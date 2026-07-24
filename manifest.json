@@ -1,0 +1,71 @@
+{
+    "manifest_version": 3,
+    "name": "B站听歌列表",
+    "version": "1.5.0",
+    "description": "浏览器级B站后台音频播放器：自带播放列表，关闭网页也能继续听歌。",
+    "permissions": [
+        "storage",
+        "declarativeNetRequest"
+    ],
+    "host_permissions": [
+        "*://api.bilibili.com/*",
+        "*://*.bilibili.com/*",
+        "*://*.bilivideo.com/*",
+        "*://*.bilivideo.cn/*",
+        "*://*.hdslb.com/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "action": {
+        "default_title": "B站听歌列表"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "http://*/*",
+                "https://*/*"
+            ],
+            "js": [
+                "content.js"
+            ],
+            "run_at": "document_idle"
+        }
+    ],
+    "commands": {
+        "toggle-panel": {
+            "suggested_key": {
+                "default": "Ctrl+Shift+B",
+                "mac": "Command+Shift+B"
+            },
+            "description": "显示/隐藏听歌列表面板"
+        }
+    },
+    "web_accessible_resources": [
+        {
+            "resources": [
+                "sidepanel.html",
+                "sidepanel.js",
+                "sidepanel.css"
+            ],
+            "matches": [
+                "http://*/*",
+                "https://*/*"
+            ]
+        }
+    ],
+    "declarative_net_request": {
+        "rule_resources": [
+            {
+                "id": "referer",
+                "enabled": true,
+                "path": "rules.json"
+            }
+        ]
+    },
+    "icons": {
+        "16": "icons/icon16.png",
+        "48": "icons/icon48.png",
+        "128": "icons/icon128.png"
+    }
+}

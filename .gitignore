@@ -1,0 +1,21 @@
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Node (如未来引入构建/依赖)
+node_modules/
+npm-debug.log*
+
+# 打包产物
+*.zip
+*.crx
+*.pem
+
+# Chrome 加载扩展时生成的 declarativeNetRequest 规则缓存
+_metadata/

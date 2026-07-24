@@ -244,41 +244,46 @@
     const CSS =
         '.mini,.panel{position:fixed;font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif}' +
 
-        '.mini{right:20px;bottom:90px;z-index:' + Z + ';display:flex;align-items:center;justify-content:center;' +
+        '.mini{right:20px;bottom:90px;z-index:' + Z + ';display:flex;align-items:center;justify-content:flex-end;' +
         'width:24px;height:24px;border-radius:12px;background:#232327;border:1px solid #3a3a3f;' +
         'cursor:pointer;user-select:none;overflow:hidden;opacity:.4;' +
         'box-shadow:0 3px 12px rgba(0,0,0,.45);' +
-        'transition:width .34s cubic-bezier(.34,1.56,.64,1),height .34s cubic-bezier(.34,1.56,.64,1),' +
-        'border-radius .34s,opacity .22s,background .25s,border-color .25s,box-shadow .3s;' +
+        'transition:width .36s cubic-bezier(.34,1.56,.64,1),height .36s cubic-bezier(.34,1.56,.64,1),' +
+        'border-radius .36s,opacity .22s,background .25s,border-color .25s,box-shadow .3s;' +
         'animation:miniIn .5s cubic-bezier(.34,1.56,.64,1) backwards}' +
         '.mini:hover{opacity:1;border-color:#55555c}' +
-        '.mini.loaded{width:150px;height:36px;border-radius:18px;opacity:.75;cursor:default;background:#202024}' +
+        '.mini.loaded{width:112px;height:32px;border-radius:16px;opacity:.75;cursor:default;background:#202024}' +
         '.mini.playing{opacity:1;border-color:#fb7299;box-shadow:0 3px 18px rgba(251,114,153,.4)}' +
+        '.mini.dragging{transition:none;opacity:1}' +
         '@keyframes miniIn{from{transform:scale(0)}to{transform:scale(1)}}' +
 
-        '.m-ico{font-size:12px;color:#fb7299;line-height:1;flex:none}' +
-        '.mini.loaded .m-ico{display:none}' +
+        '.m-controls{display:none;align-items:center;gap:2px;padding-left:6px}' +
+        '.mini.loaded .m-controls{display:flex}' +
 
-        '.m-ui{display:none;align-items:center;width:100%;padding:0 7px 0 9px}' +
-        '.mini.loaded .m-ui{display:flex}' +
+        '.m-core{flex:none;position:relative;width:24px;height:24px;border-radius:50%;' +
+        'display:flex;align-items:center;justify-content:center;cursor:pointer}' +
+        '.mini.loaded .m-core{margin:0 4px 0 2px}' +
 
-        '.m-spec{flex:none;margin-right:auto;display:flex;align-items:flex-end;gap:2.5px;height:16px;' +
-        'padding:0 3px;cursor:pointer;background:none;border:none}' +
-        '.m-spec i{width:3px;border-radius:1.5px;background:#fb7299;height:22%;transition:height .25s,background .2s}' +
+        '.m-ico{font-size:12px;color:#fb7299;line-height:1;transition:opacity .2s}' +
+        '.mini.loaded .m-ico{opacity:0}' +
+
+        '.m-spec{position:absolute;inset:0;display:flex;align-items:flex-end;justify-content:center;' +
+        'gap:2px;padding:5px 4px 6px;opacity:0;transition:opacity .25s}' +
+        '.mini.loaded .m-spec{opacity:1}' +
+        '.m-spec i{width:3px;border-radius:1.5px;background:#fb7299;height:20%;transition:height .25s,background .2s}' +
         '.mini.playing .m-spec i{animation:specB .9s ease-in-out infinite}' +
         '.mini.playing .m-spec i:nth-child(2){animation-delay:.18s}' +
         '.mini.playing .m-spec i:nth-child(3){animation-delay:.36s}' +
         '.mini.playing .m-spec i:nth-child(4){animation-delay:.1s}' +
-        '.mini.playing .m-spec i:nth-child(5){animation-delay:.28s}' +
         '.m-spec:hover i{background:#fc8bab}' +
         '@keyframes specB{0%,100%{height:18%}50%{height:100%}}' +
 
-        '.m-btn{flex:none;width:26px;height:26px;border:none;border-radius:50%;background:transparent;' +
-        'color:#ddd;font-size:13px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;' +
-        'transition:background .15s,color .15s,transform .15s;margin-left:2px}' +
-        '.m-btn:hover{background:#33333a;color:#fff;transform:scale(1.1)}' +
-        '.m-btn:active{transform:scale(.88)}' +
-        '.m-btn.m-play{background:#fb7299;color:#fff;font-size:11px}' +
+        '.m-btn{flex:none;width:24px;height:24px;border:none;border-radius:50%;background:transparent;' +
+        'color:#ddd;font-size:12px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;' +
+        'transition:background .15s,color .15s,transform .15s}' +
+        '.m-btn:hover{background:#33333a;color:#fff;transform:scale(1.12)}' +
+        '.m-btn:active{transform:scale(.86)}' +
+        '.m-btn.m-play{background:#fb7299;color:#fff;font-size:10px}' +
         '.m-btn.m-play:hover{background:#fc8bab}' +
 
         '.panel{z-index:' + (Z + 1) + ';width:340px;height:540px;max-width:92vw;' +
@@ -290,13 +295,13 @@
         '.panel.open{opacity:1;visibility:visible;transform:none;' +
         'transition:opacity .18s ease,transform .3s cubic-bezier(.34,1.56,.64,1),visibility 0s}' +
 
-        '.phead{flex:none;display:flex;align-items:center;gap:6px;padding:9px 10px;background:#202024;' +
-        'border-bottom:1px solid #2b2b2f;cursor:move;user-select:none}' +
-        '.ptitle{flex:1;font-size:13px;font-weight:600;color:#e6e6e6;letter-spacing:.3px}' +
+        '.phead{flex:none;display:flex;align-items:center;gap:6px;padding:5px 8px;background:#202024;' +
+        'border-bottom:1px solid #2b2b2f;cursor:move;user-select:none;min-height:30px}' +
+        '.gripbar{flex:1;font-size:13px;color:#4a4a52;line-height:1;letter-spacing:1px}' +
         '.pbtn{flex:none;width:26px;height:26px;border:none;border-radius:6px;background:#2b2b2f;' +
         'color:#ccc;font-size:15px;line-height:1;cursor:pointer;transition:.13s}' +
         '.pbtn:hover{background:#3a3a3f;color:#fff}' +
-        '.pbtn.add{color:#fb7299;font-size:16px;width:auto;padding:0 9px;font-weight:600}' +
+        '.pbtn.add{color:#fb7299;font-size:13px;width:auto;padding:0 9px;font-weight:600}' +
         '.pbtn.add:hover{background:#2a2026}' +
         '.pbody{flex:1;min-height:0;position:relative}' +
         '.pframe{width:100%;height:100%;border:none;display:block;background:#18191c}';
@@ -314,19 +319,20 @@
         shadow.innerHTML =
             '<style>' + CSS + '</style>' +
             '<div class="mini" title="B站听歌列表">' +
-            '<span class="m-ico">♪</span>' +
-            '<div class="m-ui">' +
-            '<button class="m-spec" title="展开播放列表"><i></i><i></i><i></i><i></i><i></i></button>' +
+            '<div class="m-controls">' +
             '<button class="m-btn m-prev" title="上一首">⏮</button>' +
             '<button class="m-btn m-play" title="播放/暂停">▶</button>' +
             '<button class="m-btn m-next" title="下一首">⏭</button>' +
             '</div>' +
+            '<div class="m-core" title="展开播放列表">' +
+            '<span class="m-ico">♪</span>' +
+            '<div class="m-spec"><i></i><i></i><i></i><i></i></div>' +
+            '</div>' +
             '</div>' +
             '<div class="panel">' +
             '<div class="phead">' +
-            '<span class="ptitle">♪ B站听歌列表</span>' +
+            '<span class="gripbar" title="拖动面板">⠿</span>' +
             '<button class="pbtn add" title="把当前B站视频加入歌单" style="display:none"><span class="addtxt">＋加入</span></button>' +
-            '<button class="pbtn close" title="收起面板">×</button>' +
             '</div>' +
             '<div class="pbody"><iframe class="pframe" title="playlist" allow="autoplay"></iframe></div>' +
             '</div>';
@@ -338,16 +344,54 @@
         addBtn = shadow.querySelector('.add');
         addTxt = shadow.querySelector('.addtxt');
 
+        let suppressClick = false;
         mini.addEventListener('click', e => {
-            if (e.target.closest('.m-spec')) { toggle(); return; }
+            if (suppressClick) { suppressClick = false; return; }
+            if (e.target.closest('.m-core')) { toggle(); return; }
             if (e.target.closest('.m-prev')) { pPrev(); return; }
             if (e.target.closest('.m-play')) { pToggle(); return; }
             if (e.target.closest('.m-next')) { pNext(); return; }
             if (!mini.classList.contains('loaded')) toggle();
         });
-        shadow.querySelector('.close').addEventListener('click', () => toggle(false));
+        makeMiniDraggable();
         addBtn.addEventListener('click', addCurrent);
         makeDraggable(panel, shadow.querySelector('.phead'));
+
+        function makeMiniDraggable() {
+            let down = false, moved = false, sx = 0, sy = 0, sr = 0, sb = 0;
+            mini.addEventListener('pointerdown', e => {
+                down = true; moved = false; suppressClick = false;
+                sx = e.clientX; sy = e.clientY;
+                const r = mini.getBoundingClientRect();
+                sr = window.innerWidth - r.right;
+                sb = window.innerHeight - r.bottom;
+                try { mini.setPointerCapture(e.pointerId); } catch (_) {}
+            });
+            mini.addEventListener('pointermove', e => {
+                if (!down) return;
+                const dx = e.clientX - sx, dy = e.clientY - sy;
+                if (!moved && Math.hypot(dx, dy) > 4) { moved = true; mini.classList.add('dragging'); }
+                if (moved) {
+                    const nr = Math.max(4, Math.min(sr - dx, window.innerWidth - 40));
+                    const nb = Math.max(4, Math.min(sb - dy, window.innerHeight - 40));
+                    mini.style.right = nr + 'px';
+                    mini.style.bottom = nb + 'px';
+                }
+            });
+            const up = () => {
+                if (down && moved) {
+                    suppressClick = true;
+                    const r = mini.getBoundingClientRect();
+                    chrome.storage.local.set({
+                        bpl_mini: { right: Math.round(window.innerWidth - r.right), bottom: Math.round(window.innerHeight - r.bottom) }
+                    });
+                }
+                down = false;
+                mini.classList.remove('dragging');
+            };
+            mini.addEventListener('pointerup', up);
+            mini.addEventListener('pointercancel', up);
+        }
 
         document.body.appendChild(host);
 
@@ -356,6 +400,14 @@
             if (hostEl && hostEl.contains(e.target)) return;
             toggle(false);
         }, true);
+
+        chrome.storage.local.get('bpl_mini').then(r => {
+            const p = (r && r.bpl_mini) || {};
+            if (typeof p.right === 'number' && typeof p.bottom === 'number') {
+                mini.style.right = Math.max(4, Math.min(p.right, window.innerWidth - 40)) + 'px';
+                mini.style.bottom = Math.max(4, Math.min(p.bottom, window.innerHeight - 40)) + 'px';
+            }
+        });
 
         chrome.storage.local.get(STORE_KEY).then(r => {
             const p = (r && r[STORE_KEY]) || {};

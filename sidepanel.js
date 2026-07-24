@@ -111,7 +111,6 @@ function render() {
 
     const it = playingItem();
     $('#curTitle').textContent = (it && it.title) || '未播放';
-    $('#curSub').textContent = (it && it.owner) || '从下方列表选择歌曲';
     const pic = (it && it.pic) ? httpsUrl(it.pic) : '';
     const coverEl = $('#npCover');
     if (coverEl.getAttribute('src') !== pic) coverEl.src = pic;
@@ -129,16 +128,31 @@ function render() {
             return '<div class="item' + (isPlaying ? ' playing' : '') + '" draggable="true" data-i="' + i + '">' +
                 '<span class="grip" title="拖动排序">⋮⋮</span>' +
                 '<img class="cover" src="' + esc(httpsUrl(s.pic)) + '" referrerpolicy="no-referrer">' +
-                '<div class="meta">' +
-                '<div class="t">' + (isPlaying ? '<span class="eq"><i></i><i></i><i></i></span>' : '') + esc(s.title) + '</div>' +
-                '<div class="s">' + esc(s.owner) + (s.duration ? ' · ' + fmt(s.duration) : '') + '</div>' +
-                '</div>' +
+                '<div class="t"><span class="txt">' + esc(s.title) + '</span></div>' +
+                '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
                 '<div class="ibtn del" data-del="' + i + '" title="删除">×</div>' +
                 '</div>';
         }).join('');
     }
+    applyMarquee($('.np-title'));
+    box.querySelectorAll('.t').forEach(applyMarquee);
     updateProgress();
+}
+
+function applyMarquee(wrap) {
+    if (!wrap) return;
+    const txt = wrap.querySelector('.txt');
+    if (!txt) return;
+    wrap.classList.remove('overflow');
+    txt.style.removeProperty('--shift');
+    txt.style.removeProperty('--dur');
+    const overflow = txt.offsetWidth - wrap.clientWidth;
+    if (overflow > 2) {
+        txt.style.setProperty('--shift', '-' + (overflow + 8) + 'px');
+        txt.style.setProperty('--dur', Math.max(5, overflow / 22) + 's');
+        wrap.classList.add('overflow');
+    }
 }
 
 function updateProgress() {
@@ -327,19 +341,16 @@ $('#modeBtn').addEventListener('click', () => {
 $('#seek').addEventListener('input', e => send('seek', { value: +e.target.value }));
 
 const volSlider = $('#volSlider');
-const volVal = $('#volVal');
 const muteBtn = $('#muteBtn');
 let curMuted = false;
 function paintVolume(v, muted) {
     volSlider.value = Math.round(v * 100);
-    volVal.textContent = Math.round(v * 100);
     curMuted = muted;
     muteBtn.textContent = (muted || v === 0) ? '🔇' : (v < 0.5 ? '🔉' : '🔊');
     muteBtn.classList.toggle('muted', muted);
 }
 volSlider.addEventListener('input', () => {
     const v = (+volSlider.value) / 100;
-    volVal.textContent = volSlider.value;
     muteBtn.textContent = v === 0 ? '🔇' : (v < 0.5 ? '🔉' : '🔊');
     send('setVolume', { value: v });
 });

@@ -245,13 +245,14 @@ async function handleBg(msg, sender) {
             const from = msg.from, to = msg.to;
             if (from == null || to == null || from === to) return { ok: true };
             if (from < 0 || from >= pl.items.length || to < 0 || to >= pl.items.length) return { ok: false };
+            const insertAt = from < to ? to - 1 : to;
             const [it] = pl.items.splice(from, 1);
-            pl.items.splice(to, 0, it);
+            pl.items.splice(insertAt, 0, it);
             const st = await getState();
             if (st.playlistId === pl.id) {
-                if (st.index === from) st.index = to;
-                else if (from < st.index && to >= st.index) st.index--;
-                else if (from > st.index && to <= st.index) st.index++;
+                if (st.index === from) st.index = insertAt;
+                else if (from < st.index && st.index <= insertAt) st.index--;
+                else if (insertAt <= st.index && st.index < from) st.index++;
                 await saveState(st);
             }
             await savePlaylists(lists);

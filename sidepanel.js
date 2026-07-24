@@ -132,7 +132,6 @@ function render() {
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
                 '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
-                '<div class="ibtn del" data-del="' + i + '" title="删除">×</div>' +
                 '</div>';
         }).join('');
     }
@@ -166,8 +165,11 @@ function applyMarquee(wrap) {
     }
 }
 
+const PLAY_D = 'M8 5v14l11-7z';
+const PAUSE_D = 'M6 5h4v14H6zm8 0h4v14h-4z';
 function updateProgress() {
-    $('#playBtn').textContent = state.playing ? '⏸' : '▶';
+    const pp = $('#playBtn').querySelector('path');
+    if (pp) pp.setAttribute('d', state.playing ? PAUSE_D : PLAY_D);
     document.body.classList.toggle('playing', !!state.playing);
     $('#time').textContent = fmt(position) + ' / ' + fmt(duration);
     const seek = $('#seek');
@@ -446,8 +448,6 @@ box.addEventListener('click', e => {
     if (Date.now() - lastDrop < 300) return;
     const rn = e.target.closest('[data-rename]');
     if (rn) { e.stopPropagation(); renameItem(+rn.dataset.rename); return; }
-    const del = e.target.closest('[data-del]');
-    if (del) { e.stopPropagation(); send('remove', { index: +del.dataset.del }); return; }
     const it = e.target.closest('.item');
     if (!it) return;
     const i = +it.dataset.i;

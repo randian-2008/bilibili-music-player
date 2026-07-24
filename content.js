@@ -241,7 +241,11 @@
     });
     // =================================================================================
 
+    const PLAY_D = 'M8 5v14l11-7z';
+    const PAUSE_D = 'M6 5h4v14H6zm8 0h4v14h-4z';
+
     const CSS =
+        '*{box-sizing:border-box}' +
         '.mini,.panel{position:fixed;font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif}' +
 
         '.mini{right:20px;bottom:90px;z-index:' + Z + ';display:flex;align-items:center;justify-content:flex-end;' +
@@ -280,11 +284,12 @@
         '@keyframes specB{0%,100%{height:18%}50%{height:100%}}' +
 
         '.m-btn{flex:none;width:24px;height:24px;border:none;border-radius:50%;background:transparent;' +
-        'color:#ddd;font-size:12px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;' +
+        'color:#ddd;cursor:pointer;display:flex;align-items:center;justify-content:center;' +
         'transition:background .15s,color .15s,transform .15s}' +
+        '.m-btn svg{display:block}' +
         '.m-btn:hover{background:#33333a;color:#fff;transform:scale(1.12)}' +
         '.m-btn:active{transform:scale(.86)}' +
-        '.m-btn.m-play{background:#fb7299;color:#fff;font-size:10px;padding-left:2px}' +
+        '.m-btn.m-play{background:#fb7299;color:#fff}' +
         '.m-btn.m-play:hover{background:#fc8bab}' +
 
         '.panel{z-index:' + (Z + 1) + ';width:340px;height:540px;max-width:92vw;' +
@@ -321,9 +326,9 @@
             '<style>' + CSS + '</style>' +
             '<div class="mini" title="B站听歌列表">' +
             '<div class="m-controls">' +
-            '<button class="m-btn m-prev" title="上一首">⏮</button>' +
-            '<button class="m-btn m-play" title="播放/暂停">▶</button>' +
-            '<button class="m-btn m-next" title="下一首">⏭</button>' +
+            '<button class="m-btn m-prev" title="上一首"><svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg></button>' +
+            '<button class="m-btn m-play" title="播放/暂停"><svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="' + PLAY_D + '"/></svg></button>' +
+            '<button class="m-btn m-next" title="下一首"><svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M16 6h2v12h-2zM6 18l8.5-6L6 6z"/></svg></button>' +
             '</div>' +
             '<div class="m-core" title="展开播放列表">' +
             '<span class="m-ico">♪</span>' +
@@ -438,7 +443,8 @@
         const playing = hasTrack && !audio.paused;
         mini.classList.toggle('loaded', hasTrack);
         mini.classList.toggle('playing', playing);
-        if (miniPlay) miniPlay.textContent = playing ? '⏸' : '▶';
+        const p = miniPlay && miniPlay.querySelector('path');
+        if (p) p.setAttribute('d', playing ? PAUSE_D : PLAY_D);
     }
 
     function persist() {

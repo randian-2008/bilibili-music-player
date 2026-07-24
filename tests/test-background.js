@@ -124,6 +124,18 @@ function makeCtx() {
     ok(src.items.map(x => x.bvid).join(',') === 'BV0,BV3,BV4', '移动后源正确 (' + src.items.map(x => x.bvid).join(',') + ')');
     ok(ctx.__store.bpl_state.index === 1, '移走正在播的后指向后继 (' + ctx.__store.bpl_state.index + ')');
 
+    console.log('\n[background moveItem 拖拽排序]');
+    // 向下拖：BV1 拖到 BV3 位置 → BV1 应落在 BV3 原位置
+    ctx = seedBatch();
+    await ctx.handleBg({ cmd: 'moveItem', from: 1, to: 3 }, null);
+    ok(ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') === 'BV0,BV2,BV1,BV3,BV4',
+        '下拖落位准确 (' + ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') + ')');
+    // 向上拖：BV3 拖到 BV1 位置 → BV3 应落在 BV1 原位置
+    ctx = seedBatch();
+    await ctx.handleBg({ cmd: 'moveItem', from: 3, to: 1 }, null);
+    ok(ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') === 'BV0,BV3,BV1,BV2,BV4',
+        '上拖落位准确 (' + ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') + ')');
+
     console.log('\n=================');
     console.log('通过: ' + pass + '  失败: ' + fail);
     process.exit(fail > 0 ? 1 : 0);

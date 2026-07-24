@@ -128,7 +128,7 @@ function render() {
             return '<div class="item' + (isPlaying ? ' playing' : '') + '" draggable="true" data-i="' + i + '">' +
                 '<span class="grip" title="拖动排序">⋮⋮</span>' +
                 '<img class="cover" src="' + esc(httpsUrl(s.pic)) + '" referrerpolicy="no-referrer">' +
-                '<div class="t"><span class="txt">' + esc(s.title) + '</span></div>' +
+                '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
                 '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
                 '<div class="ibtn del" data-del="' + i + '" title="删除">×</div>' +
@@ -142,15 +142,24 @@ function render() {
 
 function applyMarquee(wrap) {
     if (!wrap) return;
+    const track = wrap.querySelector('.track');
     const txt = wrap.querySelector('.txt');
-    if (!txt) return;
+    if (!track || !txt) return;
     wrap.classList.remove('overflow');
-    txt.style.removeProperty('--shift');
-    txt.style.removeProperty('--dur');
-    const overflow = txt.offsetWidth - wrap.clientWidth;
+    const old = track.querySelector('.txt-clone');
+    if (old) old.remove();
+    track.style.removeProperty('--shift');
+    track.style.removeProperty('--dur');
+    const w = txt.offsetWidth;
+    const overflow = w - wrap.clientWidth;
     if (overflow > 2) {
-        txt.style.setProperty('--shift', '-' + (overflow + 8) + 'px');
-        txt.style.setProperty('--dur', Math.max(5, overflow / 22) + 's');
+        const clone = txt.cloneNode(true);
+        clone.classList.add('txt-clone');
+        clone.removeAttribute('id');
+        track.appendChild(clone);
+        const dist = w + 28;
+        track.style.setProperty('--shift', '-' + dist + 'px');
+        track.style.setProperty('--dur', Math.max(6, dist / 28) + 's');
         wrap.classList.add('overflow');
     }
 }
@@ -203,8 +212,13 @@ function renameItem(i) {
         if (done) return;
         done = true;
         const v = input.value.trim();
-        if (v && v !== s.title) send('renameItem', { index: i, title: v });
-        else render();
+        if (v && v !== s.title) {
+            s.title = v;
+            render();
+            send('renameItem', { index: i, title: v });
+        } else {
+            render();
+        }
     };
     const cancel = () => { if (done) return; done = true; render(); };
     input.addEventListener('keydown', e => {

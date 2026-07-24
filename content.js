@@ -283,7 +283,7 @@
         'transition:background .15s,color .15s,transform .15s}' +
         '.m-btn:hover{background:#33333a;color:#fff;transform:scale(1.12)}' +
         '.m-btn:active{transform:scale(.86)}' +
-        '.m-btn.m-play{background:#fb7299;color:#fff;font-size:10px}' +
+        '.m-btn.m-play{background:#fb7299;color:#fff;font-size:10px;padding-left:1px}' +
         '.m-btn.m-play:hover{background:#fc8bab}' +
 
         '.panel{z-index:' + (Z + 1) + ';width:340px;height:540px;max-width:92vw;' +
@@ -344,23 +344,23 @@
         addBtn = shadow.querySelector('.add');
         addTxt = shadow.querySelector('.addtxt');
 
-        let suppressClick = false;
-        mini.addEventListener('click', e => {
-            if (suppressClick) { suppressClick = false; return; }
-            if (e.target.closest('.m-core')) { toggle(); return; }
-            if (e.target.closest('.m-prev')) { pPrev(); return; }
-            if (e.target.closest('.m-play')) { pToggle(); return; }
-            if (e.target.closest('.m-next')) { pNext(); return; }
-            if (!mini.classList.contains('loaded')) toggle();
-        });
         makeMiniDraggable();
         addBtn.addEventListener('click', addCurrent);
         makeDraggable(panel, shadow.querySelector('.phead'));
 
+        function miniActivate(target) {
+            if (target && target.closest) {
+                if (target.closest('.m-core')) { toggle(); return; }
+                if (target.closest('.m-prev')) { pPrev(); return; }
+                if (target.closest('.m-play')) { pToggle(); return; }
+                if (target.closest('.m-next')) { pNext(); return; }
+            }
+            if (!mini.classList.contains('loaded')) toggle();
+        }
         function makeMiniDraggable() {
-            let down = false, moved = false, sx = 0, sy = 0, sr = 0, sb = 0;
+            let down = false, moved = false, sx = 0, sy = 0, sr = 0, sb = 0, downTarget = null;
             mini.addEventListener('pointerdown', e => {
-                down = true; moved = false; suppressClick = false;
+                down = true; moved = false; downTarget = e.target;
                 sx = e.clientX; sy = e.clientY;
                 const r = mini.getBoundingClientRect();
                 sr = window.innerWidth - r.right;
@@ -378,19 +378,23 @@
                     mini.style.bottom = nb + 'px';
                 }
             });
-            const up = () => {
-                if (down && moved) {
-                    suppressClick = true;
+            mini.addEventListener('pointerup', () => {
+                const wasDrag = moved, tgt = downTarget;
+                down = false; moved = false; downTarget = null;
+                mini.classList.remove('dragging');
+                if (wasDrag) {
                     const r = mini.getBoundingClientRect();
                     chrome.storage.local.set({
                         bpl_mini: { right: Math.round(window.innerWidth - r.right), bottom: Math.round(window.innerHeight - r.bottom) }
                     });
+                    return;
                 }
-                down = false;
+                miniActivate(tgt);
+            });
+            mini.addEventListener('pointercancel', () => {
+                down = false; moved = false; downTarget = null;
                 mini.classList.remove('dragging');
-            };
-            mini.addEventListener('pointerup', up);
-            mini.addEventListener('pointercancel', up);
+            });
         }
 
         document.body.appendChild(host);

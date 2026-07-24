@@ -48,6 +48,16 @@
             </div>
         </div>
         <input type="file" id="importFile" accept=".json,application/json" style="display:none">
+        <div class="selbar hidden" id="selBar">
+            <span class="sel-count" id="selCount">已选 0 首</span>
+            <div class="sel-acts">
+                <button class="selbtn" id="selMoveBtn">移动至▾</button>
+                <button class="selbtn" id="selCopyBtn">复制到▾</button>
+                <button class="selbtn danger" id="selDelBtn">删除</button>
+                <button class="selbtn" id="selCancelBtn">取消</button>
+            </div>
+            <div class="sel-menu hidden" id="selMenu"></div>
+        </div>
         <div id="list" class="list"></div>
     </div>
 

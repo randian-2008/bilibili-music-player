@@ -125,8 +125,9 @@ function render() {
     } else {
         box.innerHTML = items.map((s, i) => {
             const isPlaying = showPlaying && i === state.index;
-            return '<div class="item' + (isPlaying ? ' playing' : '') + '" draggable="true" data-i="' + i + '">' +
-                '<span class="grip" title="拖动排序">⋮⋮</span>' +
+            return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '">' +
+                '<span class="grip" title="按住六点拖动排序">⋮⋮</span>' +
+                '<span class="chk"></span>' +
                 '<img class="cover" src="' + esc(httpsUrl(s.pic)) + '" referrerpolicy="no-referrer">' +
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
                 '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
@@ -137,6 +138,7 @@ function render() {
     }
     applyMarquee($('.np-title'));
     box.querySelectorAll('.t').forEach(applyMarquee);
+    if (selMode) refreshSelUI();
     updateProgress();
 }
 
@@ -381,14 +383,76 @@ chrome.storage.local.get(['bpl_volume', 'bpl_mute']).then(r => {
 });
 
 const box = $('#list');
+
+let selMode = false;
+const selected = new Set();
+function enterSelMode(firstIdx) {
+    selMode = true;
+    selected.clear();
+    if (firstIdx != null) selected.add(firstIdx);
+    refreshSelUI();
+}
+function exitSelMode() {
+    selMode = false;
+    selected.clear();
+    $('#selMenu').classList.add('hidden');
+    refreshSelUI();
+}
+function toggleSel(i) {
+    if (selected.has(i)) selected.delete(i); else selected.add(i);
+    refreshSelUI();
+}
+function refreshSelUI() {
+    box.classList.toggle('selmode', selMode);
+    box.querySelectorAll('.item').forEach(el => {
+        const on = selected.has(+el.dataset.i);
+        el.classList.toggle('selected', on);
+        const chk = el.querySelector('.chk');
+        if (chk) chk.classList.toggle('checked', on);
+    });
+    $('#selBar').classList.toggle('hidden', !selMode);
+    $('#selCount').textContent = '已选 ' + selected.size + ' 首';
+}
+
+let gripArmed = null;
+let lpTimer = null, lpStart = null, lpSupp = false;
+box.addEventListener('pointerdown', e => {
+    const g = e.target.closest('.grip');
+    if (g) {
+        const it = g.closest('.item');
+        if (it) { it.draggable = true; gripArmed = it; }
+    }
+    if (!selMode && !e.target.closest('.grip') && !e.target.closest('.ibtn')) {
+        const it = e.target.closest('.item');
+        if (it) {
+            lpStart = { x: e.clientX, y: e.clientY };
+            const idx = +it.dataset.i;
+            lpTimer = setTimeout(() => { lpTimer = null; lpSupp = true; enterSelMode(idx); }, 500);
+        }
+    }
+});
+box.addEventListener('pointermove', e => {
+    if (lpTimer && lpStart && Math.hypot(e.clientX - lpStart.x, e.clientY - lpStart.y) > 6) {
+        clearTimeout(lpTimer); lpTimer = null;
+    }
+});
+box.addEventListener('pointerup', () => {
+    if (gripArmed) { gripArmed.draggable = false; gripArmed = null; }
+    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+});
+
 box.addEventListener('click', e => {
+    if (lpSupp) { lpSupp = false; return; }
     if (Date.now() - lastDrop < 300) return;
     const rn = e.target.closest('[data-rename]');
     if (rn) { e.stopPropagation(); renameItem(+rn.dataset.rename); return; }
     const del = e.target.closest('[data-del]');
     if (del) { e.stopPropagation(); send('remove', { index: +del.dataset.del }); return; }
     const it = e.target.closest('.item');
-    if (it) act('playIndex', { index: +it.dataset.i });
+    if (!it) return;
+    const i = +it.dataset.i;
+    if (selMode) { toggleSel(i); return; }
+    act('playIndex', { index: i });
 });
 
 box.addEventListener('dragstart', e => {
@@ -419,7 +483,43 @@ box.addEventListener('drop', e => {
 });
 box.addEventListener('dragend', () => {
     dragFrom = null;
+    if (gripArmed) { gripArmed.draggable = false; gripArmed = null; }
     box.querySelectorAll('.item.drag-over,.item.dragging').forEach(x => x.classList.remove('drag-over', 'dragging'));
+});
+
+let selAction = null;
+function openSelMenu(action) {
+    selAction = action;
+    const others = playlists.filter(p => p.id !== activeId);
+    $('#selMenu').innerHTML = others.length
+        ? others.map(p => '<div data-plid="' + esc(p.id) + '">' + esc(p.name) + '</div>').join('')
+        : '<div class="sel-none">（无其他歌单）</div>';
+    $('#selMenu').classList.remove('hidden');
+}
+function selIndices() { return [...selected].sort((a, b) => a - b); }
+$('#selMoveBtn').addEventListener('click', () => openSelMenu('move'));
+$('#selCopyBtn').addEventListener('click', () => openSelMenu('copy'));
+$('#selDelBtn').addEventListener('click', () => {
+    const indices = selIndices();
+    if (!indices.length) return;
+    if (confirm('删除选中的 ' + indices.length + ' 首歌曲？')) {
+        send('batchRemove', { indices: indices }).then(() => { exitSelMode(); refresh(); });
+    }
+});
+$('#selCancelBtn').addEventListener('click', exitSelMode);
+$('#selMenu').addEventListener('click', e => {
+    const d = e.target.closest('[data-plid]');
+    $('#selMenu').classList.add('hidden');
+    if (!d) return;
+    const indices = selIndices();
+    if (!indices.length) return;
+    const cmd = selAction === 'move' ? 'batchMove' : 'batchCopy';
+    send(cmd, { indices: indices, toId: d.dataset.plid }).then(() => { exitSelMode(); refresh(); });
+});
+document.addEventListener('click', e => {
+    if (!e.target.closest('#selMenu') && !e.target.closest('#selMoveBtn') && !e.target.closest('#selCopyBtn')) {
+        $('#selMenu').classList.add('hidden');
+    }
 });
 
 function handleBroadcast(msg) {

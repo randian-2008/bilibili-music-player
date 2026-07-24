@@ -188,6 +188,56 @@ async function handleBg(msg, sender) {
             }
             return { ok: true };
         }
+        case 'batchRemove': {
+            const lists = await getPlaylists();
+            const pl = findPl(lists, await getActiveId());
+            if (!pl) return { ok: false };
+            const asc = [...new Set(msg.indices || [])].filter(i => i >= 0 && i < pl.items.length).sort((a, b) => a - b);
+            if (!asc.length) return { ok: true };
+            const st = await getState();
+            for (let k = asc.length - 1; k >= 0; k--) pl.items.splice(asc[k], 1);
+            if (st.playlistId === pl.id) {
+                const before = asc.filter(x => x < st.index).length;
+                st.index = Math.max(0, st.index - before);
+                if (!pl.items.length) { st.playing = false; st.index = 0; }
+                else if (st.index >= pl.items.length) st.index = pl.items.length - 1;
+                await saveState(st);
+            }
+            await savePlaylists(lists);
+            await broadcastData();
+            return { ok: true, count: asc.length };
+        }
+        case 'batchCopy':
+        case 'batchMove': {
+            const lists = await getPlaylists();
+            const fromPl = findPl(lists, await getActiveId());
+            const toPl = findPl(lists, msg.toId);
+            if (!fromPl || !toPl) return { ok: false };
+            const asc = [...new Set(msg.indices || [])].filter(i => i >= 0 && i < fromPl.items.length).sort((a, b) => a - b);
+            if (!asc.length) return { ok: true };
+            let added = 0;
+            for (const i of asc) {
+                const it = fromPl.items[i];
+                if (it && !toPl.items.some(x => x.bvid === it.bvid && (x.cid || 0) === (it.cid || 0))) {
+                    toPl.items.push(Object.assign({}, it));
+                    added++;
+                }
+            }
+            if (msg.cmd === 'batchMove') {
+                const st = await getState();
+                for (let k = asc.length - 1; k >= 0; k--) fromPl.items.splice(asc[k], 1);
+                if (st.playlistId === fromPl.id) {
+                    const before = asc.filter(x => x < st.index).length;
+                    st.index = Math.max(0, st.index - before);
+                    if (!fromPl.items.length) { st.playing = false; st.index = 0; }
+                    else if (st.index >= fromPl.items.length) st.index = fromPl.items.length - 1;
+                    await saveState(st);
+                }
+            }
+            await savePlaylists(lists);
+            await broadcastData();
+            return { ok: true, count: asc.length, added: added };
+        }
         case 'moveItem': {
             const lists = await getPlaylists();
             const pl = findPl(lists, await getActiveId());

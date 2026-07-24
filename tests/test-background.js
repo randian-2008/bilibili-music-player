@@ -13,6 +13,7 @@ function makeCtx() {
         setTimeout: () => 0, clearTimeout: () => {},
         fetch: () => Promise.resolve({ json: () => Promise.resolve(resp) }),
         __setResp: r => { resp = r; },
+        __store: store,
         chrome: {
             runtime: {
                 onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
@@ -81,6 +82,47 @@ function makeCtx() {
     ctx.__setResp({ code: -404, message: '啥都木有' });
     const it2 = await ctx.buildItem('BV1', 1, '兜底标题');
     ok(it2.cid === 0 && it2.title === '兜底标题', '解析失败用兜底 (' + it2.title + ')');
+
+    console.log('\n[background 批量操作]');
+    function seedBatch() {
+        const c = makeCtx();
+        const items = [];
+        for (let i = 0; i < 5; i++) items.push({ bvid: 'BV' + i, cid: 100 + i, title: 't' + i, pic: '', owner: '', duration: 10, page: 1 });
+        c.__store.bpl_playlists = [
+            { id: 'plA', name: 'A', items: items },
+            { id: 'plB', name: 'B', items: [] }
+        ];
+        c.__store.bpl_active = 'plA';
+        c.__store.bpl_state = { playlistId: 'plA', index: 2, playing: true, mode: 'loop' };
+        return c;
+    }
+    // 批量删除（删索引 1、3），当前播放索引 2 应左移 1 → 1
+    ctx = seedBatch();
+    let r = await ctx.handleBg({ cmd: 'batchRemove', indices: [3, 1] }, null);
+    let pl = ctx.__store.bpl_playlists[0];
+    ok(r.ok && pl.items.length === 3, 'batchRemove 删除后剩 3 首');
+    ok(pl.items.map(x => x.bvid).join(',') === 'BV0,BV2,BV4', '剩余顺序正确 (' + pl.items.map(x => x.bvid).join(',') + ')');
+    ok(ctx.__store.bpl_state.index === 1, '播放索引左移 (' + ctx.__store.bpl_state.index + ')');
+
+    // 批量复制到 plB（不影响源）
+    ctx = seedBatch();
+    r = await ctx.handleBg({ cmd: 'batchCopy', indices: [0, 2], toId: 'plB' }, null);
+    let src = ctx.__store.bpl_playlists[0], dst = ctx.__store.bpl_playlists[1];
+    ok(r.ok && src.items.length === 5 && dst.items.length === 2, 'batchCopy 源不变、目标+2');
+    ok(dst.items.map(x => x.bvid).join(',') === 'BV0,BV2', '复制内容正确 (' + dst.items.map(x => x.bvid).join(',') + ')');
+
+    // 批量复制到 plB 两次 → 去重
+    r = await ctx.handleBg({ cmd: 'batchCopy', indices: [0, 2], toId: 'plB' }, null);
+    dst = ctx.__store.bpl_playlists[1];
+    ok(dst.items.length === 2, '重复复制去重 (' + dst.items.length + ')');
+
+    // 批量移动到 plB（源删除）
+    ctx = seedBatch();
+    r = await ctx.handleBg({ cmd: 'batchMove', indices: [1, 2], toId: 'plB' }, null);
+    src = ctx.__store.bpl_playlists[0]; dst = ctx.__store.bpl_playlists[1];
+    ok(r.ok && src.items.length === 3 && dst.items.length === 2, 'batchMove 源-2、目标+2');
+    ok(src.items.map(x => x.bvid).join(',') === 'BV0,BV3,BV4', '移动后源正确 (' + src.items.map(x => x.bvid).join(',') + ')');
+    ok(ctx.__store.bpl_state.index === 1, '移走正在播的后指向后继 (' + ctx.__store.bpl_state.index + ')');
 
     console.log('\n=================');
     console.log('通过: ' + pass + '  失败: ' + fail);

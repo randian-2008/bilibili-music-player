@@ -9,7 +9,7 @@
     const PANEL_URL = chrome.runtime.getURL('sidepanel.html');
     const Z = 2147483646;
 
-    let shadow, fab, panel, pframe, addBtn, addTxt;
+    let shadow, hostEl, mini, miniPlay, panel, pframe, addBtn, addTxt;
     let panelOpen = false;
     let frameLoaded = false;
     let built = false;
@@ -26,7 +26,7 @@
     let shufflePos = -1;
     const P_DEF = { playlistId: null, index: 0, playing: false, mode: 'loop' };
     const P_MODES = ['order', 'shuffle', 'one', 'loop', 'shuffleLoop'];
-    const PLAYER_CMDS = { toggle: 1, next: 1, prev: 1, playIndex: 1, seek: 1, getStatus: 1, stop: 1, setMode: 1 };
+    const PLAYER_CMDS = { toggle: 1, next: 1, prev: 1, playIndex: 1, seek: 1, getStatus: 1, stop: 1, setMode: 1, setVolume: 1, setMute: 1, getVolume: 1 };
 
     function pNormMode(st) {
         if (P_MODES.indexOf(st.mode) >= 0) return st.mode;
@@ -187,6 +187,19 @@
                 await pSetState({ mode: mode });
                 return { ok: true };
             }
+            case 'setVolume': {
+                const v = Math.max(0, Math.min(1, Number(payload.value)));
+                audio.volume = v;
+                chrome.storage.local.set({ bpl_volume: v });
+                return { ok: true, volume: v, muted: audio.muted };
+            }
+            case 'setMute': {
+                audio.muted = !!payload.muted;
+                chrome.storage.local.set({ bpl_mute: audio.muted });
+                return { ok: true, volume: audio.volume, muted: audio.muted };
+            }
+            case 'getVolume':
+                return { ok: true, volume: audio.volume, muted: audio.muted };
             default: return { ok: false };
         }
     }
@@ -200,6 +213,13 @@
         } else {
             pAdvance();
         }
+    });
+    audio.addEventListener('play', updateMiniUI);
+    audio.addEventListener('pause', updateMiniUI);
+    audio.addEventListener('emptied', updateMiniUI);
+    chrome.storage.local.get(['bpl_volume', 'bpl_mute']).then(r => {
+        if (typeof r.bpl_volume === 'number') audio.volume = Math.max(0, Math.min(1, r.bpl_volume));
+        if (typeof r.bpl_mute === 'boolean') audio.muted = r.bpl_mute;
     });
     setInterval(() => {
         if (!audio.src) return;
@@ -222,18 +242,44 @@
     // =================================================================================
 
     const CSS =
-        '.fab,.panel{position:fixed;font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif}' +
+        '.mini,.panel{position:fixed;font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif}' +
 
-        '.fab{right:20px;bottom:90px;z-index:' + Z + ';width:48px;height:48px;border-radius:50%;' +
-        'background:#fb7299;color:#fff;border:none;cursor:pointer;font-size:21px;line-height:1;' +
-        'display:flex;align-items:center;justify-content:center;user-select:none;' +
-        'box-shadow:0 3px 14px rgba(251,114,153,.5);' +
-        'transition:transform .18s cubic-bezier(.34,1.56,.64,1);' +
-        'animation:fabIn .55s cubic-bezier(.34,1.56,.64,1) backwards,fabGlow 3.6s ease-in-out 1.2s infinite}' +
-        '.fab:hover{transform:scale(1.14)}' +
-        '.fab:active{transform:scale(.92)}' +
-        '@keyframes fabIn{from{transform:scale(0);opacity:0}to{transform:scale(1);opacity:1}}' +
-        '@keyframes fabGlow{0%,100%{box-shadow:0 3px 14px rgba(251,114,153,.45)}50%{box-shadow:0 4px 24px rgba(251,114,153,.8)}}' +
+        '.mini{right:20px;bottom:90px;z-index:' + Z + ';display:flex;align-items:center;justify-content:center;' +
+        'width:24px;height:24px;border-radius:12px;background:#232327;border:1px solid #3a3a3f;' +
+        'cursor:pointer;user-select:none;overflow:hidden;opacity:.4;' +
+        'box-shadow:0 3px 12px rgba(0,0,0,.45);' +
+        'transition:width .34s cubic-bezier(.34,1.56,.64,1),height .34s cubic-bezier(.34,1.56,.64,1),' +
+        'border-radius .34s,opacity .22s,background .25s,border-color .25s,box-shadow .3s;' +
+        'animation:miniIn .5s cubic-bezier(.34,1.56,.64,1) backwards}' +
+        '.mini:hover{opacity:1;border-color:#55555c}' +
+        '.mini.loaded{width:150px;height:36px;border-radius:18px;opacity:.75;cursor:default;background:#202024}' +
+        '.mini.playing{opacity:1;border-color:#fb7299;box-shadow:0 3px 18px rgba(251,114,153,.4)}' +
+        '@keyframes miniIn{from{transform:scale(0)}to{transform:scale(1)}}' +
+
+        '.m-ico{font-size:12px;color:#fb7299;line-height:1;flex:none}' +
+        '.mini.loaded .m-ico{display:none}' +
+
+        '.m-ui{display:none;align-items:center;width:100%;padding:0 7px 0 9px}' +
+        '.mini.loaded .m-ui{display:flex}' +
+
+        '.m-spec{flex:none;margin-right:auto;display:flex;align-items:flex-end;gap:2.5px;height:16px;' +
+        'padding:0 3px;cursor:pointer;background:none;border:none}' +
+        '.m-spec i{width:3px;border-radius:1.5px;background:#fb7299;height:22%;transition:height .25s,background .2s}' +
+        '.mini.playing .m-spec i{animation:specB .9s ease-in-out infinite}' +
+        '.mini.playing .m-spec i:nth-child(2){animation-delay:.18s}' +
+        '.mini.playing .m-spec i:nth-child(3){animation-delay:.36s}' +
+        '.mini.playing .m-spec i:nth-child(4){animation-delay:.1s}' +
+        '.mini.playing .m-spec i:nth-child(5){animation-delay:.28s}' +
+        '.m-spec:hover i{background:#fc8bab}' +
+        '@keyframes specB{0%,100%{height:18%}50%{height:100%}}' +
+
+        '.m-btn{flex:none;width:26px;height:26px;border:none;border-radius:50%;background:transparent;' +
+        'color:#ddd;font-size:13px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;' +
+        'transition:background .15s,color .15s,transform .15s;margin-left:2px}' +
+        '.m-btn:hover{background:#33333a;color:#fff;transform:scale(1.1)}' +
+        '.m-btn:active{transform:scale(.88)}' +
+        '.m-btn.m-play{background:#fb7299;color:#fff;font-size:11px}' +
+        '.m-btn.m-play:hover{background:#fc8bab}' +
 
         '.panel{z-index:' + (Z + 1) + ';width:340px;height:540px;max-width:92vw;' +
         'max-height:calc(100vh - 160px);right:20px;bottom:146px;' +
@@ -263,10 +309,19 @@
         const host = document.createElement('div');
         host.id = HOST_ID;
         host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:' + Z;
+        hostEl = host;
         shadow = host.attachShadow({ mode: 'closed' });
         shadow.innerHTML =
             '<style>' + CSS + '</style>' +
-            '<button class="fab" title="B站听歌列表 (Ctrl+Shift+B)">♪</button>' +
+            '<div class="mini" title="B站听歌列表">' +
+            '<span class="m-ico">♪</span>' +
+            '<div class="m-ui">' +
+            '<button class="m-spec" title="展开播放列表"><i></i><i></i><i></i><i></i><i></i></button>' +
+            '<button class="m-btn m-prev" title="上一首">⏮</button>' +
+            '<button class="m-btn m-play" title="播放/暂停">▶</button>' +
+            '<button class="m-btn m-next" title="下一首">⏭</button>' +
+            '</div>' +
+            '</div>' +
             '<div class="panel">' +
             '<div class="phead">' +
             '<span class="ptitle">♪ B站听歌列表</span>' +
@@ -276,18 +331,31 @@
             '<div class="pbody"><iframe class="pframe" title="playlist" allow="autoplay"></iframe></div>' +
             '</div>';
 
-        fab = shadow.querySelector('.fab');
+        mini = shadow.querySelector('.mini');
+        miniPlay = shadow.querySelector('.m-play');
         panel = shadow.querySelector('.panel');
         pframe = shadow.querySelector('.pframe');
         addBtn = shadow.querySelector('.add');
         addTxt = shadow.querySelector('.addtxt');
 
-        fab.addEventListener('click', () => toggle());
+        mini.addEventListener('click', e => {
+            if (e.target.closest('.m-spec')) { toggle(); return; }
+            if (e.target.closest('.m-prev')) { pPrev(); return; }
+            if (e.target.closest('.m-play')) { pToggle(); return; }
+            if (e.target.closest('.m-next')) { pNext(); return; }
+            if (!mini.classList.contains('loaded')) toggle();
+        });
         shadow.querySelector('.close').addEventListener('click', () => toggle(false));
         addBtn.addEventListener('click', addCurrent);
         makeDraggable(panel, shadow.querySelector('.phead'));
 
         document.body.appendChild(host);
+
+        document.addEventListener('click', e => {
+            if (!panelOpen) return;
+            if (hostEl && hostEl.contains(e.target)) return;
+            toggle(false);
+        }, true);
 
         chrome.storage.local.get(STORE_KEY).then(r => {
             const p = (r && r[STORE_KEY]) || {};
@@ -304,6 +372,16 @@
             if (p.open) setTimeout(() => toggle(true), 60);
         });
         updateAddBtn();
+        updateMiniUI();
+    }
+
+    function updateMiniUI() {
+        if (!mini) return;
+        const hasTrack = !!audio.src;
+        const playing = hasTrack && !audio.paused;
+        mini.classList.toggle('loaded', hasTrack);
+        mini.classList.toggle('playing', playing);
+        if (miniPlay) miniPlay.textContent = playing ? '⏸' : '▶';
     }
 
     function persist() {

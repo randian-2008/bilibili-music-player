@@ -111,8 +111,11 @@ function render() {
 
     const it = playingItem();
     $('#curTitle').textContent = (it && it.title) || '未播放';
-    $('#curSub').textContent = (it && it.owner) || '';
-    $('#nowEq').style.display = it ? '' : 'none';
+    $('#curSub').textContent = (it && it.owner) || '从下方列表选择歌曲';
+    const pic = (it && it.pic) ? httpsUrl(it.pic) : '';
+    const coverEl = $('#npCover');
+    if (coverEl.getAttribute('src') !== pic) coverEl.src = pic;
+    $('#npBg').style.backgroundImage = pic ? 'url("' + pic.replace(/"/g, '') + '")' : '';
 
     const pl = activePlaylist();
     const items = (pl && pl.items) || [];
@@ -316,11 +319,41 @@ fileInput.addEventListener('change', () => {
 $('#playBtn').addEventListener('click', () => act('toggle').then(refresh));
 $('#nextBtn').addEventListener('click', () => act('next'));
 $('#prevBtn').addEventListener('click', () => act('prev'));
+$('#stopBtn').addEventListener('click', () => act('stop').then(refresh));
 $('#modeBtn').addEventListener('click', () => {
     const next = MODES[(modeIndex(state.mode) + 1) % MODES.length];
     send('setMode', { mode: next.id });
 });
 $('#seek').addEventListener('input', e => send('seek', { value: +e.target.value }));
+
+const volSlider = $('#volSlider');
+const volVal = $('#volVal');
+const muteBtn = $('#muteBtn');
+let curMuted = false;
+function paintVolume(v, muted) {
+    volSlider.value = Math.round(v * 100);
+    volVal.textContent = Math.round(v * 100);
+    curMuted = muted;
+    muteBtn.textContent = (muted || v === 0) ? '🔇' : (v < 0.5 ? '🔉' : '🔊');
+    muteBtn.classList.toggle('muted', muted);
+}
+volSlider.addEventListener('input', () => {
+    const v = (+volSlider.value) / 100;
+    volVal.textContent = volSlider.value;
+    muteBtn.textContent = v === 0 ? '🔇' : (v < 0.5 ? '🔉' : '🔊');
+    send('setVolume', { value: v });
+});
+muteBtn.addEventListener('click', () => {
+    const m = !curMuted;
+    send('setMute', { muted: m }).then(res => {
+        if (res && res.ok) paintVolume(res.volume, res.muted);
+    });
+});
+chrome.storage.local.get(['bpl_volume', 'bpl_mute']).then(r => {
+    const v = (typeof r.bpl_volume === 'number') ? r.bpl_volume : 0.8;
+    const m = !!r.bpl_mute;
+    paintVolume(v, m);
+});
 
 const box = $('#list');
 box.addEventListener('click', e => {

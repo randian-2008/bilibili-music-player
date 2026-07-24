@@ -7,38 +7,57 @@
     <title>B站听歌列表</title>
 </head>
 <body>
-    <div class="pl-bar">
-        <select id="plSelect" title="切换歌单"></select>
-        <button id="plNew" class="pbtn" title="新建歌单">＋</button>
-        <button id="plMenuBtn" class="pbtn" title="歌单操作">⋯</button>
-        <div id="plMenu" class="menu hidden">
-            <div data-act="rename">重命名歌单</div>
-            <div data-act="import">导入歌单 (JSON)</div>
-            <div class="sep"></div>
-            <div data-act="export-txt">导出为 TXT</div>
-            <div data-act="export-md">导出为 Markdown</div>
-            <div data-act="export-json">导出为 JSON</div>
-            <div class="sep"></div>
-            <div data-act="clear">清空歌单</div>
-            <div data-act="delete" class="danger">删除歌单</div>
+    <div class="player">
+        <div class="np-bg" id="npBg"></div>
+        <div class="np">
+            <div class="cover-wrap">
+                <img class="cover" id="npCover" alt="" referrerpolicy="no-referrer">
+                <div class="cover-eq" id="nowEq"><i></i><i></i><i></i><i></i><i></i></div>
+            </div>
+            <div class="np-meta">
+                <div class="np-title" id="curTitle">未播放</div>
+                <div class="np-sub" id="curSub">从下方列表选择歌曲</div>
+            </div>
+        </div>
+        <div class="progress">
+            <input type="range" id="seek" min="0" value="0" step="1">
+            <div class="time" id="time">0:00 / 0:00</div>
+        </div>
+        <div class="ctrl">
+            <button id="prevBtn" class="cbtn" title="上一首">⏮</button>
+            <button id="playBtn" class="cbtn main" title="播放/暂停">▶</button>
+            <button id="nextBtn" class="cbtn" title="下一首">⏭</button>
+            <button id="stopBtn" class="cbtn stop" title="停止播放（收起播放器）">■</button>
+            <button id="modeBtn" class="tbtn mode" title="切换播放模式"></button>
+        </div>
+        <div class="volume">
+            <button id="muteBtn" class="vbtn" title="静音/取消静音">🔊</button>
+            <input type="range" id="volSlider" min="0" max="100" value="80" step="1">
+            <span class="vol-val" id="volVal">80</span>
         </div>
     </div>
-    <input type="file" id="importFile" accept=".json,application/json" style="display:none">
-    <div class="now">
-        <div class="now-t">
-            <span class="eq" id="nowEq" style="display:none"><i></i><i></i><i></i></span><span id="curTitle">未播放</span>
+
+    <div class="listwrap">
+        <div class="pl-bar">
+            <select id="plSelect" title="切换歌单"></select>
+            <button id="plNew" class="pbtn" title="新建歌单">＋</button>
+            <button id="plMenuBtn" class="pbtn" title="歌单操作">⋯</button>
+            <div id="plMenu" class="menu hidden">
+                <div data-act="rename">重命名歌单</div>
+                <div data-act="import">导入歌单 (JSON)</div>
+                <div class="sep"></div>
+                <div data-act="export-txt">导出为 TXT</div>
+                <div data-act="export-md">导出为 Markdown</div>
+                <div data-act="export-json">导出为 JSON</div>
+                <div class="sep"></div>
+                <div data-act="clear">清空歌单</div>
+                <div data-act="delete" class="danger">删除歌单</div>
+            </div>
         </div>
-        <div class="now-s" id="curSub"></div>
-        <input type="range" id="seek" min="0" value="0" step="1">
-        <div class="now-time" id="time">0:00 / 0:00</div>
+        <input type="file" id="importFile" accept=".json,application/json" style="display:none">
+        <div id="list" class="list"></div>
     </div>
-    <div class="ctrl">
-        <button id="prevBtn" class="cbtn" title="上一首">⏮</button>
-        <button id="playBtn" class="cbtn main" title="播放/暂停">▶</button>
-        <button id="nextBtn" class="cbtn" title="下一首">⏭</button>
-        <button id="modeBtn" class="tbtn mode" title="切换播放模式"></button>
-    </div>
-    <div id="list" class="list"></div>
+
     <script src="sidepanel.js"></script>
 </body>
 </html>

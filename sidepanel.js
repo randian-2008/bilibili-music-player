@@ -126,9 +126,8 @@ function render() {
         box.innerHTML = items.map((s, i) => {
             const isPlaying = showPlaying && i === state.index;
             return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '">' +
-                '<span class="grip" title="按住六点拖动排序">⋮⋮</span>' +
                 '<span class="chk"></span>' +
-                '<img class="cover" src="' + esc(httpsUrl(s.pic)) + '" referrerpolicy="no-referrer">' +
+                '<img class="cover" src="' + esc(httpsUrl(s.pic)) + '" draggable="true" referrerpolicy="no-referrer">' +
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
                 '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
@@ -416,15 +415,9 @@ function refreshSelUI() {
     $('#selCount').textContent = '已选 ' + selected.size + ' 首';
 }
 
-let gripArmed = null;
 let lpTimer = null, lpStart = null, lpSupp = false;
 box.addEventListener('pointerdown', e => {
-    const g = e.target.closest('.grip');
-    if (g) {
-        const it = g.closest('.item');
-        if (it) { it.draggable = true; gripArmed = it; }
-    }
-    if (!selMode && !e.target.closest('.grip') && !e.target.closest('.ibtn')) {
+    if (!selMode && !e.target.closest('.cover') && !e.target.closest('.ibtn')) {
         const it = e.target.closest('.item');
         if (it) {
             lpStart = { x: e.clientX, y: e.clientY };
@@ -439,7 +432,6 @@ box.addEventListener('pointermove', e => {
     }
 });
 box.addEventListener('pointerup', () => {
-    if (gripArmed) { gripArmed.draggable = false; gripArmed = null; }
     if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
 });
 
@@ -460,6 +452,8 @@ box.addEventListener('dragstart', e => {
     if (!it) return;
     dragFrom = +it.dataset.i;
     it.classList.add('dragging');
+    box.classList.add('drag-on');
+    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
     e.dataTransfer.effectAllowed = 'move';
     try { e.dataTransfer.setData('text/plain', String(dragFrom)); } catch (_) {}
 });
@@ -483,7 +477,7 @@ box.addEventListener('drop', e => {
 });
 box.addEventListener('dragend', () => {
     dragFrom = null;
-    if (gripArmed) { gripArmed.draggable = false; gripArmed = null; }
+    box.classList.remove('drag-on');
     box.querySelectorAll('.item.drag-over,.item.dragging').forEach(x => x.classList.remove('drag-over', 'dragging'));
 });
 

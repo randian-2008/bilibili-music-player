@@ -131,6 +131,7 @@ function render() {
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
                 '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
+                '<a class="ibtn link" href="' + esc(itemUrl(s)) + '" title="在原页面打开">↗</a>' +
                 '</div>';
         }).join('');
     }
@@ -542,6 +543,13 @@ box.addEventListener('pointercancel', () => {
 box.addEventListener('click', e => {
     if (lpSupp) { lpSupp = false; return; }
     if (Date.now() - lastDrop < 300) return;
+    const lk = e.target.closest('a.link');
+    if (lk) {
+        e.preventDefault();
+        e.stopPropagation();
+        send('openTab', { url: lk.getAttribute('href') });
+        return;
+    }
     const rn = e.target.closest('[data-rename]');
     if (rn) { e.stopPropagation(); renameItem(+rn.dataset.rename); return; }
     const it = e.target.closest('.item');

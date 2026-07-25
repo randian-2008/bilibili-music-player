@@ -102,18 +102,28 @@
         if (pIsShuffle(st.mode) && !keepOrder) pBuildFrom(items.length, i);
         const it = items[i];
         const r = await bgResolveAudio(it);
-        if (!r || !r.ok || !r.url) return { ok: false, error: (r && r.error) || '获取音频失败' };
-        try {
-            curIndex = i;
-            audio.src = r.url;
-            await audio.play();
-            await pSetState({ index: i, playing: true });
-            return { ok: true };
-        } catch (e) {
-            const msg = String((e && e.message) || e);
-            const blocked = /autoplay|play\(\)|user (didn|did not)|gesture|not allowed/i.test(msg);
-            return { ok: false, error: blocked ? '浏览器阻止了自动播放：请先点一下页面任意位置或浮动按钮，再点播放' : msg };
+        if (!r || !r.ok || !r.urls || !r.urls.length) return { ok: false, error: (r && r.error) || '获取音频失败' };
+        let blocked = false;
+        for (const url of r.urls) {
+            audio.src = url;
+            try {
+                await audio.play();
+                curIndex = i;
+                await pSetState({ index: i, playing: true });
+                return { ok: true };
+            } catch (e) {
+                const m = String((e && (e.name || e.message)) || e);
+                if (/NotAllowedError|not allowed|autoplay|gesture|user (didn|did not)/i.test(m)) { blocked = true; break; }
+            }
         }
+        audio.removeAttribute('src');
+        audio.load();
+        return {
+            ok: false,
+            error: blocked
+                ? '浏览器阻止了自动播放：请先点一下页面任意位置或浮动按钮，再点播放'
+                : '无法播放该音频（已尝试 ' + r.urls.length + ' 个音源）'
+        };
     }
     async function pStopPlayback() {
         audio.pause();

@@ -8,10 +8,19 @@ function ok(cond, msg) { if (cond) { pass++; console.log('  PASS: ' + msg); } el
 function makeCtx(opts) {
     opts = opts || {};
     const store = opts.store || {};
-    const resolveAudioRes = opts.resolveAudioRes || { ok: true, url: 'https://cdn/audio.m4s' };
+    const resolveAudioRes = opts.resolveAudioRes || { ok: true, urls: ['https://cdn/audio.m4s'] };
+    const failUrls = new Set(opts.failUrls || []);
     const audio = {
         paused: true, src: '', currentTime: 0, duration: 0, playbackRate: 1,
-        play() { this.paused = false; return Promise.resolve(); },
+        play() {
+            if (failUrls.has(this.src)) {
+                const e = new Error('The element has no supported sources.');
+                e.name = 'NotSupportedError';
+                return Promise.reject(e);
+            }
+            this.paused = false;
+            return Promise.resolve();
+        },
         pause() { this.paused = true; },
         load() {},
         removeAttribute() { this.src = ''; },
@@ -84,6 +93,24 @@ async function testPlayIndex() {
     ctx = makeCtx({ store: setupPlaylist(2) });
     r = await ctx.__player.pPlayIndex(0);
     ok(r.ok === true && ctx.__audio.src === 'https://cdn/audio.m4s', '正常播放设置 src (' + ctx.__audio.src + ')');
+
+    // 首个音源不可播 → 自动尝试下一个
+    ctx = makeCtx({
+        store: setupPlaylist(2),
+        resolveAudioRes: { ok: true, urls: ['https://cdn/bad.m4s', 'https://cdn/good.m4s'] },
+        failUrls: ['https://cdn/bad.m4s']
+    });
+    r = await ctx.__player.pPlayIndex(0);
+    ok(r.ok === true && ctx.__audio.src === 'https://cdn/good.m4s', '首源失败自动切换下一源 (' + ctx.__audio.src + ')');
+
+    // 全部音源不可播 → 报错
+    ctx = makeCtx({
+        store: setupPlaylist(2),
+        resolveAudioRes: { ok: true, urls: ['https://cdn/a.m4s', 'https://cdn/b.m4s'] },
+        failUrls: ['https://cdn/a.m4s', 'https://cdn/b.m4s']
+    });
+    r = await ctx.__player.pPlayIndex(0);
+    ok(r.ok === false && /已尝试 2 个音源/.test(r.error), '全部音源失败报错 (' + r.error + ')');
 }
 
 async function testModes() {

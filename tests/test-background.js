@@ -38,28 +38,43 @@ function makeCtx() {
 }
 
 (async () => {
-    console.log('[background getAudioUrl（B站音频源解析）]');
+    console.log('[background getAudioUrls（B站音频源解析·多源容错）]');
 
+    // dash 多码率 → 候选有序（高码率在前），返回多个候选
     let ctx = makeCtx();
     ctx.__setResp({ code: 0, data: { dash: { audio: [
         { baseUrl: 'https://cdn/low.m4s', bandwidth: 1000 },
         { baseUrl: 'https://cdn/high.m4s', bandwidth: 5000 } ] } } });
-    ok(await ctx.getAudioUrl('BV1', 1) === 'https://cdn/high.m4s', 'dash 选最高码率');
+    let urls = await ctx.getAudioUrls('BV1', 1);
+    ok(urls[0] === 'https://cdn/high.m4s', 'dash 高码率在前 (' + urls[0] + ')');
+    ok(urls.length >= 2, '返回多个候选源 (' + urls.length + ')');
 
+    // 含备用链接
+    ctx = makeCtx();
+    ctx.__setResp({ code: 0, data: { dash: { audio: [
+        { baseUrl: 'https://cdn/main.m4s', backup_url: ['https://cdn/bak1.m4s'], bandwidth: 3000 } ] } } });
+    urls = await ctx.getAudioUrls('BV1', 1);
+    ok(urls.includes('https://cdn/main.m4s') && urls.includes('https://cdn/bak1.m4s'), '主链+备用链 (' + urls.join(',') + ')');
+
+    // 普通音频在前、flac 作为候选
     ctx = makeCtx();
     ctx.__setResp({ code: 0, data: { dash: {
         audio: [{ baseUrl: 'https://cdn/normal.m4s', bandwidth: 3000 }],
         flac: { audio: { baseUrl: 'https://cdn/flac.m4s', bandwidth: 9000 } } } } });
-    ok(await ctx.getAudioUrl('BV1', 1) === 'https://cdn/flac.m4s', '合并 flac 选最高');
+    urls = await ctx.getAudioUrls('BV1', 1);
+    ok(urls[0] === 'https://cdn/normal.m4s' && urls.includes('https://cdn/flac.m4s'), '普通音频优先、flac 候选 (' + urls.join(',') + ')');
 
+    // durl(mp4) 兜底
     ctx = makeCtx();
     ctx.__setResp({ code: 0, data: { durl: [{ url: 'https://cdn/fb.mp4' }] } });
-    ok(await ctx.getAudioUrl('BV1', 1) === 'https://cdn/fb.mp4', 'durl 回退');
+    urls = await ctx.getAudioUrls('BV1', 1);
+    ok(urls.includes('https://cdn/fb.mp4'), 'durl 兜底 (' + urls.join(',') + ')');
 
+    // 接口错误
     ctx = makeCtx();
     ctx.__setResp({ code: -403, message: '需要登录' });
     let threw = false;
-    try { await ctx.getAudioUrl('BV1', 1); } catch (e) { threw = /需要登录|code=-403/.test(e.message); }
+    try { await ctx.getAudioUrls('BV1', 1); } catch (e) { threw = /需要登录|未获取到音频流/.test(e.message); }
     ok(threw, '接口错误抛异常');
 
     console.log('\n[background resolveCid]');

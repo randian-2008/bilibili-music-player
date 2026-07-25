@@ -177,6 +177,8 @@ input[type=range]:hover::-webkit-slider-thumb { transform: scale(1.3); }
     color: #888; border-radius: 4px; font-size: 13px; cursor: pointer; transition: .12s;
 }
 .ibtn:hover { color: #fff; background: #3a3a3f; }
+.ibtn.link { display: flex; align-items: center; justify-content: center; text-decoration: none; color: #8a8a92; }
+.ibtn.link:hover { color: #fb7299; background: #2a2026; }
 
 .empty { text-align: center; color: #777; font-size: 13px; padding: 40px 20px; line-height: 1.8; }
 

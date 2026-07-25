@@ -41,25 +41,37 @@ async function resolveCid(bvid, page) {
     const pg = (page && pages.find(x => x.page === page)) || pages[0] || {};
     return { cid: pg.cid || d.cid || 0, info: d, page: pg };
 }
-async function getAudioUrl(bvid, cid) {
-    const j = await biliFetch('https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) +
-        '&cid=' + encodeURIComponent(cid) + '&fnval=4048&fourk=1');
-    if (!j || j.code !== 0 || !j.data) {
-        throw new Error('playurl 接口返回错误：' + ((j && j.message) || ('code=' + (j && j.code))));
-    }
-    const data = j.data;
-    const dash = data.dash;
-    if (dash) {
-        let aud = (dash.audio || []).slice();
-        if (dash.dolby && dash.dolby.audio && dash.dolby.audio.length) aud = aud.concat(dash.dolby.audio);
-        if (dash.flac && dash.flac.audio) aud = aud.concat([dash.flac.audio]);
-        if (aud.length) {
-            aud.sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
-            return aud[0].baseUrl || aud[0].base_url;
+async function getAudioUrls(bvid, cid) {
+    const base = 'https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) + '&cid=' + encodeURIComponent(cid);
+    const pushStreams = (list, urls) => {
+        for (const a of list) {
+            const main = a.baseUrl || a.base_url || a.url;
+            if (main) urls.push(main);
+            for (const b of (a.backupUrl || a.backup_url || [])) if (b) urls.push(b);
         }
+    };
+    const [jDash, jMp4] = await Promise.all([
+        biliFetch(base + '&fnval=4048&fourk=1').catch(() => null),
+        biliFetch(base + '&fnval=1').catch(() => null)
+    ]);
+    const urls = [];
+    if (jDash && jDash.code === 0 && jDash.data && jDash.data.dash) {
+        const dash = jDash.data.dash;
+        const aud = (dash.audio || []).slice().sort((a, b) => (b.bandwidth || 0) - (a.bandwidth || 0));
+        const extra = [];
+        if (dash.dolby && dash.dolby.audio && dash.dolby.audio.length) extra.push(...dash.dolby.audio);
+        if (dash.flac && dash.flac.audio) extra.push(dash.flac.audio);
+        pushStreams(aud, urls);
+        pushStreams(extra, urls);
     }
-    if (data.durl && data.durl.length) return data.durl[0].url;
-    throw new Error('未获取到音频流（可能需要登录B站或该视频无音频）');
+    if (jMp4 && jMp4.code === 0 && jMp4.data && jMp4.data.durl && jMp4.data.durl.length) {
+        pushStreams(jMp4.data.durl, urls);
+    }
+    if (!urls.length) {
+        const msg = (jDash && jDash.message) || (jMp4 && jMp4.message);
+        throw new Error('未获取到音频流' + (msg ? '：' + msg : '（可能需要登录B站或该视频无音频）'));
+    }
+    return [...new Set(urls)];
 }
 async function buildItem(bvid, page, fallbackTitle) {
     try {
@@ -154,11 +166,15 @@ async function handleBg(msg, sender) {
                 let cid = msg.cid || 0;
                 if (!cid) cid = (await resolveCid(msg.bvid, msg.page || 1)).cid;
                 if (!cid) return { ok: false, error: '无法解析视频 cid' };
-                const url = await getAudioUrl(msg.bvid, cid);
-                return { ok: true, url: url };
+                const urls = await getAudioUrls(msg.bvid, cid);
+                return { ok: true, urls: urls };
             } catch (e) {
                 return { ok: false, error: String((e && e.message) || e) };
             }
+        }
+        case 'openTab': {
+            if (msg.url) chrome.tabs.create({ url: msg.url });
+            return { ok: true };
         }
         case 'remove': {
             const lists = await getPlaylists();

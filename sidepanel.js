@@ -21,7 +21,7 @@ let activeId = null;
 let state = Object.assign({}, DEF_STATE);
 let position = 0;
 let duration = 0;
-let dragFrom = null;
+let drag = null;
 let lastDrop = 0;
 
 function esc(s) {
@@ -127,7 +127,7 @@ function render() {
             const isPlaying = showPlaying && i === state.index;
             return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '">' +
                 '<span class="chk"></span>' +
-                '<img class="cover" src="' + esc(httpsUrl(s.pic)) + '" draggable="true" referrerpolicy="no-referrer">' +
+                '<img class="cover" src="' + esc(httpsUrl(s.pic)) + '" draggable="false" referrerpolicy="no-referrer">' +
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
                 '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
@@ -416,23 +416,102 @@ function refreshSelUI() {
 }
 
 let lpTimer = null, lpStart = null, lpSupp = false;
+let popTimer = null, hoverCover = null;
+
+function findTargetIndex(clientY) {
+    const items = [...box.querySelectorAll('.item')].filter(el => !el.classList.contains('dragging'));
+    for (const el of items) {
+        const r = el.getBoundingClientRect();
+        if (clientY <= r.top + r.height / 2) return +el.dataset.i;
+    }
+    return items.length ? +items[items.length - 1].dataset.i : null;
+}
+function cleanupDrag() {
+    if (!drag) return;
+    drag.el.style.transform = '';
+    drag.el.classList.remove('dragging');
+    box.classList.remove('drag-on');
+    box.querySelectorAll('.item.drag-over').forEach(x => x.classList.remove('drag-over'));
+    drag = null;
+}
+function showCoverPop(cover) {
+    if (box.classList.contains('drag-on') || !cover.isConnected) return;
+    const r = cover.getBoundingClientRect();
+    const pop = $('#coverPop'), img = $('#coverPopImg');
+    const W = r.width * 3, H = r.height * 3;
+    img.src = cover.src;
+    pop.style.width = W + 'px';
+    pop.style.height = H + 'px';
+    pop.style.left = (r.left + r.width / 2 - W / 2) + 'px';
+    pop.style.top = (r.top + r.height / 2 - H / 2) + 'px';
+    pop.classList.add('show');
+}
+function hideCoverPop() { $('#coverPop').classList.remove('show'); }
+
 box.addEventListener('pointerdown', e => {
-    if (!selMode && !e.target.closest('.cover') && !e.target.closest('.ibtn')) {
-        const it = e.target.closest('.item');
-        if (it) {
-            lpStart = { x: e.clientX, y: e.clientY };
-            const idx = +it.dataset.i;
-            lpTimer = setTimeout(() => { lpTimer = null; lpSupp = true; enterSelMode(idx); }, 500);
-        }
+    const it = e.target.closest('.item');
+    if (!it) return;
+    const cover = e.target.closest('.cover');
+    if (cover && !selMode) {
+        drag = { from: +it.dataset.i, el: it, startY: e.clientY, moved: false };
+        try { cover.setPointerCapture(e.pointerId); } catch (_) {}
+        return;
+    }
+    if (!selMode && !cover && !e.target.closest('.ibtn')) {
+        lpStart = { x: e.clientX, y: e.clientY };
+        const idx = +it.dataset.i;
+        lpTimer = setTimeout(() => { lpTimer = null; lpSupp = true; enterSelMode(idx); }, 500);
     }
 });
 box.addEventListener('pointermove', e => {
     if (lpTimer && lpStart && Math.hypot(e.clientX - lpStart.x, e.clientY - lpStart.y) > 6) {
         clearTimeout(lpTimer); lpTimer = null;
     }
+    if (!drag) return;
+    const dy = e.clientY - drag.startY;
+    if (!drag.moved && Math.abs(dy) > 5) {
+        drag.moved = true;
+        drag.el.classList.add('dragging');
+        box.classList.add('drag-on');
+        hideCoverPop();
+    }
+    if (drag.moved) {
+        const lr = box.getBoundingClientRect();
+        if (e.clientY < lr.top + 36) box.scrollTop -= 10;
+        else if (e.clientY > lr.bottom - 36) box.scrollTop += 10;
+        drag.el.style.transform = 'translateY(' + dy + 'px)';
+        const target = findTargetIndex(e.clientY);
+        box.querySelectorAll('.item.drag-over').forEach(x => x.classList.remove('drag-over'));
+        if (target != null && target !== drag.from) {
+            const tEl = box.querySelector('.item[data-i="' + target + '"]');
+            if (tEl) tEl.classList.add('drag-over');
+        }
+    }
 });
-box.addEventListener('pointerup', () => {
+box.addEventListener('pointerup', e => {
     if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+    if (!drag) return;
+    const wasMoved = drag.moved, from = drag.from;
+    let moved = false;
+    if (wasMoved) {
+        const target = findTargetIndex(e.clientY);
+        if (target != null && target !== from) {
+            lastDrop = Date.now();
+            send('moveItem', { from: from, to: target });
+            moved = true;
+        }
+    }
+    box.classList.remove('drag-on');
+    box.querySelectorAll('.item.drag-over').forEach(x => x.classList.remove('drag-over'));
+    if (!moved) {
+        drag.el.classList.remove('dragging');
+        drag.el.style.transform = '';
+    }
+    drag = null;
+});
+box.addEventListener('pointercancel', () => {
+    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+    cleanupDrag();
 });
 
 box.addEventListener('click', e => {
@@ -447,38 +526,20 @@ box.addEventListener('click', e => {
     act('playIndex', { index: i });
 });
 
-box.addEventListener('dragstart', e => {
-    const it = e.target.closest('.item');
-    if (!it) return;
-    dragFrom = +it.dataset.i;
-    it.classList.add('dragging');
-    box.classList.add('drag-on');
-    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
-    e.dataTransfer.effectAllowed = 'move';
-    try { e.dataTransfer.setData('text/plain', String(dragFrom)); } catch (_) {}
-});
-box.addEventListener('dragover', e => {
-    if (dragFrom == null) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-    const it = e.target.closest('.item');
-    box.querySelectorAll('.item.drag-over').forEach(x => x.classList.remove('drag-over'));
-    if (it) it.classList.add('drag-over');
-});
-box.addEventListener('drop', e => {
-    e.preventDefault();
-    const it = e.target.closest('.item');
-    if (it && dragFrom != null) {
-        const to = +it.dataset.i;
-        if (to !== dragFrom) { lastDrop = Date.now(); send('moveItem', { from: dragFrom, to }); }
+box.addEventListener('mouseover', e => {
+    const cover = e.target.closest('.cover');
+    if (cover === hoverCover) return;
+    hoverCover = cover;
+    if (popTimer) { clearTimeout(popTimer); popTimer = null; }
+    hideCoverPop();
+    if (cover && !box.classList.contains('drag-on') && !drag) {
+        popTimer = setTimeout(() => { popTimer = null; showCoverPop(cover); }, 2000);
     }
-    dragFrom = null;
-    box.querySelectorAll('.item.drag-over,.item.dragging').forEach(x => x.classList.remove('drag-over', 'dragging'));
 });
-box.addEventListener('dragend', () => {
-    dragFrom = null;
-    box.classList.remove('drag-on');
-    box.querySelectorAll('.item.drag-over,.item.dragging').forEach(x => x.classList.remove('drag-over', 'dragging'));
+box.addEventListener('mouseleave', () => {
+    hoverCover = null;
+    if (popTimer) { clearTimeout(popTimer); popTimer = null; }
+    hideCoverPop();
 });
 
 let selAction = null;

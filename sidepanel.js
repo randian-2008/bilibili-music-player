@@ -426,6 +426,11 @@ function findTargetIndex(clientY) {
     }
     return items.length ? +items[items.length - 1].dataset.i : null;
 }
+function removeDragListeners() {
+    window.removeEventListener('pointermove', dragMove);
+    window.removeEventListener('pointerup', dragUp);
+    window.removeEventListener('pointercancel', dragCancel);
+}
 function cleanupDrag() {
     if (!drag) return;
     drag.el.style.transform = '';
@@ -434,39 +439,7 @@ function cleanupDrag() {
     box.querySelectorAll('.item.drag-over').forEach(x => x.classList.remove('drag-over'));
     drag = null;
 }
-function showCoverPop(cover) {
-    if (box.classList.contains('drag-on') || !cover.isConnected) return;
-    const r = cover.getBoundingClientRect();
-    const pop = $('#coverPop'), img = $('#coverPopImg');
-    const W = r.width * 3, H = r.height * 3;
-    img.src = cover.src;
-    pop.style.width = W + 'px';
-    pop.style.height = H + 'px';
-    pop.style.left = (r.left + r.width / 2 - W / 2) + 'px';
-    pop.style.top = (r.top + r.height / 2 - H / 2) + 'px';
-    pop.classList.add('show');
-}
-function hideCoverPop() { $('#coverPop').classList.remove('show'); }
-
-box.addEventListener('pointerdown', e => {
-    const it = e.target.closest('.item');
-    if (!it) return;
-    const cover = e.target.closest('.cover');
-    if (cover && !selMode) {
-        drag = { from: +it.dataset.i, el: it, startY: e.clientY, moved: false };
-        try { cover.setPointerCapture(e.pointerId); } catch (_) {}
-        return;
-    }
-    if (!selMode && !cover && !e.target.closest('.ibtn')) {
-        lpStart = { x: e.clientX, y: e.clientY };
-        const idx = +it.dataset.i;
-        lpTimer = setTimeout(() => { lpTimer = null; lpSupp = true; enterSelMode(idx); }, 500);
-    }
-});
-box.addEventListener('pointermove', e => {
-    if (lpTimer && lpStart && Math.hypot(e.clientX - lpStart.x, e.clientY - lpStart.y) > 6) {
-        clearTimeout(lpTimer); lpTimer = null;
-    }
+function dragMove(e) {
     if (!drag) return;
     const dy = e.clientY - drag.startY;
     if (!drag.moved && Math.abs(dy) > 5) {
@@ -487,31 +460,83 @@ box.addEventListener('pointermove', e => {
             if (tEl) tEl.classList.add('drag-over');
         }
     }
-});
-box.addEventListener('pointerup', e => {
-    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
+}
+function dragUp(e) {
+    removeDragListeners();
     if (!drag) return;
     const wasMoved = drag.moved, from = drag.from;
-    let moved = false;
+    let reordered = false;
     if (wasMoved) {
         const target = findTargetIndex(e.clientY);
         if (target != null && target !== from) {
             lastDrop = Date.now();
+            const pl = playlists.find(p => p.id === activeId);
+            if (pl) {
+                const insertAt = from < target ? target - 1 : target;
+                const mv = pl.items.splice(from, 1)[0];
+                pl.items.splice(insertAt, 0, mv);
+                reordered = true;
+            }
             send('moveItem', { from: from, to: target });
-            moved = true;
         }
     }
     box.classList.remove('drag-on');
     box.querySelectorAll('.item.drag-over').forEach(x => x.classList.remove('drag-over'));
-    if (!moved) {
-        drag.el.classList.remove('dragging');
-        drag.el.style.transform = '';
-    }
+    drag.el.classList.remove('dragging');
+    drag.el.style.transform = '';
     drag = null;
+    if (reordered) {
+        const sc = box.scrollTop;
+        render();
+        box.scrollTop = sc;
+    }
+}
+function dragCancel() {
+    removeDragListeners();
+    cleanupDrag();
+}
+function showCoverPop(cover) {
+    if (box.classList.contains('drag-on') || !cover.isConnected) return;
+    const r = cover.getBoundingClientRect();
+    const pop = $('#coverPop'), img = $('#coverPopImg');
+    const W = r.width * 3, H = r.height * 3;
+    img.src = cover.src;
+    pop.style.width = W + 'px';
+    pop.style.height = H + 'px';
+    pop.style.left = r.left + 'px';
+    pop.style.top = (r.bottom - H) + 'px';
+    pop.classList.add('show');
+}
+function hideCoverPop() { $('#coverPop').classList.remove('show'); }
+
+box.addEventListener('pointerdown', e => {
+    if (drag) { removeDragListeners(); cleanupDrag(); }
+    const it = e.target.closest('.item');
+    if (!it) return;
+    const cover = e.target.closest('.cover');
+    if (cover && !selMode) {
+        drag = { from: +it.dataset.i, el: it, startY: e.clientY, moved: false };
+        window.addEventListener('pointermove', dragMove);
+        window.addEventListener('pointerup', dragUp);
+        window.addEventListener('pointercancel', dragCancel);
+        return;
+    }
+    if (!selMode && !cover && !e.target.closest('.ibtn')) {
+        lpStart = { x: e.clientX, y: e.clientY };
+        const idx = +it.dataset.i;
+        lpTimer = setTimeout(() => { lpTimer = null; lpSupp = true; enterSelMode(idx); }, 500);
+    }
+});
+box.addEventListener('pointermove', e => {
+    if (lpTimer && lpStart && Math.hypot(e.clientX - lpStart.x, e.clientY - lpStart.y) > 6) {
+        clearTimeout(lpTimer); lpTimer = null;
+    }
+});
+box.addEventListener('pointerup', () => {
+    if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
 });
 box.addEventListener('pointercancel', () => {
     if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; }
-    cleanupDrag();
 });
 
 box.addEventListener('click', e => {

@@ -27,6 +27,20 @@ function makeCtx(opts) {
         removeAttribute() { this.src = ''; },
         addEventListener() {}
     };
+    const handlers = [];
+    const portSent = [];
+    const port = {
+        postMessage(msg) {
+            portSent.push(msg);
+            if (msg && msg.resolveAudio) {
+                Promise.resolve().then(() => {
+                    handlers.forEach(fn => fn({ _id: msg._id, result: resolveAudioRes }));
+                });
+            }
+        },
+        onMessage: { addListener: (fn) => handlers.push(fn) },
+        onDisconnect: { addListener() {} }
+    };
     const sandbox = {
         console, Math, JSON, Promise, Date, URLSearchParams,
         setTimeout: (fn) => 0, clearTimeout: () => {}, setInterval: () => 0,
@@ -40,13 +54,8 @@ function makeCtx(opts) {
         document: { getElementById: () => audio },
         chrome: {
             runtime: {
-                sendMessage: (msg, cb) => {
-                    if (msg && msg.cmd === 'resolveAudio') {
-                        if (cb) cb(resolveAudioRes);
-                        return Promise.resolve(resolveAudioRes);
-                    }
-                    return Promise.resolve(undefined);
-                },
+                connect: () => port,
+                sendMessage: () => Promise.resolve(undefined),
                 onMessage: { addListener() {} }
             },
             storage: {
@@ -57,7 +66,9 @@ function makeCtx(opts) {
                 onChanged: { addListener() {} }
             }
         },
-        __audio: audio, __store: store
+        __audio: audio, __store: store,
+        __port: port, __portSent: portSent,
+        __drive: (msg) => { handlers.forEach(fn => fn(msg)); }
     };
     vm.createContext(sandbox);
     vm.runInContext(code, sandbox);
@@ -166,11 +177,36 @@ async function testHandleCmd() {
     ok(r.ok === true && ctx.__audio.src === '' , 'stop 清空音源');
 }
 
+async function testPort() {
+    console.log('\n[offscreen Port 命令闭环]');
+    const ctx = makeCtx({ store: setupPlaylist(3) });
+    const before = ctx.__portSent.length;
+    ctx.__drive({ _id: 42, cmd: 'setMode', mode: 'shuffle' });
+    let resp = null;
+    for (let i = 0; i < 20; i++) {
+        resp = ctx.__portSent.slice(before).find(m => m._id === 42);
+        if (resp) break;
+        await new Promise(r => setTimeout(r, 5));
+    }
+    ok(resp && resp.result && resp.result.ok === true && (await ctx.pGetState()).mode === 'shuffle',
+        'Port 命令→响应闭环（setMode）');
+
+    ctx.__drive({ _id: 43, cmd: 'getStatus' });
+    resp = null;
+    for (let i = 0; i < 20; i++) {
+        resp = ctx.__portSent.slice(before).find(m => m._id === 43);
+        if (resp) break;
+        await new Promise(r => setTimeout(r, 5));
+    }
+    ok(resp && resp.result && typeof resp.result.position === 'number', 'Port getStatus 响应');
+}
+
 (async () => {
     try {
         await testPlayIndex();
         await testModes();
         await testHandleCmd();
+        await testPort();
     } catch (e) { console.error('测试执行异常:', e); fail++; }
     console.log('\n=================');
     console.log('通过: ' + pass + '  失败: ' + fail);

@@ -122,7 +122,10 @@ async function ensureDefaultPlaylist() {
 
 const OFFSCREEN_PATH = 'offscreen.html';
 let creating = null;
+let offscreenPort = null;
 let offscreenReady = false;
+let portMsgId = 0;
+const portWaiters = {};
 
 async function hasOffscreen() {
     if (chrome.offscreen.hasDocument) {
@@ -134,7 +137,7 @@ async function hasOffscreen() {
     } catch (e) { return false; }
 }
 async function ensureOffscreen() {
-    if (await hasOffscreen()) return;
+    if (offscreenPort || await hasOffscreen()) return;
     if (creating) { await creating; return; }
     creating = chrome.offscreen.createDocument({
         url: OFFSCREEN_PATH,
@@ -143,36 +146,73 @@ async function ensureOffscreen() {
     }).finally(() => { creating = null; });
     await creating;
 }
-async function waitReady(timeout = 3000) {
-    if (offscreenReady) return true;
+async function waitForPort(timeout = 4000) {
+    if (offscreenPort) return true;
     const start = Date.now();
     while (Date.now() - start < timeout) {
-        try {
-            const res = await chrome.runtime.sendMessage({ target: 'offscreen', cmd: 'getStatus' });
-            if (res && res.ok) { offscreenReady = true; return true; }
-        } catch (e) {}
+        if (offscreenPort) return true;
         await new Promise(r => setTimeout(r, 120));
     }
-    return false;
+    return !!offscreenPort;
+}
+async function handleResolveAudio(p) {
+    try {
+        let cid = p.cid || 0;
+        if (!cid) cid = (await resolveCid(p.bvid, p.page || 1)).cid;
+        if (!cid) return { ok: false, error: '无法解析视频 cid' };
+        const urls = await getAudioUrls(p.bvid, cid);
+        return { ok: true, urls: urls };
+    } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) };
+    }
 }
 async function sendToOffscreen(msg) {
     let lastErr = '未知错误';
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
             await ensureOffscreen();
-            await waitReady();
-            const res = await chrome.runtime.sendMessage(Object.assign({ target: 'offscreen' }, msg));
-            if (res !== undefined) return res;
+            if (!(await waitForPort())) throw new Error('offscreen 端口未连接');
+            const id = ++portMsgId;
+            const result = await new Promise(resolve => {
+                portWaiters[id] = resolve;
+                try { offscreenPort.postMessage(Object.assign({ _id: id }, msg)); } catch (e) { resolve(undefined); }
+                setTimeout(() => {
+                    if (portWaiters[id]) { delete portWaiters[id]; resolve(undefined); }
+                }, 8000);
+            });
+            if (result !== undefined) return result;
             throw new Error('offscreen 无响应');
         } catch (e) {
             lastErr = String((e && e.message) || e);
             offscreenReady = false;
+            offscreenPort = null;
             try { if (chrome.offscreen.closeDocument) await chrome.offscreen.closeDocument(); } catch (_) {}
             await new Promise(r => setTimeout(r, 200));
         }
     }
     return { ok: false, error: '音频模块通信失败：' + lastErr };
 }
+
+chrome.runtime.onConnect.addListener(port => {
+    if (port.name !== 'bpl-audio') return;
+    offscreenPort = port;
+    offscreenReady = true;
+    port.onMessage.addListener(msg => {
+        if (!msg || msg._id == null) return;
+        if (msg.resolveAudio) {
+            handleResolveAudio(msg.resolveAudio).then(result => {
+                try { port.postMessage({ _id: msg._id, result: result }); } catch (e) {}
+            });
+            return;
+        }
+        const w = portWaiters[msg._id];
+        if (w) { delete portWaiters[msg._id]; w(msg.result); }
+    });
+    port.onDisconnect.addListener(() => {
+        if (offscreenPort === port) offscreenPort = null;
+        offscreenReady = false;
+    });
+});
 
 function broadcast(msg) {
     chrome.runtime.sendMessage(Object.assign({ target: 'all' }, msg)).catch(() => {});
@@ -187,7 +227,6 @@ async function broadcastData() {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg) return;
-    if (msg.type === 'ready') { offscreenReady = true; return; }
     if (msg.target === 'bg') {
         handleBg(msg, sender)
             .then(res => sendResponse(res || { ok: true }))
@@ -217,22 +256,18 @@ async function handleBg(msg, sender) {
             return { ok: true };
         }
         case 'resolveAudio': {
-            try {
-                let cid = msg.cid || 0;
-                if (!cid) cid = (await resolveCid(msg.bvid, msg.page || 1)).cid;
-                if (!cid) return { ok: false, error: '无法解析视频 cid' };
-                const urls = await getAudioUrls(msg.bvid, cid);
-                return { ok: true, urls: urls };
-            } catch (e) {
-                return { ok: false, error: String((e && e.message) || e) };
-            }
+            return await handleResolveAudio(msg);
         }
         case 'openTab': {
             if (msg.url) chrome.tabs.create({ url: msg.url });
             return { ok: true };
         }
         case 'player': {
-            return await sendToOffscreen(msg.payload || {});
+            const payload = msg.payload || {};
+            if (payload.cmd === 'getStatus' && !offscreenPort && !(await hasOffscreen())) {
+                return { ok: true, position: 0, duration: 0, playing: false, index: -1, hasTrack: false };
+            }
+            return await sendToOffscreen(payload);
         }
         case 'remove': {
             const lists = await getPlaylists();

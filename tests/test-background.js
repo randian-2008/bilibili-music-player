@@ -10,26 +10,49 @@ function makeCtx(opts) {
     let resp = {};
     const store = {};
     const off = { exists: false, createCalls: 0, closeCalls: 0 };
-    const offscreenResponder = opts.offscreenResponder || (() => Promise.resolve(undefined));
+    const offscreenResponder = opts.offscreenResponder || ((msg) => ({ ok: true, echoed: msg.cmd }));
+    const connectHandlers = [];
+    const portHandlers = [];
+    const portSent = [];
+    let connected = false;
+    const fakePort = {
+        name: 'bpl-audio',
+        postMessage(msg) {
+            portSent.push(msg);
+            if (msg._id != null && msg.cmd) {
+                Promise.resolve().then(() => {
+                    const res = offscreenResponder(msg);
+                    Promise.resolve(res).then(r => {
+                        portHandlers.forEach(fn => fn({ _id: msg._id, result: r }));
+                    });
+                });
+            }
+        },
+        onMessage: { addListener: (fn) => portHandlers.push(fn) },
+        onDisconnect: { addListener() {} }
+    };
     const sandbox = {
         console, Math, JSON, Promise, Date,
-        setTimeout: (fn) => { Promise.resolve().then(fn); return 0; }, clearTimeout: () => {},
+        setTimeout: (fn) => { setImmediate(fn); return 0; }, clearTimeout: () => {},
         fetch: () => Promise.resolve({ json: () => Promise.resolve(resp) }),
         __setResp: r => { resp = r; },
         __store: store,
         __off: off,
+        __portSent: portSent,
         chrome: {
             runtime: {
                 onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
-                sendMessage: (msg) => {
-                    if (msg && msg.target === 'offscreen') return offscreenResponder(msg);
-                    return Promise.resolve(undefined);
-                },
+                onConnect: { addListener: (fn) => connectHandlers.push(fn) },
+                sendMessage: () => Promise.resolve(undefined),
                 getContexts: () => Promise.resolve(off.exists ? [{}] : [])
             },
             offscreen: {
                 hasDocument: () => Promise.resolve(off.exists),
-                createDocument: () => { off.createCalls++; off.exists = true; return Promise.resolve(); },
+                createDocument: () => {
+                    off.createCalls++; off.exists = true;
+                    Promise.resolve().then(() => { connected = true; connectHandlers.forEach(fn => fn(fakePort)); });
+                    return Promise.resolve();
+                },
                 closeDocument: () => { off.closeCalls++; off.exists = false; return Promise.resolve(); }
             },
             action: { onClicked: { addListener() {} } },
@@ -43,7 +66,9 @@ function makeCtx(opts) {
                     remove: () => Promise.resolve()
                 }
             }
-        }
+        },
+        __connectPort: () => { connected = true; connectHandlers.forEach(fn => fn(fakePort)); },
+        __firePort: (msg) => { portHandlers.forEach(fn => fn(msg)); }
     };
     vm.createContext(sandbox);
     vm.runInContext(code, sandbox);
@@ -164,12 +189,13 @@ function makeCtx(opts) {
     ok(ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') === 'BV0,BV3,BV1,BV2,BV4',
         '上拖落位准确 (' + ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') + ')');
 
-    console.log('\n[background offscreen 路由]');
-    // sendToOffscreen 正常：创建 offscreen 并转发命令
-    ctx = makeCtx({ offscreenResponder: (msg) => Promise.resolve(msg.cmd === 'getStatus' ? { ok: true } : { ok: true, echoed: msg.cmd }) });
+    console.log('\n[background offscreen 路由（Port 通信）]');
+    // sendToOffscreen 正常：创建 offscreen 并经 Port 转发命令
+    ctx = makeCtx({ offscreenResponder: (msg) => ({ ok: true, echoed: msg.cmd }) });
     r = await ctx.sendToOffscreen({ cmd: 'toggle' });
-    ok(r.ok && r.echoed === 'toggle', 'sendToOffscreen 转发命令并返回响应');
+    ok(r.ok && r.echoed === 'toggle', 'sendToOffscreen 经 Port 转发命令并返回响应');
     ok(ctx.__off.createCalls === 1 && ctx.__off.exists, '自动创建 offscreen 文档');
+    ok(ctx.__portSent.some(m => m.cmd === 'toggle'), '命令通过 port.postMessage 发送');
 
     // 已存在则不重复创建
     r = await ctx.sendToOffscreen({ cmd: 'next' });
@@ -179,21 +205,31 @@ function makeCtx(opts) {
     r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'prev' } }, null);
     ok(r.ok && r.echoed === 'prev', 'handleBg player 路由到 offscreen');
 
-    // offscreen 无响应 → 重试（关闭重建）后仍失败 → 返回错误
-    ctx = makeCtx({ offscreenResponder: () => Promise.resolve(undefined) });
+    // getStatus 且 offscreen 未创建 → 直接返回默认状态（不急着创建）
+    ctx = makeCtx({ offscreenResponder: () => ({ ok: true }) });
+    r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'getStatus' } }, null);
+    ok(r.ok && r.hasTrack === false && ctx.__off.createCalls === 0, 'getStatus 无 offscreen 时不创建、返回默认');
+
+    // offscreen 持续无响应 → 重试（关闭重建）后仍失败 → 返回错误
+    ctx = makeCtx({ offscreenResponder: () => undefined });
     r = await ctx.sendToOffscreen({ cmd: 'toggle' });
     ok(r.ok === false && /音频模块通信失败/.test(r.error), 'offscreen 持续无响应返回错误');
     ok(ctx.__off.closeCalls >= 1, '失败时关闭重建 offscreen (closeCalls=' + ctx.__off.closeCalls + ')');
 
-    // 首次无响应、第二次恢复 → 重试成功
-    let calls = 0;
-    ctx = makeCtx({ offscreenResponder: (msg) => {
-        calls++;
-        if (msg.cmd === 'getStatus') return Promise.resolve(calls <= 2 ? undefined : { ok: true });
-        return Promise.resolve(calls <= 2 ? undefined : { ok: true, echoed: msg.cmd });
-    } });
-    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
-    ok(r.ok && r.echoed === 'toggle', 'offscreen 恢复后重试成功');
+    // resolveAudio 经 Port 请求处理
+    ctx = makeCtx();
+    ctx.__setResp({ code: 0, data: { dash: { audio: [{ baseUrl: 'https://cdn/a.m4s', bandwidth: 1000 }] } } });
+    await ctx.__connectPort();
+    const before = ctx.__portSent.length;
+    ctx.__firePort({ _id: 7, resolveAudio: { bvid: 'BV1', cid: 1 } });
+    let got = null;
+    for (let i = 0; i < 20; i++) {
+        got = ctx.__portSent.slice(before).find(m => m._id === 7);
+        if (got) break;
+        await new Promise(r2 => setTimeout(r2, 5));
+    }
+    ok(got && got.result && got.result.ok && got.result.urls[0] === 'https://cdn/a.m4s',
+        'resolveAudio 经 Port 响应 (' + (got && got.result && got.result.urls && got.result.urls[0]) + ')');
 
     console.log('\n=================');
     console.log('通过: ' + pass + '  失败: ' + fail);

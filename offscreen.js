@@ -45,16 +45,58 @@ async function pEnsurePlaylist() {
     if (activeId) return await pSetState({ playlistId: activeId });
     return st;
 }
+let port = null;
+let reqId = 0;
+const pendingReq = {};
+
+function connectAudioPort() {
+    let p;
+    try {
+        p = chrome.runtime.connect({ name: 'bpl-audio' });
+    } catch (e) {
+        setTimeout(() => connectAudioPort(), 500);
+        return;
+    }
+    port = p;
+    p.onMessage.addListener(msg => {
+        if (!msg || msg._id == null) return;
+        if (msg.cmd) {
+            handleCmd(msg).then(res => {
+                try { p.postMessage({ _id: msg._id, result: res || { ok: true } }); } catch (e) {}
+            }).catch(e => {
+                try { p.postMessage({ _id: msg._id, result: { ok: false, error: String((e && e.message) || e) } }); } catch (_) {}
+            });
+            return;
+        }
+        if (pendingReq[msg._id]) {
+            const cb = pendingReq[msg._id];
+            delete pendingReq[msg._id];
+            cb(msg.result);
+        }
+    });
+    p.onDisconnect.addListener(() => {
+        if (port === p) port = null;
+        setTimeout(() => connectAudioPort(), 500);
+    });
+}
+
 function bgResolveAudio(it) {
     return new Promise(res => {
-        try {
-            chrome.runtime.sendMessage(
-                { target: 'bg', cmd: 'resolveAudio', bvid: it.bvid, cid: it.cid || 0, page: it.page || 1 },
-                r => res(r || { ok: false, error: '获取音频失败（后台无响应）' })
-            );
-        } catch (e) {
-            res({ ok: false, error: String((e && e.message) || e) });
-        }
+        const id = ++reqId;
+        pendingReq[id] = result => res(result || { ok: false, error: '获取音频失败（后台无响应）' });
+        const trySend = () => {
+            if (!port) { setTimeout(trySend, 100); return; }
+            try {
+                port.postMessage({ _id: id, resolveAudio: { bvid: it.bvid, cid: it.cid || 0, page: it.page || 1 } });
+            } catch (e) {
+                delete pendingReq[id];
+                res({ ok: false, error: String((e && e.message) || e) });
+            }
+        };
+        trySend();
+        setTimeout(() => {
+            if (pendingReq[id]) { delete pendingReq[id]; res({ ok: false, error: '获取音频失败（后台超时）' }); }
+        }, 8000);
     });
 }
 function pShuffled(count) {
@@ -288,16 +330,5 @@ async function handleCmd(msg) {
     }
 }
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || msg.target !== 'offscreen') return;
-    handleCmd(msg)
-        .then(res => sendResponse(res || { ok: true }))
-        .catch(e => sendResponse({ ok: false, error: String((e && e.message) || e) }));
-    return true;
-});
-
-chrome.runtime.sendMessage({ target: 'bg', type: 'ready' }).catch(() => {});
+connectAudioPort();
 pGetState().then(st => broadcastState(st));
-window.addEventListener('load', () => {
-    chrome.runtime.sendMessage({ target: 'bg', type: 'ready' }).catch(() => {});
-});

@@ -28,7 +28,8 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
   只要浏览器开着就一直播；且 offscreen 是扩展页面，其音频请求为扩展请求
   （绕过页面 CSP/跨站限制、带 Referer 与 Cookie），解决了部分歌曲在普通页面无法播放的问题。
 - **职责分离**：B站 API 请求（`view` 取 cid/元数据、`playurl` 取音频流）由 **background** 发起
-  （持 host_permissions 绕过 CORS）；offscreen 向 background 取音频源后播放；
+  （持 host_permissions 绕过 CORS）；offscreen 经 **`chrome.runtime.connect` 持久 Port** 与
+  background 双向通信（命令按 `_id` 匹配响应，断线自动重连）；
   播放命令由 iframe 经 content script 桥接 → background → offscreen；
   offscreen 的 state/progress 广播经 content script 回传给胶囊与面板。
 - **多音源容错**：按 普通AAC→杜比→FLAC→mp4(durl) 顺序返回候选（含 backup_url），
@@ -132,11 +133,21 @@ node tests/test-content.js      # 播放命令路由(→background player)、状
 
 三个测试均通过 `vm` 注入 mock 的 `chrome/fetch/Audio/document`，**直接执行真实源码**
 （offscreen.js / background.js 顶层函数可直接访问；content.js 经 `__BPL_EXPOSE` 钩子），
-共 **51 项断言**（offscreen 17 + background 29 + content 5），全部通过（退出码 0）才算合格。
+共 **55 项断言**（offscreen 19 + background 31 + content 5），全部通过（退出码 0）才算合格。
 注意：浏览器集成层（offscreen 实际创建/发声、postMessage 桥接收发、Referer/Origin 规则、
 autoplay 策略、CORS 真实行为）无法在 Node 中验证，需手动在浏览器确认。
 
 ## 更新记录
+
+### v2.0.1（修复：offscreen 通信改 Port 长连接）
+- **修复全部按钮失效/无法播放**：根因是 background↔offscreen 用 `chrome.runtime.sendMessage`
+  通信在部分 Chrome 环境不可靠（接收端未就绪/多监听者干扰，即 v1.3 时代"音频模块通信失败"的
+  老问题）。改用 **`chrome.runtime.connect` 持久 Port**：offscreen 加载即连一条 `bpl-audio`
+  通道，后台经 port 发命令、按 `_id` 匹配响应；resolveAudio 也改走 port
+- offscreen 增加 **port 断线自动重连**（Service Worker 重启/文档回收后恢复）
+- `getStatus` 在 offscreen 未创建时直接返回默认状态，**不再每次页面加载都创建 offscreen**
+- 新增/更新测试：Port 命令→响应闭环、sendToOffscreen 经 Port 路由、getStatus 不创建、
+  resolveAudio 经 Port 处理（共 55 项全过）
 
 ### v2.0.0（跨页面播放：音频迁入 Offscreen Document）
 - **音频播放从 content script 迁入 Offscreen Document**：offscreen 独立于标签页存活，
@@ -151,7 +162,6 @@ autoplay 策略、CORS 真实行为）无法在 Node 中验证，需手动在浏
 - **修复加入歌单后列表不自动刷新**：面板新增 `storage.onChanged` 监听，歌单数据变化即刷新
 - DNR 规则补设 `Origin`（见 rules.json）
 - 测试扩展至 51 项（新增 offscreen 引擎测试、offscreen 路由测试）
-
 ### v1.9.0（多音源容错 + 原页面跳转）
 - **多音源容错播放**：`getAudioUrl` 重构为 `getAudioUrls`，并行拉取 DASH（普通 AAC→杜比→FLAC，
   各含 `backup_url` 备用链）与 mp4(`durl`) 兜底，返回**有序候选列表**；播放器逐个尝试，
@@ -313,12 +323,13 @@ autoplay 策略、CORS 真实行为）无法在 Node 中验证，需手动在浏
 
 ## 开发状态
 
-v2.0.0 音频迁入 Offscreen Document，实现**跨页面持续播放**（关页面不停），
-并以扩展身份请求音频解决部分歌曲无法播放的问题。单元测试共 **51 项**全部通过。
+v2.0.1 修复全部按钮失效问题：offscreen 通信改 **Port 长连接**（取代不可靠的 sendMessage），
+并支持断线自动重连、getStatus 不再急切创建 offscreen。单元测试共 **55 项**全部通过。
 待用户在浏览器验证：
 1. **跨页面播放**：开始播放后关闭/跳转当前标签页，音频继续（浏览器开着即可）
-2. 此前无法播放的歌曲（如 BV12c7fzBEnd）现在能否播放
-3. 加入歌单后面板自动刷新
+2. **所有按钮**（播放/上下曲/停止/模式/音量/歌单操作）恢复可用
+3. 此前无法播放的歌曲（如 BV12c7fzBEnd）现在能否播放
+4. 加入歌单后面板自动刷新
 4. 胶囊/面板的播放控制、进度、音量正常
 
 已知取舍与后续方向：

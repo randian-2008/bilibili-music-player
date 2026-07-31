@@ -9,6 +9,11 @@
                     "header": "Referer",
                     "operation": "set",
                     "value": "https://www.bilibili.com/"
+                },
+                {
+                    "header": "Origin",
+                    "operation": "set",
+                    "value": "https://www.bilibili.com"
                 }
             ]
         },
@@ -30,6 +35,11 @@
                     "header": "Referer",
                     "operation": "set",
                     "value": "https://www.bilibili.com/"
+                },
+                {
+                    "header": "Origin",
+                    "operation": "set",
+                    "value": "https://www.bilibili.com"
                 }
             ]
         },

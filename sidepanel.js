@@ -638,4 +638,9 @@ if (IN_FRAME) {
     chrome.runtime.onMessage.addListener(handleBroadcast);
 }
 
+chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local') return;
+    if (changes.bpl_playlists || changes.bpl_active) refresh();
+});
+
 refresh();

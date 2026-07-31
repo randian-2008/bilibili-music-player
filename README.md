@@ -9,24 +9,30 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 │    ├─ 可变形胶囊 ★（停止=24px半透明圆♪；有曲目=胶囊：频谱+上一首/播放/下一首）
 │    ├─ 浮动面板（上下两区：小播放器+歌单；可拖拽，点页面空白自动收起）
 │    ├─「＋加入」按钮（仅 B站视频页，把 bvid/page 发给 background）
-│    ├─ 音频播放器 ★（<audio> 在本页播放；向 background 取音频 URL，5 种模式、音量记忆、进度广播）
-│    └─ postMessage 桥接（iframe 的播放/音量命令 → 本页播放器；歌单命令 → background）
+│    └─ postMessage 桥接（iframe 命令 ↔ background；并把 state/progress 广播回传给胶囊）
 │              ▲  window.postMessage          │ chrome.runtime.sendMessage
 │              ▼                              ▼
 ├─ sidepanel.html/js/css（扩展页面，被 iframe 复用为播放列表 UI：上部小播放器+下部歌单）
 │
-├─ background.js（Service Worker：歌单管理、状态持久化、★请求B站API取cid/音频源）
+├─ background.js（Service Worker：歌单管理、状态持久化、★请求B站API取cid/音频源、
+│                 创建/管理 offscreen 并转发播放命令）
 │
-└─ rules.json（declarativeNetRequest：为 bilivideo / api.bilibili 请求设置 Referer）
+├─ offscreen.html/js ★（Offscreen Document 播放引擎：<audio> 真正发声，
+│                 向 background 取音频源、多音源容错、5 种模式、音量记忆、进度/状态广播）
+│
+└─ rules.json（declarativeNetRequest：为 bilivideo / api.bilibili 请求设置 Referer/Origin）
 ```
 
-**核心设计**：播放列表 UI 以浮动面板注入任意网页（iframe 加载 `sidepanel.html`）。
-**职责分离**：B站 API 请求（`view` 取 cid/元数据、`playurl` 取音频流）全部由 **background**
-发起（持 host_permissions 绕过 CORS，这是成熟扩展的标准做法）；content script 拿到音频 URL 后
-用 `<audio>` 就地播放，播放命令由 iframe 经 `postMessage` 发给本页 content script 处理；
-歌单增删改等发给 background 持久化。
-（取舍：音频随当前网页存活，关闭/跳转该标签页会停止；如需"关网页也继续"需 Offscreen，
-该方案在部分环境存在通信问题，暂缓。）
+**核心设计**：
+- **音频在 Offscreen Document 播放**——它独立于任何标签页存活，**关闭/跳转页面不停播**，
+  只要浏览器开着就一直播；且 offscreen 是扩展页面，其音频请求为扩展请求
+  （绕过页面 CSP/跨站限制、带 Referer 与 Cookie），解决了部分歌曲在普通页面无法播放的问题。
+- **职责分离**：B站 API 请求（`view` 取 cid/元数据、`playurl` 取音频流）由 **background** 发起
+  （持 host_permissions 绕过 CORS）；offscreen 向 background 取音频源后播放；
+  播放命令由 iframe 经 content script 桥接 → background → offscreen；
+  offscreen 的 state/progress 广播经 content script 回传给胶囊与面板。
+- **多音源容错**：按 普通AAC→杜比→FLAC→mp4(durl) 顺序返回候选（含 backup_url），
+  offscreen 逐个尝试，直接播放失败再用扩展身份 fetch 转 blob 兜底。
 
 ## 悬浮控制（可变形胶囊）+ 打开 / 隐藏播放列表
 
@@ -41,10 +47,10 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 ## 已实现功能
 
 ### 播放
-- 音频在 content script 内用 `<audio>` 播放；音频源由 background 解析
+- **音频在 Offscreen Document 播放**（跨页面持续播放，关页面不停）；音频源由 background 解析
 - **多音源容错**：并行拉取 DASH（普通 AAC→杜比→FLAC，各含备用链接）与 mp4(durl) 兜底，
-  播放器**按序逐个尝试**，某源不可播（编码不支持/链接失效）自动切换下一源，解决部分歌曲
-  "no supported source was found"
+  offscreen **按序逐个尝试**，某源不可播（编码不支持/链接失效）自动切换下一源，
+  直接播放失败再用扩展身份 fetch 转 blob 兜底，解决部分歌曲 "no supported source was found"
 - 播放/暂停、上一首/下一首、进度条拖拽、**停止**（清空播放并收起胶囊，区别于暂停）
 - **音量调节 + 静音**（面板内滑杆），数值持久化记忆（`bpl_volume` / `bpl_mute`）
 - MediaSession 集成（系统媒体控制）
@@ -119,17 +125,32 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 核心逻辑用 Node 在模拟环境中单测（无需浏览器），改动后务必先跑：
 
 ```bash
-node tests/test-background.js   # B站音频源解析(dash/flac/durl/错误)、取cid、加入视频拉元数据
-node tests/test-content.js      # 播放(经background取源)、5种播放模式、命令分发
+node tests/test-offscreen.js    # offscreen 播放引擎：pPlayIndex/多音源容错/blob兜底/5种模式/命令
+node tests/test-background.js   # B站音频源解析、取cid、拉元数据、批量操作、offscreen 路由(创建/重试)
+node tests/test-content.js      # 播放命令路由(→background player)、状态广播同步
 ```
 
-两个测试均通过 `vm` 注入 mock 的 `chrome/fetch/Audio/document`，**直接执行真实源码**
-（content.js 经 `__BPL_EXPOSE` 钩子取出内部播放器；background.js 顶层函数可直接访问），
-共 36 项断言（background 22 + content 14），全部通过（退出码 0）才算合格。
-注意：浏览器集成层（postMessage 桥接实际收发、Referer 规则生效、autoplay 策略、CORS 真实行为）
-无法在 Node 中验证，需手动在浏览器确认。
+三个测试均通过 `vm` 注入 mock 的 `chrome/fetch/Audio/document`，**直接执行真实源码**
+（offscreen.js / background.js 顶层函数可直接访问；content.js 经 `__BPL_EXPOSE` 钩子），
+共 **51 项断言**（offscreen 17 + background 29 + content 5），全部通过（退出码 0）才算合格。
+注意：浏览器集成层（offscreen 实际创建/发声、postMessage 桥接收发、Referer/Origin 规则、
+autoplay 策略、CORS 真实行为）无法在 Node 中验证，需手动在浏览器确认。
 
 ## 更新记录
+
+### v2.0.0（跨页面播放：音频迁入 Offscreen Document）
+- **音频播放从 content script 迁入 Offscreen Document**：offscreen 独立于标签页存活，
+  **关闭/跳转页面不停播**（只要浏览器开着）；且 offscreen 是扩展页面，音频请求为扩展请求，
+  绕过页面 CSP/跨站限制、带 Referer 与 Cookie，解决部分歌曲（如 BV12c7fzBEnd）在普通页面无法播放
+- **新增 offscreen.html/js 播放引擎**：`<audio>` 发声、向 background 取音频源、
+  多音源容错（直接播放→fetch+blob 兜底）、5 种模式、音量记忆、MediaSession、进度/状态广播
+- **background 新增 offscreen 管理**：`ensureOffscreen`（按需创建）+ `sendToOffscreen`
+  （就绪轮询 + 失败关闭重建重试 3 次）+ `player` 命令路由
+- **content.js 瘦身为控制层**：不再本地播放，播放命令经 background 路由到 offscreen；
+  胶囊/面板状态由 offscreen 广播回传
+- **修复加入歌单后列表不自动刷新**：面板新增 `storage.onChanged` 监听，歌单数据变化即刷新
+- DNR 规则补设 `Origin`（见 rules.json）
+- 测试扩展至 51 项（新增 offscreen 引擎测试、offscreen 路由测试）
 
 ### v1.9.0（多音源容错 + 原页面跳转）
 - **多音源容错播放**：`getAudioUrl` 重构为 `getAudioUrls`，并行拉取 DASH（普通 AAC→杜比→FLAC，
@@ -292,13 +313,15 @@ node tests/test-content.js      # 播放(经background取源)、5种播放模式
 
 ## 开发状态
 
-v1.9.0 多音源容错播放（解决部分歌曲无法播放）+ 每首歌 ↗ 跳转原页面。
-单元测试共 36 项（background 22 + content 14）全部通过。待用户在浏览器验证：
-1. 此前报 "no supported source" 的歌曲现在能否播放（会自动尝试多个音源）
-2. 每首歌右侧 ↗ 按钮可在新标签页打开原视频
-3. 若仍无法播放，红色 toast 会提示"已尝试 N 个音源"或具体接口错误
+v2.0.0 音频迁入 Offscreen Document，实现**跨页面持续播放**（关页面不停），
+并以扩展身份请求音频解决部分歌曲无法播放的问题。单元测试共 **51 项**全部通过。
+待用户在浏览器验证：
+1. **跨页面播放**：开始播放后关闭/跳转当前标签页，音频继续（浏览器开着即可）
+2. 此前无法播放的歌曲（如 BV12c7fzBEnd）现在能否播放
+3. 加入歌单后面板自动刷新
+4. 胶囊/面板的播放控制、进度、音量正常
 
 已知取舍与后续方向：
-- 音频随当前网页存活，关闭或完整跳转该标签页会停止（B站站内 SPA 跳转不受影响）。
-  如需"关网页也继续听"，需重新引入 Offscreen Document 并排查其在部分环境的通信问题。
+- 浏览器完全关闭后音频停止（offscreen 随浏览器生命周期）。
 - 更高音质 / 大会员曲目可能需要登录B站。
+- offscreen 由 Chrome 管理，长时间无播放可能被回收，下次播放自动重建。

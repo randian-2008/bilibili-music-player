@@ -120,6 +120,60 @@ async function ensureDefaultPlaylist() {
     return pls;
 }
 
+const OFFSCREEN_PATH = 'offscreen.html';
+let creating = null;
+let offscreenReady = false;
+
+async function hasOffscreen() {
+    if (chrome.offscreen.hasDocument) {
+        try { return await chrome.offscreen.hasDocument(); } catch (e) {}
+    }
+    try {
+        const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+        return !!(ctxs && ctxs.length);
+    } catch (e) { return false; }
+}
+async function ensureOffscreen() {
+    if (await hasOffscreen()) return;
+    if (creating) { await creating; return; }
+    creating = chrome.offscreen.createDocument({
+        url: OFFSCREEN_PATH,
+        reasons: ['AUDIO_PLAYBACK'],
+        justification: '后台播放B站音频（跨页面持续播放）'
+    }).finally(() => { creating = null; });
+    await creating;
+}
+async function waitReady(timeout = 3000) {
+    if (offscreenReady) return true;
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+        try {
+            const res = await chrome.runtime.sendMessage({ target: 'offscreen', cmd: 'getStatus' });
+            if (res && res.ok) { offscreenReady = true; return true; }
+        } catch (e) {}
+        await new Promise(r => setTimeout(r, 120));
+    }
+    return false;
+}
+async function sendToOffscreen(msg) {
+    let lastErr = '未知错误';
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            await ensureOffscreen();
+            await waitReady();
+            const res = await chrome.runtime.sendMessage(Object.assign({ target: 'offscreen' }, msg));
+            if (res !== undefined) return res;
+            throw new Error('offscreen 无响应');
+        } catch (e) {
+            lastErr = String((e && e.message) || e);
+            offscreenReady = false;
+            try { if (chrome.offscreen.closeDocument) await chrome.offscreen.closeDocument(); } catch (_) {}
+            await new Promise(r => setTimeout(r, 200));
+        }
+    }
+    return { ok: false, error: '音频模块通信失败：' + lastErr };
+}
+
 function broadcast(msg) {
     chrome.runtime.sendMessage(Object.assign({ target: 'all' }, msg)).catch(() => {});
 }
@@ -133,6 +187,7 @@ async function broadcastData() {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg) return;
+    if (msg.type === 'ready') { offscreenReady = true; return; }
     if (msg.target === 'bg') {
         handleBg(msg, sender)
             .then(res => sendResponse(res || { ok: true }))
@@ -175,6 +230,9 @@ async function handleBg(msg, sender) {
         case 'openTab': {
             if (msg.url) chrome.tabs.create({ url: msg.url });
             return { ok: true };
+        }
+        case 'player': {
+            return await sendToOffscreen(msg.payload || {});
         }
         case 'remove': {
             const lists = await getPlaylists();

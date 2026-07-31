@@ -5,19 +5,32 @@ const code = fs.readFileSync(require('path').join(__dirname, '..', 'background.j
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; console.log('  PASS: ' + msg); } else { fail++; console.log('  FAIL: ' + msg); } }
 
-function makeCtx() {
+function makeCtx(opts) {
+    opts = opts || {};
     let resp = {};
     const store = {};
+    const off = { exists: false, createCalls: 0, closeCalls: 0 };
+    const offscreenResponder = opts.offscreenResponder || (() => Promise.resolve(undefined));
     const sandbox = {
         console, Math, JSON, Promise, Date,
-        setTimeout: () => 0, clearTimeout: () => {},
+        setTimeout: (fn) => { Promise.resolve().then(fn); return 0; }, clearTimeout: () => {},
         fetch: () => Promise.resolve({ json: () => Promise.resolve(resp) }),
         __setResp: r => { resp = r; },
         __store: store,
+        __off: off,
         chrome: {
             runtime: {
                 onMessage: { addListener() {} }, onInstalled: { addListener() {} }, onStartup: { addListener() {} },
-                sendMessage: () => Promise.resolve(undefined)
+                sendMessage: (msg) => {
+                    if (msg && msg.target === 'offscreen') return offscreenResponder(msg);
+                    return Promise.resolve(undefined);
+                },
+                getContexts: () => Promise.resolve(off.exists ? [{}] : [])
+            },
+            offscreen: {
+                hasDocument: () => Promise.resolve(off.exists),
+                createDocument: () => { off.createCalls++; off.exists = true; return Promise.resolve(); },
+                closeDocument: () => { off.closeCalls++; off.exists = false; return Promise.resolve(); }
             },
             action: { onClicked: { addListener() {} } },
             commands: { onCommand: { addListener() {} } },
@@ -150,6 +163,37 @@ function makeCtx() {
     await ctx.handleBg({ cmd: 'moveItem', from: 3, to: 1 }, null);
     ok(ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') === 'BV0,BV3,BV1,BV2,BV4',
         '上拖落位准确 (' + ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') + ')');
+
+    console.log('\n[background offscreen 路由]');
+    // sendToOffscreen 正常：创建 offscreen 并转发命令
+    ctx = makeCtx({ offscreenResponder: (msg) => Promise.resolve(msg.cmd === 'getStatus' ? { ok: true } : { ok: true, echoed: msg.cmd }) });
+    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
+    ok(r.ok && r.echoed === 'toggle', 'sendToOffscreen 转发命令并返回响应');
+    ok(ctx.__off.createCalls === 1 && ctx.__off.exists, '自动创建 offscreen 文档');
+
+    // 已存在则不重复创建
+    r = await ctx.sendToOffscreen({ cmd: 'next' });
+    ok(r.echoed === 'next' && ctx.__off.createCalls === 1, '已存在不重复创建');
+
+    // handleBg player 路由
+    r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'prev' } }, null);
+    ok(r.ok && r.echoed === 'prev', 'handleBg player 路由到 offscreen');
+
+    // offscreen 无响应 → 重试（关闭重建）后仍失败 → 返回错误
+    ctx = makeCtx({ offscreenResponder: () => Promise.resolve(undefined) });
+    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
+    ok(r.ok === false && /音频模块通信失败/.test(r.error), 'offscreen 持续无响应返回错误');
+    ok(ctx.__off.closeCalls >= 1, '失败时关闭重建 offscreen (closeCalls=' + ctx.__off.closeCalls + ')');
+
+    // 首次无响应、第二次恢复 → 重试成功
+    let calls = 0;
+    ctx = makeCtx({ offscreenResponder: (msg) => {
+        calls++;
+        if (msg.cmd === 'getStatus') return Promise.resolve(calls <= 2 ? undefined : { ok: true });
+        return Promise.resolve(calls <= 2 ? undefined : { ok: true, echoed: msg.cmd });
+    } });
+    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
+    ok(r.ok && r.echoed === 'toggle', 'offscreen 恢复后重试成功');
 
     console.log('\n=================');
     console.log('通过: ' + pass + '  失败: ' + fail);

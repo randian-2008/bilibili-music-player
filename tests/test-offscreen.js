@@ -11,23 +11,40 @@ function makeCtx(opts) {
     const resolveAudioRes = opts.resolveAudioRes || { ok: true, urls: ['https://cdn/audio.m4s'] };
     const playFailUrls = new Set(opts.playFailUrls || []);
     const fetchFailUrls = new Set(opts.fetchFailUrls || []);
+    const asyncErrorUrls = new Set(opts.asyncErrorUrls || []);   // play() 成功后异步触发 error（模拟 CDN 403）
     const audio = {
-        paused: true, src: '', currentTime: 0, duration: 0, playbackRate: 1,
+        paused: true, currentTime: 0, duration: 0, playbackRate: 1, volume: 1, muted: false,
+        error: null, networkState: 1, readyState: 0,
+        ls: {},
+        _src: '',
+        addEventListener(t, f) { (this.ls[t] = this.ls[t] || []).push(f); },
+        removeEventListener(t, f) { const l = this.ls[t]; if (l) { const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); } },
         play() {
-            if (playFailUrls.has(this.src)) {
+            if (playFailUrls.has(this._src)) {
                 const e = new Error('The element has no supported sources.');
                 e.name = 'NotSupportedError';
                 return Promise.reject(e);
             }
             this.paused = false;
+            if (asyncErrorUrls.has(this._src)) {
+                setImmediate(() => {
+                    this.error = { code: 4, message: 'MEDIA_ERR_SRC_NOT_SUPPORTED' };
+                    (this.ls.error || []).slice().forEach(f => f());
+                });
+            }
             return Promise.resolve();
         },
         pause() { this.paused = true; },
         load() {},
-        removeAttribute() { this.src = ''; },
-        addEventListener() {}
+        removeAttribute(n) { if (n === 'src') this.src = ''; }
     };
+    // 换源即清空 error/就绪态，模拟真实 HTMLMediaElement（否则上一源的残留 error 会误杀下一源）
+    Object.defineProperty(audio, 'src', {
+        get() { return audio._src; },
+        set(v) { audio._src = v; audio.error = null; audio.readyState = v ? 4 : 0; }
+    });
     const handlers = [];
+    const msgListeners = [];
     const portSent = [];
     const port = {
         postMessage(msg) {
@@ -41,9 +58,46 @@ function makeCtx(opts) {
         onMessage: { addListener: (fn) => handlers.push(fn) },
         onDisconnect: { addListener() {} }
     };
+    // 模拟 background 端：storageGet/storageSet 代理 + resolveAudio 取源（noStorage 变体的生命线）
+    const sent = [];
+    const sendMessage = (payload, cb) => {
+        sent.push(payload);
+        if (payload && payload.cmd === 'storageGet') {
+            Promise.resolve().then(() => cb && cb({ ok: true, values: Object.assign({}, store) }));
+            return undefined;
+        }
+        if (payload && payload.cmd === 'storageSet') {
+            Object.assign(store, payload.data || {});
+            Promise.resolve().then(() => cb && cb({ ok: true }));
+            return undefined;
+        }
+        if (cb && payload && payload.resolveAudio) {
+            Promise.resolve().then(() => cb(resolveAudioRes));
+            return undefined;
+        }
+        return Promise.resolve(undefined);
+    };
+    const chromeObj = {
+        runtime: {
+            connect: () => port,
+            sendMessage: sendMessage,
+            onMessage: { addListener: (fn) => msgListeners.push(fn) }
+        },
+        storage: {
+            local: {
+                get: () => Promise.resolve(Object.assign({}, store)),
+                set: o => { Object.assign(store, o); return Promise.resolve(); }
+            },
+            onChanged: { addListener() {} }
+        }
+    };
+    // noStorage 变体：复刻现场 Edge——chrome.runtime 完好、chrome.storage 恒为 undefined。
+    // offscreen 必须完全经 background 代理完成存储读写并照常播放。
+    if (opts.noStorage) chromeObj.storage = undefined;
     const sandbox = {
         console, Math, JSON, Promise, Date, URLSearchParams,
-        setTimeout: (fn) => 0, clearTimeout: () => {}, setInterval: () => 0,
+        // setImmediate 驱动：offscreen 的 playSettled 宽限计时需真实触发（忽略延时、立即排队）
+        setTimeout: (fn) => { setImmediate(fn); return 0; }, clearTimeout: () => {}, setInterval: () => 0,
         fetch: (url) => {
             if (fetchFailUrls.has(url)) return Promise.reject(new Error('fetch fail'));
             return Promise.resolve({ ok: true, blob: () => Promise.resolve({}) });
@@ -52,23 +106,11 @@ function makeCtx(opts) {
         window: { addEventListener() {} },
         navigator: {},
         document: { getElementById: () => audio },
-        chrome: {
-            runtime: {
-                connect: () => port,
-                sendMessage: () => Promise.resolve(undefined),
-                onMessage: { addListener() {} }
-            },
-            storage: {
-                local: {
-                    get: () => Promise.resolve(Object.assign({}, store)),
-                    set: o => { Object.assign(store, o); return Promise.resolve(); }
-                },
-                onChanged: { addListener() {} }
-            }
-        },
+        chrome: chromeObj,
         __audio: audio, __store: store,
-        __port: port, __portSent: portSent,
-        __drive: (msg) => { handlers.forEach(fn => fn(msg)); }
+        __port: port, __portSent: portSent, __sent: sent,
+        __drive: (msg) => { handlers.forEach(fn => fn(msg)); },
+        __driveMsg: (msg) => { msgListeners.forEach(fn => fn(msg)); }
     };
     vm.createContext(sandbox);
     vm.runInContext(code, sandbox);
@@ -104,6 +146,13 @@ async function testPlayIndex() {
     r = await ctx.pPlayIndex(0);
     ok(r.ok === true && ctx.__audio.src === 'https://cdn/audio.m4s', '正常播放设置 src (' + ctx.__audio.src + ')');
 
+    // v2.2.6 回归：state 广播必须经 bg 中继（offscreen 直发 {target:'all'} 到不了网页里的 content script，
+    // 现场表现为胶囊不变形/图标动画不切换、面板进度条不动）
+    const relays = ctx.__sent.filter(m => m && m.target === 'bg' && m.cmd === 'relay' && m.data && m.data.type === 'state');
+    const relayed = relays[relays.length - 1];   // 取最后一条：加载时先发过一条 playing:false 的初始态
+    ok(!!relayed && relayed.data.state.hasTrack === true && relayed.data.state.playing === true,
+        '起播后经 bg 中继 state 广播（hasTrack/playing 驱动胶囊变形与图标）');
+
     ctx = makeCtx({
         store: setupPlaylist(2),
         resolveAudioRes: { ok: true, urls: ['https://cdn/bad.m4s', 'https://cdn/good.m4s'] },
@@ -129,6 +178,18 @@ async function testPlayIndex() {
     });
     r = await ctx.pPlayIndex(0);
     ok(r.ok === false && /已尝试 2 个音源/.test(r.error), '全部音源失败报错 (' + r.error + ')');
+
+    // 关键回归（bug①）：play() 成功 resolve，但媒体随后异步报错（CDN 403 → SRC_NOT_SUPPORTED）。
+    // 旧实现只 await play()，会误判“已起播”而停在坏源上无声播放；新实现 error 事件感知 → 切下一源。
+    ctx = makeCtx({
+        store: setupPlaylist(2),
+        resolveAudioRes: { ok: true, urls: ['https://cdn/asyncbad.m4s', 'https://cdn/good.m4s'] },
+        asyncErrorUrls: ['https://cdn/asyncbad.m4s'],
+        fetchFailUrls: ['https://cdn/asyncbad.m4s']
+    });
+    r = await ctx.pPlayIndex(0);
+    ok(r.ok === true && ctx.__audio.src === 'https://cdn/good.m4s',
+        'play 成功后异步 error → 认定首源失败并切下一源 (' + ctx.__audio.src + ')');
 }
 
 async function testModes() {
@@ -175,6 +236,8 @@ async function testHandleCmd() {
     ok(r.ok === true && ctx.__audio.volume === 0.5 && ctx.__store.bpl_volume === 0.5, 'setVolume 生效并持久化');
     r = await ctx.handleCmd({ cmd: 'stop' });
     ok(r.ok === true && ctx.__audio.src === '' , 'stop 清空音源');
+    r = await ctx.handleCmd({ cmd: 'ping' });
+    ok(r.ok === true && r.pong === 1, 'ping 探测应答 pong（健康探测）');
 }
 
 async function testPort() {
@@ -201,12 +264,38 @@ async function testPort() {
     ok(resp && resp.result && typeof resp.result.position === 'number', 'Port getStatus 响应');
 }
 
+async function testNoStorage() {
+    // 现场回归（v2.2.4 存储代理）：此 Edge 的 offscreen 无 chrome.storage（连新建文档亦然），
+    // 但 chrome.runtime 正常。以下断言“存储全量经 background 代理”后播放链路毫发无损。
+    console.log('\n[offscreen 无 chrome.storage → 经 background 代理]');
+    const ticks = async (n) => { for (let i = 0; i < n; i++) await new Promise(r => setImmediate(r)); };
+
+    let ctx = makeCtx({ store: setupPlaylist(2), noStorage: true });
+    ok(ctx.chrome.storage === undefined, '变体前提：chrome.storage 缺失（chrome.runtime 仍在）');
+    let r = await ctx.pPlayIndex(0);
+    ok(r.ok === true && ctx.__audio.src === 'https://cdn/audio.m4s', '无 storage 也能完整播放（经代理取歌单/状态）');
+    let st = await ctx.pGetState();
+    ok(st.index === 0 && st.playing === true, '状态经代理持久化（bpl_state 写回 bg）');
+    ok(ctx.__store.bpl_state && ctx.__store.bpl_state.playing === true, '写入确实落到（模拟的）bg 存储');
+
+    ctx = makeCtx({ store: setupPlaylist(3), noStorage: true });
+    r = await ctx.handleCmd({ cmd: 'playIndex', index: 2 });
+    ok(r.ok === true && (await ctx.pGetState()).index === 2, 'handleCmd playIndex 经代理闭环');
+
+    // 无 storage.onChanged：改由 background 的 'data' 广播驱动歌单变更同步（清空→停播清源）
+    ctx.__store.bpl_playlists = [];
+    ctx.__driveMsg({ target: 'all', type: 'data', playlists: [] });
+    await ticks(3);
+    ok(ctx.__audio.src === '', 'data 广播驱动空单停播（替代 onChanged）');
+}
+
 (async () => {
     try {
         await testPlayIndex();
         await testModes();
         await testHandleCmd();
         await testPort();
+        await testNoStorage();
     } catch (e) { console.error('测试执行异常:', e); fail++; }
     console.log('\n=================');
     console.log('通过: ' + pass + '  失败: ' + fail);

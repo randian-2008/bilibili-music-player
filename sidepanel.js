@@ -34,23 +34,100 @@ function httpsUrl(u) {
     return u.indexOf('http://') === 0 ? 'https://' + u.slice(7) : u;
 }
 function fmt(sec) {
-    sec = Math.round(sec || 0);
+    sec = Number(sec);
+    if (!isFinite(sec) || sec < 0) sec = 0;   // 个别流 duration 为 Infinity/NaN
+    sec = Math.round(sec);
     const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
     const p = n => String(n).padStart(2, '0');
     return h > 0 ? h + ':' + p(m) + ':' + p(s) : m + ':' + p(s);
 }
+// 日志：sidepanel.html 先载入 logger.js；异常环境兜底
+if (typeof BPLLog === 'undefined') {
+    globalThis.BPLLog = { info() {}, log() {}, warn() {}, error() {}, flush() {}, recent() { return []; } };
+}
 const IN_FRAME = (window.self !== window.top);
+
+// ===================== 运行日志面板（读取统一 bpl_log，支持导出/清空） =====================
+const logEl = document.getElementById('diag');
+let logOpen = false;
+let logCache = [];
+let bootCache = null;   // offscreen 启动诊断标记（offscreen-boot.js / offscreen.js 写入）
+function renderBootInfo() {
+    const el = logEl && logEl.querySelector('#bootInfo');
+    if (!el) return;
+    const b = bootCache;
+    if (!b || !b.at) {
+        el.textContent = 'offscreen 诊断：无启动信号（脚本可能从未执行——待修根因，本版本无兜底）';
+        el.className = 'boot bad';
+        return;
+    }
+    let txt = 'offscreen 诊断：' + (b.phase || '?') + ' @' + fmtLogTime(b.at);
+    if (b.msg) txt += '（' + b.msg + (b.line ? ':' + b.line : '') + '）';
+    if (b.phase === 'resource-error' && b.src) txt += '（加载失败：' + b.src + '）';
+    el.textContent = txt;
+    el.className = 'boot ' + (b.phase === 'loaded' ? 'good' : b.phase === 'boot' ? 'mid' : 'bad');
+}
+function fmtLogTime(t) {
+    const d = new Date(t || 0);
+    const p = n => String(n).padStart(2, '0');
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
+function renderLog() {
+    if (!logEl) return;
+    const body = logEl.querySelector('.log-body');
+    if (!body) return;
+    body.innerHTML = logCache.length
+        ? logCache.map(e =>
+            '<div class="ll ' + esc(e.level) + '"><span class="lt">' + fmtLogTime(e.t) + '</span> ' +
+            '<span class="ls">[' + esc(e.scope) + ']</span> ' + esc(e.msg) + '</div>').join('')
+        : '<div class="ll">（暂无日志）</div>';
+    body.scrollTop = body.scrollHeight;
+}
+function openLog(open) {
+    logOpen = (open == null) ? !logOpen : !!open;
+    if (logEl) logEl.classList.toggle('hidden', !logOpen);
+    if (logOpen) { renderBootInfo(); renderLog(); }
+}
+function exportLog() {
+    const bootLine = '【offscreen 诊断】' + (bootCache && bootCache.at
+        ? JSON.stringify(bootCache)
+        : '无 bpl_boot 记录：offscreen 脚本很可能从未执行（本环境由页内备用引擎播放）');
+    const lines = [bootLine, '================================'].concat(
+        logCache.map(e => e.s + ' [' + e.level + '][' + e.scope + '] ' + e.msg)
+    );
+    downloadText('bpl-log-' + Date.now() + '.txt', lines.join('\r\n'), 'text/plain;charset=utf-8');
+}
+if (logEl) {
+    logEl.innerHTML =
+        '<div class="log-head"><span class="log-title">运行日志</span>' +
+        '<button id="logExport" class="logbtn">导出</button>' +
+        '<button id="logClear" class="logbtn">清空</button>' +
+        '<button id="logClose" class="logbtn">关闭</button></div>' +
+        '<div class="log-boot"><span id="bootInfo" class="boot"></span></div>' +
+        '<div class="log-body"></div>';
+    logEl.querySelector('#logClose').addEventListener('click', () => openLog(false));
+    logEl.querySelector('#logExport').addEventListener('click', exportLog);
+    logEl.querySelector('#logClear').addEventListener('click', () => {
+        chrome.storage.local.set({ bpl_log: [] }); logCache = []; renderLog();
+    });
+}
+// =====================================================================================
+
 function send(cmd, extra) {
     const payload = Object.assign({ target: 'bg', cmd }, extra || {});
+    const report = r => {
+        if (r && r.ok === false && r.error) BPLLog.error('ui', cmd + ' 失败：' + r.error);
+        else if (!r) BPLLog.warn('ui', cmd + '：后台无响应（超时）');
+    };
     if (!IN_FRAME) {
         return new Promise(res => {
-            chrome.runtime.sendMessage(payload, r => res(r));
+            chrome.runtime.sendMessage(payload, r => { report(r); res(r); });
         });
     }
     return new Promise(res => {
         const id = Math.random().toString(36).slice(2) + Date.now().toString(36);
         let done = false;
-        const finish = v => { if (!done) { done = true; window.removeEventListener('message', onMsg); res(v); } };
+        const finish = v => { if (!done) { done = true; window.removeEventListener('message', onMsg); report(v); res(v); } };
         const onMsg = e => {
             if (e.source !== window.parent) return;
             const d = e.data;
@@ -58,7 +135,8 @@ function send(cmd, extra) {
         };
         window.addEventListener('message', onMsg);
         try { window.parent.postMessage({ bplBridge: 'req', id: id, payload: payload }, '*'); } catch (_) {}
-        setTimeout(() => finish(undefined), 4000);
+        // 冷启动需创建 offscreen + 解析音源（可能走 blob 兜底），4s 常不够，放宽到 15s 以免误报“后台无响应”
+        setTimeout(() => finish(undefined), 15000);
     });
 }
 
@@ -326,6 +404,9 @@ menu.addEventListener('click', e => {
     menu.classList.add('hidden');
     const pl = activePlaylist();
     if (act === 'import') { fileInput.click(); return; }
+    if (act === 'log') { openLog(true); return; }
+    if (act === 'log-export') { exportLog(); return; }
+    if (act === 'log-clear') { chrome.storage.local.set({ bpl_log: [] }); logCache = []; renderLog(); return; }
     if (!pl) return;
     if (act === 'rename') {
         const name = prompt('重命名歌单：', pl.name);
@@ -500,12 +581,14 @@ function showCoverPop(cover) {
     if (box.classList.contains('drag-on') || !cover.isConnected) return;
     const r = cover.getBoundingClientRect();
     const pop = $('#coverPop'), img = $('#coverPopImg');
-    const W = r.width * 3, H = r.height * 3;
+    // 4.2×（46×30 → 约 193×126）：比 3× 更醒目，仍稳处 340px 面板之内
+    const W = r.width * 4.2, H = r.height * 4.2;
     img.src = cover.src;
     pop.style.width = W + 'px';
     pop.style.height = H + 'px';
     pop.style.left = r.left + 'px';
-    pop.style.top = (r.bottom - H) + 'px';
+    // 列表顶部的曲目：预览向上展开会被面板顶边裁切，钳到顶边之内
+    pop.style.top = Math.max(6, r.bottom - H) + 'px';
     pop.classList.add('show');
 }
 function hideCoverPop() { $('#coverPop').classList.remove('show'); }
@@ -516,6 +599,9 @@ box.addEventListener('pointerdown', e => {
     if (!it) return;
     const cover = e.target.closest('.cover');
     if (cover && !selMode) {
+        // 按下即收预览并取消未触发的放大计时：避免“按住准备拖拽”时大图弹出
+        if (popTimer) { clearTimeout(popTimer); popTimer = null; }
+        hideCoverPop();
         drag = { from: +it.dataset.i, el: it, startY: e.clientY, moved: false };
         window.addEventListener('pointermove', dragMove);
         window.addEventListener('pointerup', dragUp);
@@ -566,7 +652,7 @@ box.addEventListener('mouseover', e => {
     if (popTimer) { clearTimeout(popTimer); popTimer = null; }
     hideCoverPop();
     if (cover && !box.classList.contains('drag-on') && !drag) {
-        popTimer = setTimeout(() => { popTimer = null; showCoverPop(cover); }, 2000);
+        popTimer = setTimeout(() => { popTimer = null; showCoverPop(cover); }, 1000);
     }
 });
 box.addEventListener('mouseleave', () => {
@@ -641,6 +727,27 @@ if (IN_FRAME) {
 chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
     if (changes.bpl_playlists || changes.bpl_active) refresh();
+    // bug② 收敛安全网：切歌/模式变化由播放端写 bpl_state。正常经广播链即时刷新，
+    // 一旦广播链（播放端→后台广播→content→iframe postMessage）丢失，这里据存储变更兜底重渲染，
+    // 避免“正在播放信息与列表标记不更新”。
+    if (changes.bpl_state) {
+        state = Object.assign({}, DEF_STATE, changes.bpl_state.newValue || {});
+        state.mode = normMode(state);
+        render();
+    }
+    if (changes.bpl_log) {
+        logCache = changes.bpl_log.newValue || [];
+        if (logOpen) renderLog();
+    }
+    if (changes.bpl_boot) {
+        bootCache = changes.bpl_boot.newValue || null;
+        if (logOpen) renderBootInfo();
+    }
+});
+
+chrome.storage.local.get(['bpl_log', 'bpl_boot']).then(r => {
+    if (r && Array.isArray(r.bpl_log)) { logCache = r.bpl_log; if (logOpen) renderLog(); }
+    if (r && r.bpl_boot) { bootCache = r.bpl_boot; if (logOpen) renderBootInfo(); }
 });
 
 refresh();

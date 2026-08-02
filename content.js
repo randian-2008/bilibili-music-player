@@ -4,9 +4,16 @@
     if (window.top !== window.self) return;
     if (!/^https?:$/.test(location.protocol)) return;
 
+    // 日志：manifest 中 content_scripts 先注入 logger.js；异常环境兜底
+    if (typeof BPLLog === 'undefined') {
+        globalThis.BPLLog = { info() {}, log() {}, warn() {}, error() {}, flush() {}, recent() { return []; } };
+    }
+
     const HOST_ID = 'bpl-ext-host';
     const STORE_KEY = 'bpl_panel';
     const PANEL_URL = chrome.runtime.getURL('sidepanel.html');
+    // 扩展自身源（如 chrome-extension://abc），用于桥接来源白名单；不用 new URL 以兼容更多环境
+    const EXT_ORIGIN = chrome.runtime.getURL('').replace(/\/+$/, '');
     const Z = 2147483646;
 
     let shadow, hostEl, mini, miniPlay, panel, pframe, addBtn, addTxt;
@@ -19,21 +26,48 @@
         return /(^|\.)bilibili\.com$/.test(location.hostname) && /^\/video\//.test(location.pathname);
     }
 
-    // ===================== 音频播放（路由到 offscreen，后台跨页面播放） =====================
+    // ===================== 音频播放（offscreen 唯一宿主，命令一律经后台转发，无兜底） =====================
     const PLAYER_CMDS = { toggle: 1, next: 1, prev: 1, playIndex: 1, seek: 1, getStatus: 1, stop: 1, setMode: 1, setVolume: 1, setMute: 1, getVolume: 1 };
     let playerState = { playing: false, hasTrack: false, index: 0, mode: 'loop' };
+    let loggedBridgeOrigin = false;
+    let loggedBroadcast = false;
 
-    function handlePlayerCmd(payload) {
+    // 失效上下文自愈（v2.2.7）：扩展升级后，升级前就开着的标签页里 content script 的扩展上下文
+    // 已永久失效（所有 runtime/storage 调用抛 "Extension context invalidated"，现场日志实锤），
+    // 页内无药可救——唯一解是重载本页让新版脚本重新注入。sessionStorage 守卫保证只重载一次，
+    // 绝不循环；重载成功（通道复活）后即清除守卫，使下次升级仍可再次自愈。
+    function reviveIfDead(err) {
+        const msg = String((err && err.message) || err || '');
+        if (!/Extension context invalidated/i.test(msg)) return false;
+        try {
+            if (sessionStorage.getItem('bpl_revive')) return true;
+            sessionStorage.setItem('bpl_revive', '1');
+        } catch (_) {}
+        BPLLog.warn('content', '扩展上下文已失效（疑升级前残留标签页）→ 重载本页一次以复活');
+        try { location.reload(); } catch (_) {}
+        return true;
+    }
+
+    function sendBgPlayer(payload, timeout) {
         return new Promise(res => {
+            let done = false;
+            const finish = v => { if (!done) { done = true; clearTimeout(t); res(v); } };
+            const t = setTimeout(() => finish({ ok: false, error: '后台超时' }), timeout || 15000);
             try {
                 chrome.runtime.sendMessage({ target: 'bg', cmd: 'player', payload: payload }, r => {
-                    res(r || { ok: false, error: '后台无响应' });
+                    const le = (typeof chrome !== 'undefined' && chrome.runtime) ? chrome.runtime.lastError : null;
+                    if (le) reviveIfDead(le);
+                    else if (r) { try { sessionStorage.removeItem('bpl_revive'); } catch (_) {} }
+                    finish(r || { ok: false, error: '后台无响应' });
                 });
             } catch (e) {
-                res({ ok: false, error: String((e && e.message) || e) });
+                reviveIfDead(e);
+                finish({ ok: false, error: String((e && e.message) || e) });
             }
         });
     }
+    // 命令路由：offscreen 是唯一音频宿主（按产品决策放弃一切兜底）。播放命令一律经后台转发给 offscreen 文档。
+    function handlePlayerCmd(payload) { return sendBgPlayer(payload, 15000); }
     // =================================================================================
 
     const PLAY_D = 'M8 5v14l11-7z';
@@ -185,9 +219,11 @@
                 mini.classList.remove('dragging');
                 if (wasDrag) {
                     const r = mini.getBoundingClientRect();
-                    chrome.storage.local.set({
-                        bpl_mini: { right: Math.round(window.innerWidth - r.right), bottom: Math.round(window.innerHeight - r.bottom) }
-                    });
+                    try {
+                        chrome.storage.local.set({
+                            bpl_mini: { right: Math.round(window.innerWidth - r.right), bottom: Math.round(window.innerHeight - r.bottom) }
+                        });
+                    } catch (e) { reviveIfDead(e); }
                     return;
                 }
                 miniActivate(tgt);
@@ -212,8 +248,10 @@
                 mini.style.right = Math.max(4, Math.min(p.right, window.innerWidth - 40)) + 'px';
                 mini.style.bottom = Math.max(4, Math.min(p.bottom, window.innerHeight - 40)) + 'px';
             }
-        });
+        }).catch(e => reviveIfDead(e));
 
+        // 只恢复面板位置。开合状态刻意不持久化、不恢复（用户要求）：
+        // 新开页面/刷新时面板一律默认收起——无论是否正在播放；旧的 bpl_panel.open 恢复已移除。
         chrome.storage.local.get(STORE_KEY).then(r => {
             const p = (r && r[STORE_KEY]) || {};
             const valid = typeof p.x === 'number' && typeof p.y === 'number' &&
@@ -226,8 +264,7 @@
                 panel.style.left = posX + 'px';
                 panel.style.top = posY + 'px';
             }
-            if (p.open) setTimeout(() => toggle(true), 60);
-        });
+        }).catch(e => reviveIfDead(e));
         updateAddBtn();
         updateMiniUI();
     }
@@ -241,7 +278,10 @@
     }
 
     function persist() {
-        chrome.storage.local.set({ [STORE_KEY]: { open: panelOpen, x: posX, y: posY } });
+        // 只存位置（open 不再持久化：面板永远默认收起，见 buildUI 内说明）
+        try {
+            chrome.storage.local.set({ [STORE_KEY]: { x: posX, y: posY } });
+        } catch (e) { reviveIfDead(e); }
     }
 
     function ensureFrame() {
@@ -318,6 +358,9 @@
         if (!msg) return;
         if (msg.target === 'content' && msg.cmd === 'togglePanel') { toggle(); return; }
         if (msg.target === 'all') {
+            // 诊断留痕（每实例一次）：现场曾出现“广播投递失效、UI 冻住”，凭此条可确认
+            // content script 是否真的收到了广播、首条是何类型（v2.2.7 起广播改为双路投递）。
+            if (!loggedBroadcast) { loggedBroadcast = true; BPLLog.info('content', '收到首个广播 type=' + msg.type); }
             if (msg.type === 'state' && msg.state) {
                 playerState.playing = !!msg.state.playing;
                 playerState.hasTrack = !!msg.state.hasTrack;
@@ -331,29 +374,52 @@
         }
     });
 
+    // 桥接来源决策（抽成纯函数便于单测）：
+    //   'player'        播放命令：危害仅为控制播放，任意非网页源放行（兼容个别环境扩展 iframe 源被序列化为 'null'）
+    //   'forward'       通用命令（歌单增删改/openTab 等）：仅扩展自身源放行
+    //   'reject-http'   网页源（http/https，浏览器设定、不可伪造）一律拒绝
+    //   'reject-origin' 非扩展源发起的通用命令拒绝——堵住“只拒 http(s)+任意透传”的越权面
+    function bridgeDecision(origin, cmd) {
+        if (typeof origin === 'string' && /^https?:\/\//.test(origin)) return 'reject-http';
+        if (cmd && PLAYER_CMDS[cmd]) return 'player';
+        if (origin !== EXT_ORIGIN) return 'reject-origin';
+        return 'forward';
+    }
+
     window.addEventListener('message', e => {
         const d = e.data;
         if (!d || d.bplBridge !== 'req') return;
-        if (typeof e.origin === 'string' && /^https?:\/\//.test(e.origin)) return;
-        if (!frameLoaded || !pframe || !pframe.contentWindow) return;
         const payload = d.payload;
+        const decision = bridgeDecision(e.origin, payload && payload.cmd);
+        if (decision === 'reject-http') return;
+        if (!frameLoaded || !pframe || !pframe.contentWindow) return;
+        if (!loggedBridgeOrigin) { loggedBridgeOrigin = true; BPLLog.info('content', '桥接首个请求 origin=' + e.origin + ' → ' + decision); }
         const respond = res => {
             try { pframe.contentWindow.postMessage({ bplBridge: 'res', id: d.id, result: res }, '*'); } catch (_) {}
         };
-        if (payload && PLAYER_CMDS[payload.cmd]) {
+        if (decision === 'reject-origin') {
+            BPLLog.warn('content', '桥接拒绝非扩展源通用命令 origin=' + e.origin + ' cmd=' + (payload && payload.cmd));
+            respond({ ok: false, error: '来源不受信任' });
+            return;
+        }
+        if (decision === 'player') {
             handlePlayerCmd(payload).then(respond, err => respond({ ok: false, error: String((err && err.message) || err) }));
             return;
         }
+        // decision === 'forward'
         try {
             chrome.runtime.sendMessage(payload, res => respond(res));
-        } catch (_) {}
+        } catch (err) {
+            respond({ ok: false, error: String((err && err.message) || err) });
+        }
     });
 
     if (typeof globalThis !== 'undefined' && typeof globalThis.__BPL_EXPOSE === 'function') {
         globalThis.__BPL_EXPOSE({
             handlePlayerCmd: handlePlayerCmd,
             getPlayerState: () => playerState,
-            updateMiniUI: updateMiniUI
+            updateMiniUI: updateMiniUI,
+            bridgeDecision: bridgeDecision
         });
     }
 

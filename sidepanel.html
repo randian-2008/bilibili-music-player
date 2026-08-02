@@ -45,6 +45,10 @@
                 <div class="sep"></div>
                 <div data-act="clear">清空歌单</div>
                 <div data-act="delete" class="danger">删除歌单</div>
+                <div class="sep"></div>
+                <div data-act="log">查看运行日志</div>
+                <div data-act="log-export">导出日志 (TXT)</div>
+                <div data-act="log-clear">清空日志</div>
             </div>
         </div>
         <input type="file" id="importFile" accept=".json,application/json" style="display:none">
@@ -62,6 +66,8 @@
     </div>
 
     <div id="coverPop"><img id="coverPopImg" alt=""></div>
+    <div id="diag" class="diag hidden"></div>
+    <script src="logger.js"></script>
     <script src="sidepanel.js"></script>
 </body>
 </html>

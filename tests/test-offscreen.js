@@ -289,6 +289,50 @@ async function testNoStorage() {
     ok(ctx.__audio.src === '', 'data 广播驱动空单停播（替代 onChanged）');
 }
 
+async function testResume() {
+    // v2.2.9 断点续播：现场实证 offscreen 暂停 ~30s 即被浏览器回收（进度随之蒸发），
+    // 再按播放却从头开始。以下断言“进度落盘 + 回收后重建从断点续播”全链路。
+    console.log('\n[offscreen 断点续播（暂停→回收→再按播放从断点起）]');
+    const ticks = async (n) => { for (let i = 0; i < n; i++) await new Promise(r => setImmediate(r)); };
+
+    // ① 暂停时进度落盘（pause 事件驱动，bvid+cid+position 三要素）
+    let ctx = makeCtx({ store: setupPlaylist(2) });
+    await ctx.pPlayIndex(1);
+    ok(ctx.__store.bpl_position && ctx.__store.bpl_position.bvid === 'BV1' && ctx.__store.bpl_position.position === 0,
+        '起播即写断点 0（身份 BV1/101）');
+    ctx.__audio.currentTime = 42;
+    ctx.__audio.ls.pause.slice().forEach(f => f());   // 触发 pause 事件监听（mock 不自动派发）
+    await ticks(3);
+    let pos = ctx.__store.bpl_position;
+    ok(pos && pos.bvid === 'BV1' && pos.cid === 101 && pos.position === 42, '暂停时进度落盘 42s (' + JSON.stringify(pos) + ')');
+
+    // ② 文档被回收后重建（新 ctx = 全新空音频，存储共享 = bg 侧持久层），toggle → 从 42s 继续
+    const ctx2 = makeCtx({ store: ctx.__store });
+    ok(!ctx2.__audio.src, '新文档音频为空（模拟回收后重建）');
+    let r = await ctx2.pToggle();
+    ok(r.ok === true && !!ctx2.__audio.src && ctx2.__audio.currentTime === 42,
+        '再按播放从断点 42s 继续（不是从头）(at=' + ctx2.__audio.currentTime + 's)');
+    ok((await ctx2.pGetState()).playing === true, '续播后状态为播放中');
+
+    // ③ 断点身份不符（歌单变动/换了歌）→ 从头播，不盲跳
+    ctx = makeCtx({ store: setupPlaylist(2) });
+    ctx.__store.bpl_position = { bvid: 'BVx', cid: 999, position: 88 };
+    r = await ctx.pToggle();
+    ok(r.ok === true && ctx.__audio.currentTime === 0, '断点曲目不符 → 从头播');
+
+    // ④ 显式点歌不吃断点（用户意图明确：就是要听这首的开头）
+    ctx = makeCtx({ store: setupPlaylist(2) });
+    ctx.__store.bpl_position = { bvid: 'BV1', cid: 101, position: 88 };
+    r = await ctx.handleCmd({ cmd: 'playIndex', index: 1 });
+    ok(r.ok === true && ctx.__audio.currentTime === 0, '显式 playIndex 从头播（不续断点）');
+
+    // ⑤ stop 清断点：显式停止 = 下回从头
+    ctx = makeCtx({ store: setupPlaylist(2) });
+    await ctx.pPlayIndex(0);
+    r = await ctx.handleCmd({ cmd: 'stop' });
+    ok(r.ok === true && ctx.__store.bpl_position === null, 'stop 清除断点');
+}
+
 (async () => {
     try {
         await testPlayIndex();
@@ -296,6 +340,7 @@ async function testNoStorage() {
         await testHandleCmd();
         await testPort();
         await testNoStorage();
+        await testResume();
     } catch (e) { console.error('测试执行异常:', e); fail++; }
     console.log('\n=================');
     console.log('通过: ' + pass + '  失败: ' + fail);

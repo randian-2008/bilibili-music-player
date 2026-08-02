@@ -93,7 +93,8 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 
 ### 数据持久化
 - chrome.storage.local
-- 键：`bpl_playlists`（歌单）、`bpl_active`（当前歌单ID）、`bpl_state`（播放状态）、`bpl_panel`（仅面板位置）
+- 键：`bpl_playlists`（歌单）、`bpl_active`（当前歌单ID）、`bpl_state`（播放状态）、`bpl_panel`（仅面板位置）、
+  `bpl_position`（断点：`{bvid, cid, position}`，供 offscreen 被回收后续播，v2.2.9）
 - 旧版单歌单数据自动迁移
 
 ## 技术要点
@@ -128,7 +129,7 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 核心逻辑用 Node 在模拟环境中单测（无需浏览器），改动后务必先跑：
 
 ```bash
-node tests/test-offscreen.js    # offscreen 播放引擎：pPlayIndex/多音源容错/blob兜底/5种模式/命令/ping探测/无chrome.storage经bg代理播放
+node tests/test-offscreen.js    # offscreen 播放引擎：pPlayIndex/多音源容错/blob兜底/5种模式/命令/ping探测/无chrome.storage经bg代理播放/断点续播
 node tests/test-background.js   # B站音频源解析、取cid、拉元数据、批量操作、offscreen 路由(创建/降级非粘性/去踩踏/业务错误透传/relay)、广播双路投递(runtime+tabs.sendMessage)、readBootDiag 死因诊断、存储代理(storageGet/storageSet/logMerge)
 node tests/test-content.js      # 播放命令路由(一律→background player，无兜底)、状态广播同步、桥接来源决策(安全)、失效上下文自愈(一次性重载复活)
 node tests/test-logger.js       # 本地日志：批量落盘、级别、时间戳、上限裁剪、无存储上下文经 bg logMerge 中继
@@ -136,7 +137,7 @@ node tests/test-logger.js       # 本地日志：批量落盘、级别、时间�
 
 四个测试均通过 `vm` 注入 mock 的 `chrome/fetch/document`，**直接执行真实源码**
 （offscreen.js / background.js 顶层函数可直接访问；content.js 经 `__BPL_EXPOSE` 钩子；logger.js 直接挂载 `globalThis.BPLLog`），
-共 **104 项断言**（offscreen 28 + background 50 + content 18 + logger 8），全部通过（退出码 0）才算合格。
+共 **114 项断言**（offscreen 36 + background 52 + content 18 + logger 8），全部通过（退出码 0）才算合格。
 注意：浏览器集成层（offscreen 实际创建/发声、postMessage 桥接收发、Referer/Origin 规则、
 autoplay 策略、CORS 真实行为）无法在 Node 中验证，需手动在浏览器确认。
 
@@ -152,6 +153,11 @@ Edge 基于 Chromium（79+ 起），MV3 与 Offscreen Document（Chrome/Edge 109
 - **Offscreen Document 独立于 SW 存活**：它是扩展页面，SW 被杀时它可继续存在并播放音频；
   但**同一时刻只允许一个** offscreen 文档，`createDocument` 在已存在时会拒绝；Chrome 不保证其自然寿命，
   空闲时可能被回收（`AUDIO_PLAYBACK` reason + 正在发声会显著延长其存活）。
+  **现场实锤（v2.2.9 日志）：`AUDIO_PLAYBACK` 只在真实出声时保活——暂停后恰好 ~30s，文档即被当
+  空闲回收**（日志中暂停时刻与 Port 断开时刻相差整 30s）。这是 MV3 的固有机制、无法阻止，故 v2.2.9
+  起不与之对抗：播放进度持续落盘（`bpl_position`，暂停时/播放中每 5s/起播写 0/stop 清除），
+  文档被回收后再按播放，新建文档按曲目身份（bvid+cid）匹配断点 seek 回原位继续；期间后台的
+  `getStatus` 从存储推导暂停态，各页面 UI 保持一致。
 - **`runtime.sendMessage`→offscreen 不可靠**：接收端未就绪 / 多监听者干扰时会丢消息——这是 v1.3 时代
   “音频模块通信失败”、也是 v2.0.1 改用 Port 的老问题。**绝不能把它当长期主通道**。
 - **例外（现场实锤，v2.2.4 已适配）**：某些 Edge 环境下 offscreen 文档的 `chrome.runtime` 完全正常
@@ -216,6 +222,27 @@ v2.2.4 起，无 `chrome.storage` 的环境（如上述 Edge 的 offscreen）写
 - 面板「歌单菜单 ⋯」内可**查看 / 导出 TXT / 清空** 日志，便于在 Edge 现场定位通信问题。
 
 ## 更新记录
+
+### v2.2.9（断点续播：暂停后被浏览器回收，再按播放从暂停处继续）
+
+现场日志钉死根因：用户 01:54:01 暂停，**01:54:31（整 30 秒后）**offscreen Port 断开——
+`AUDIO_PLAYBACK` 只在音频**真实出声**时为 offscreen 文档保活，暂停即无输出、文档被浏览器当
+空闲回收。进度与加载态全随死文档蒸发，于是：再按播放 → 新建文档从 0 播（「歌曲从头开始」）；
+新页面 `getStatus` 拿不到 offscreen → 返回无曲目默认值（单音符 ♪）；旧页面仍持最后一次广播
+（暂停胶囊）→ 新旧页面互相矛盾。这是 MV3 固有机制，无法阻止回收，故不与之对抗、改为状态落盘：
+
+- **进度持久化**（offscreen.js）：新增 `bpl_position` `{bvid, cid, position}`——**暂停时**（pause
+  事件，覆盖面板按钮/系统媒体键一切暂停路径）、**播放中每 5s**（防播放途中被回收，损失 ≤5s）、
+  **起播写 0** 落盘；`stop`/歌单清空/自然播完即清除（显式停止 = 下次从头）。stop 先同步清曲目身份
+  再让 pause 事件落空，杜绝「停了反而写回断点」的竞态。
+- **断点续播**（offscreen.js）：`toggle` 发现音频为空（文档曾被回收的常态）时读出断点，按**曲目身份
+  匹配**（bvid+cid，防歌单变动后盲跳）seek 回原位继续；**显式点歌/切上一首下一首不吃断点**，
+  一律从头——用户主动选曲的意图优先。系统媒体键的「播放」同样接入续播路径。
+- **UI 一致性**（background.js）：offscreen 不存在时的 `getStatus` 不再返回「无曲目」，改从存储推导：
+  当前曲目有效 → `hasTrack:true` + 暂停态 + 断点位置 + 曲目时长。新页面胶囊与旧页面显示一致，
+  按下播放即续播，整条链路自洽。
+- 测试：**114 项**（offscreen 36 + background 52 + content 18 + logger 8）全部通过；新增回归
+  「暂停落盘 → 新文档从 42s 续播」「身份不符/显式点歌不吃断点」「stop 清断点」「回收期 getStatus 推导」。
 
 ### v2.2.8（面板永远默认收起 + 封面预览更快更大）
 

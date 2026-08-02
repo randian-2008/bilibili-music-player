@@ -70,6 +70,7 @@ const DEF_STATE = { playlistId: null, index: 0, playing: false, mode: 'loop' };
 const P_MODES = ['order', 'shuffle', 'one', 'loop', 'shuffleLoop'];
 const audio = document.getElementById('player');
 let curIndex = -1;
+let curTrack = null;   // 当前曲身份 {bvid, cid}：断点落盘以此为键，stop/清空时置 null
 let shuffleOrder = [];
 let shufflePos = -1;
 let curBlobUrl = null;
@@ -122,6 +123,17 @@ async function pSetState(patch) {
     await store.set({ bpl_state: st });
     broadcastState(st);
     return st;
+}
+// 进度持久化（v2.2.9 断点续播）：现场日志实锤——暂停后恰好 ~30s，offscreen 被浏览器当空闲文档
+// 回收（AUDIO_PLAYBACK 只在真实出声时保活，暂停=无输出=空闲）。进度不能只活在文档里：
+// 暂停时/播放中每 5s/起播写 0，一律落存储 bpl_position（含曲身份 bvid+cid）；文档被回收后
+// 再按播放，按身份匹配断点 seek 回原位。stop 清除（显式停止=下次从头）。
+function persistPosition(position) {
+    if (!curTrack) return;
+    store.set({ bpl_position: { bvid: curTrack.bvid, cid: curTrack.cid, position: position || 0 } }).catch(() => {});
+}
+function clearPosition() {
+    store.set({ bpl_position: null }).catch(() => {});
 }
 async function pEnsurePlaylist() {
     const st = await pGetState();
@@ -278,7 +290,9 @@ async function tryPlayUrl(url) {
     }
 }
 
-async function pPlayIndex(i, keepOrder) {
+// savedPos：可选断点 {bvid, cid, position}——仅 toggle 从空音频起播时传入（回收后续播），
+// 身份匹配才 seek 回去；显式点歌/切歌一律不传，从头播。
+async function pPlayIndex(i, keepOrder, savedPos) {
     const items = await pGetItems();
     if (!items.length) return { ok: false, error: '当前播放的歌单为空' };
     if (i < 0 || i >= items.length) return { ok: false, error: '播放索引越界 (' + i + '/' + items.length + ')' };
@@ -298,8 +312,16 @@ async function pPlayIndex(i, keepOrder) {
         if (res.ok) {
             BPLLog.info('off', '第 ' + (si + 1) + '/' + r.urls.length + ' 源播放成功[' + it.bvid + ']');
             curIndex = i;
+            curTrack = { bvid: it.bvid, cid: it.cid || 0 };
+            const resumeAt = (savedPos && savedPos.bvid === it.bvid &&
+                (savedPos.cid || 0) === (it.cid || 0) && savedPos.position > 0) ? savedPos.position : 0;
+            if (resumeAt > 0) {
+                audio.currentTime = resumeAt;
+                BPLLog.info('off', '从断点继续：' + Math.round(resumeAt) + 's[' + it.bvid + ']');
+            }
             setupMediaSession(it);
             await pSetState({ index: i, playing: true });
+            persistPosition(resumeAt);
             return { ok: true };
         }
         if (res.blocked) { blocked = true; break; }
@@ -318,6 +340,8 @@ async function pPlayIndex(i, keepOrder) {
 }
 async function pStopPlayback() {
     audio.pause();
+    curTrack = null;
+    clearPosition();   // 自然播完=下回从头，不留断点
     await pSetState({ playing: false });
     return { ok: true };
 }
@@ -354,9 +378,12 @@ async function pPrev() {
 async function pToggle() {
     if (audio.paused) {
         if (!audio.src) {
+            // 文档曾被回收（暂停 ~30s 后的常态）：音频为空，但断点在存储里。
+            // 读出 bpl_position 交给 pPlayIndex 按曲身份匹配，从暂停处继续而非从头。
             await pEnsurePlaylist();
             const st = await pGetState();
-            return await pPlayIndex(st.index);
+            const savedPos = (await store.get('bpl_position')).bpl_position;
+            return await pPlayIndex(st.index, false, savedPos);
         }
         try { await audio.play(); } catch (e) {
             return { ok: false, error: '浏览器阻止了自动播放：请先点一下页面或浮动按钮再试' };
@@ -378,7 +405,11 @@ function setupMediaSession(it) {
             album: 'B站听歌列表',
             artwork: it.pic ? [{ src: it.pic, sizes: '512x512', type: 'image/jpeg' }] : []
         });
-        navigator.mediaSession.setActionHandler('play', () => { audio.play().catch(() => {}); });
+        // 系统媒体键“播放”：音频为空（文档曾被回收）时走 toggle 的断点续播路径
+        navigator.mediaSession.setActionHandler('play', () => {
+            if (!audio.src) pToggle();
+            else audio.play().catch(() => {});
+        });
         navigator.mediaSession.setActionHandler('pause', () => { audio.pause(); });
         navigator.mediaSession.setActionHandler('previoustrack', () => { pPrev(); });
         navigator.mediaSession.setActionHandler('nexttrack', () => { pNext(); });
@@ -401,6 +432,9 @@ audio.addEventListener('play', () => {
 });
 audio.addEventListener('pause', () => {
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+    // 任何暂停路径（面板按钮/MediaSession/系统键）都落断点——这正是文档被回收前的最后一笔。
+    // stop 会先同步清掉 curTrack，故其后触发的本事件不会误写（断点清除优先）。
+    persistPosition(audio.currentTime || 0);
     pSetState({ playing: false });
 });
 // 关键诊断：play() 可能先 resolve、随后由 error 事件异步失败（如 CDN 403/解码错），
@@ -425,6 +459,7 @@ store.get(['bpl_volume', 'bpl_mute']).then(r => {
     if (typeof r.bpl_mute === 'boolean') audio.muted = r.bpl_mute;
 });
 
+let progTick = 0;
 setInterval(() => {
     if (!audio.src) return;
     relayBroadcast({
@@ -433,6 +468,9 @@ setInterval(() => {
         duration: audio.duration || 0,
         playing: !audio.paused
     });
+    // 播放中每 5s 落一次断点：即便播放途中文档被回收（罕见但 Chromium 确会发生），
+    // 损失也不超过 5s；暂停时的落盘由 pause 事件保证，二者互补。
+    if (!audio.paused && ++progTick % 5 === 0) persistPosition(audio.currentTime || 0);
     if ('mediaSession' in navigator && navigator.mediaSession.setPositionState) {
         try {
             navigator.mediaSession.setPositionState({
@@ -449,6 +487,7 @@ function onPlaylistsChanged() {
     pGetItems().then(items => {
         if (!items.length && audio.src) {
             audio.pause(); audio.removeAttribute('src'); audio.load(); curIndex = -1;
+            curTrack = null; clearPosition();   // 歌单清空：曲目不复存在，断点随之作废
         }
     });
 }
@@ -470,6 +509,8 @@ async function handleCmd(msg) {
         case 'getStatus': return { ok: true, position: audio.currentTime || 0, duration: audio.duration || 0, playing: !audio.paused, index: curIndex, hasTrack: !!audio.src };
         case 'stop':
             audio.pause(); audio.removeAttribute('src'); audio.load();
+            curTrack = null;   // 先断身份：随后异步触发的 pause 事件不再回写断点
+            clearPosition();   // 显式停止 = 下次从头，清断点
             if (curBlobUrl) { URL.revokeObjectURL(curBlobUrl); curBlobUrl = null; }
             curIndex = -1; shuffleOrder = []; shufflePos = -1;
             await pSetState({ playing: false });

@@ -251,6 +251,21 @@ function makeCtx(opts) {
     r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'getStatus' } }, null);
     ok(r.ok && r.hasTrack === false && ctx.__off.createCalls === 0, 'getStatus 无 offscreen 时不创建、返回默认');
 
+    // v2.2.9 回归：offscreen 被回收（暂停 ~30s 后的常态）≠ 没有曲目。getStatus 从存储推导
+    // 暂停态 + 断点位置——否则新页面胶囊退回单音符 ♪、与旧页面的暂停态互相矛盾。
+    ctx = makeCtx();
+    ctx.__store.bpl_playlists = [{ id: 'pl1', name: 'p', items: [
+        { bvid: 'BV0', cid: 100, title: 'a', pic: '', owner: '', duration: 200, page: 1 },
+        { bvid: 'BV1', cid: 101, title: 'b', pic: '', owner: '', duration: 300, page: 1 } ] }];
+    ctx.__store.bpl_state = { playlistId: 'pl1', index: 1, playing: false, mode: 'loop' };
+    ctx.__store.bpl_position = { bvid: 'BV1', cid: 101, position: 77 };
+    r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'getStatus' } }, null);
+    ok(r.ok && r.hasTrack === true && r.playing === false && r.index === 1 && r.position === 77 && r.duration === 300,
+        'offscreen 被回收时 getStatus 从存储推导暂停态+断点 (' + r.position + '/' + r.duration + ')');
+    ctx.__store.bpl_position = { bvid: 'BVx', cid: 9, position: 77 };
+    r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'getStatus' } }, null);
+    ok(r.ok && r.hasTrack === true && r.position === 0, '断点曲目不符 → 推导位置归零');
+
     // offscreen 持续无响应 → 返回带确切诊断的错误；关键回归：不再 close+重建踩踏
     // （旧实现失败即关闭重建，2s 一轮把正在初始化的 offscreen.js 反复踩死，是本次故障元凶）
     ctx = makeCtx({ offscreenResponder: () => undefined });

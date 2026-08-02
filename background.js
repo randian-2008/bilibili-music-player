@@ -479,7 +479,17 @@ async function handleBg(msg, sender) {
             const payload = msg.payload || {};
             if (payload.cmd !== 'getStatus' && payload.cmd !== 'ping') BPLLog.info('bg', '收到 player 命令：' + payload.cmd);
             if (payload.cmd === 'getStatus' && !offscreenPort && !(await hasOffscreen())) {
-                return { ok: true, position: 0, duration: 0, playing: false, index: -1, hasTrack: false };
+                // v2.2.9：offscreen 暂停 ~30s 即被浏览器当空闲文档回收（AUDIO_PLAYBACK 只在出声时保活），
+                // 此时“有一首暂停中的歌”仍是事实。从存储推导：新页面的胶囊/面板应显示暂停态与断点位置
+                // （而非无曲目的单音符 ♪），与旧页面保持一致；按下播放经 toggle 走断点续播。
+                const st = await getState();
+                const pls = await getPlaylists();
+                const pl = pls.find(p => p.id === st.playlistId);
+                const it = pl && pl.items && pl.items[st.index];
+                if (!it) return { ok: true, position: 0, duration: 0, playing: false, index: -1, hasTrack: false };
+                const pos = (await chrome.storage.local.get('bpl_position')).bpl_position;
+                const at = (pos && pos.bvid === it.bvid && (pos.cid || 0) === (it.cid || 0)) ? (pos.position || 0) : 0;
+                return { ok: true, position: at, duration: it.duration || 0, playing: false, index: st.index, hasTrack: true, mode: st.mode };
             }
             return await sendToOffscreen(payload);
         }

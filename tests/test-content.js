@@ -109,6 +109,18 @@ function makeCtx(opts) {
     ok(bd('null', 'deletePlaylist') === 'reject-origin', 'null 源通用命令拒绝(堵越权)');
     ok(bd('chrome-extension://other', 'clear') === 'reject-origin', '其他扩展源通用命令拒绝');
 
+    console.log('\n[content.js 面板尺寸与视口边界]');
+    const clamp = ctx.__api().clampPanelGeometry;
+    let g = clamp(20, 30, 100, 120, 1000, 800);
+    ok(g.x === 20 && g.y === 30 && g.width === 300 && g.height === 300,
+        '面板尺寸不小于 300x300');
+    g = clamp(50, 60, 2000, 2000, 1000, 800);
+    ok(g.x === 4 && g.y === 4 && g.width === 992 && g.height === 792,
+        '面板尺寸不超过视口并保留 4px 边距');
+    g = clamp(-200, 900, 400, 350, 1000, 800);
+    ok(g.x === 4 && g.y === 446 && g.width === 400 && g.height === 350,
+        '越界位置被钳制到完整可见范围');
+
     console.log('\n[content.js 失效上下文自愈（v2.2.7：升级残留标签页）]');
     // 现场日志实锤：升级前开着的标签页里 runtime 调用全抛 "Extension context invalidated"，
     // UI 僵死。期望：检测→重载本页一次（守卫防循环）；通道复活后清守卫。

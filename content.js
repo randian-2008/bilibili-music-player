@@ -16,11 +16,26 @@
     const EXT_ORIGIN = chrome.runtime.getURL('').replace(/\/+$/, '');
     const Z = 2147483646;
 
-    let shadow, hostEl, mini, miniPlay, panel, pframe, addBtn, addTxt;
+    let shadow, hostEl, mini, miniPlay, panel, pframe, addBtn, addTxt, resizeGrip;
     let panelOpen = false;
     let frameLoaded = false;
     let built = false;
-    let posX = null, posY = null;
+    let posX = null, posY = null, panelWidth = null, panelHeight = null;
+
+    const PANEL_MARGIN = 4;
+    const PANEL_MIN_WIDTH = 300;
+    const PANEL_MIN_HEIGHT = 300;
+    function clampPanelGeometry(x, y, width, height, viewportWidth, viewportHeight) {
+        const maxWidth = Math.max(1, viewportWidth - PANEL_MARGIN * 2);
+        const maxHeight = Math.max(1, viewportHeight - PANEL_MARGIN * 2);
+        const minWidth = Math.min(PANEL_MIN_WIDTH, maxWidth);
+        const minHeight = Math.min(PANEL_MIN_HEIGHT, maxHeight);
+        const w = Math.max(minWidth, Math.min(Number(width) || 340, maxWidth));
+        const h = Math.max(minHeight, Math.min(Number(height) || 540, maxHeight));
+        const left = Math.max(PANEL_MARGIN, Math.min(Number(x) || PANEL_MARGIN, viewportWidth - w - PANEL_MARGIN));
+        const top = Math.max(PANEL_MARGIN, Math.min(Number(y) || PANEL_MARGIN, viewportHeight - h - PANEL_MARGIN));
+        return { x: left, y: top, width: w, height: h };
+    }
 
     function isBiliVideo() {
         return /(^|\.)bilibili\.com$/.test(location.hostname) && /^\/video\//.test(location.pathname);
@@ -129,6 +144,9 @@
         'transition:opacity .2s ease,transform .28s cubic-bezier(.34,1.56,.64,1),visibility 0s linear .28s}' +
         '.panel.open{opacity:1;visibility:visible;transform:none;' +
         'transition:opacity .18s ease,transform .3s cubic-bezier(.34,1.56,.64,1),visibility 0s}' +
+        '.panel.sized{max-width:calc(100vw - 8px);max-height:calc(100vh - 8px)}' +
+        '.panel.dragging,.panel.resizing{transition:none}' +
+        '.panel.dragging .pframe,.panel.resizing .pframe{pointer-events:none}' +
 
         '.phead{flex:none;display:flex;align-items:center;gap:6px;padding:5px 8px;background:#202024;' +
         'border-bottom:1px solid #2b2b2f;cursor:move;user-select:none;min-height:30px}' +
@@ -139,7 +157,11 @@
         '.pbtn.add{color:#fb7299;font-size:13px;width:auto;padding:0 9px;font-weight:600}' +
         '.pbtn.add:hover{background:#2a2026}' +
         '.pbody{flex:1;min-height:0;position:relative}' +
-        '.pframe{width:100%;height:100%;border:none;display:block;background:#18191c}';
+        '.pframe{width:100%;height:100%;border:none;display:block;background:#18191c}' +
+        '.resize-grip{position:absolute;right:0;bottom:0;z-index:3;width:18px;height:18px;' +
+        'cursor:nwse-resize;color:#777982;touch-action:none}' +
+        '.resize-grip::after{content:"";position:absolute;right:3px;bottom:3px;width:8px;height:8px;' +
+        'border-right:2px solid currentColor;border-bottom:2px solid currentColor}';
 
     function buildUI() {
         if (built || document.getElementById(HOST_ID)) return;
@@ -170,6 +192,7 @@
             '<button class="pbtn add" title="把当前B站视频加入歌单" style="display:none"><span class="addtxt">＋加入</span></button>' +
             '</div>' +
             '<div class="pbody"><iframe class="pframe" title="playlist" allow="autoplay"></iframe></div>' +
+            '<div class="resize-grip" title="调整面板大小"></div>' +
             '</div>';
 
         mini = shadow.querySelector('.mini');
@@ -178,10 +201,12 @@
         pframe = shadow.querySelector('.pframe');
         addBtn = shadow.querySelector('.add');
         addTxt = shadow.querySelector('.addtxt');
+        resizeGrip = shadow.querySelector('.resize-grip');
 
         makeMiniDraggable();
         addBtn.addEventListener('click', addCurrent);
         makeDraggable(panel, shadow.querySelector('.phead'));
+        makeResizable(panel, resizeGrip);
 
         function miniActivate(target) {
             if (target && target.closest) {
@@ -250,21 +275,20 @@
             }
         }).catch(e => reviveIfDead(e));
 
-        // 只恢复面板位置。开合状态刻意不持久化、不恢复（用户要求）：
-        // 新开页面/刷新时面板一律默认收起——无论是否正在播放；旧的 bpl_panel.open 恢复已移除。
+        // 恢复面板位置与用户调整后的尺寸。开合状态仍不持久化：新页面/刷新后一律默认收起。
         chrome.storage.local.get(STORE_KEY).then(r => {
             const p = (r && r[STORE_KEY]) || {};
-            const valid = typeof p.x === 'number' && typeof p.y === 'number' &&
-                (p.x > 8 || p.y > 8) &&
-                p.x < window.innerWidth - 60 && p.y < window.innerHeight - 60;
-            if (valid) {
-                posX = p.x; posY = p.y;
-                panel.style.right = 'auto';
-                panel.style.bottom = 'auto';
-                panel.style.left = posX + 'px';
-                panel.style.top = posY + 'px';
+            const hasPosition = typeof p.x === 'number' && typeof p.y === 'number';
+            const hasSize = typeof p.width === 'number' && typeof p.height === 'number';
+            if (hasPosition || hasSize) {
+                const width = hasSize ? p.width : panel.offsetWidth;
+                const height = hasSize ? p.height : panel.offsetHeight;
+                const x = hasPosition ? p.x : window.innerWidth - width - 20;
+                const y = hasPosition ? p.y : window.innerHeight - height - 146;
+                applyPanelGeometry(clampPanelGeometry(x, y, width, height, window.innerWidth, window.innerHeight));
             }
         }).catch(e => reviveIfDead(e));
+        window.addEventListener('resize', keepPanelInViewport);
         updateAddBtn();
         updateMiniUI();
     }
@@ -277,10 +301,34 @@
         if (p) p.setAttribute('d', playerState.playing ? PAUSE_D : PLAY_D);
     }
 
+    function applyPanelGeometry(g) {
+        panel.classList.add('sized');
+        panel.style.right = 'auto';
+        panel.style.bottom = 'auto';
+        panel.style.left = g.x + 'px';
+        panel.style.top = g.y + 'px';
+        panel.style.width = g.width + 'px';
+        panel.style.height = g.height + 'px';
+        posX = g.x; posY = g.y;
+        panelWidth = g.width; panelHeight = g.height;
+    }
+
+    let viewportPersistTimer = null;
+    function keepPanelInViewport() {
+        if (!panel || !panel.classList.contains('sized')) return;
+        applyPanelGeometry(clampPanelGeometry(
+            posX, posY, panelWidth, panelHeight, window.innerWidth, window.innerHeight
+        ));
+        if (viewportPersistTimer) clearTimeout(viewportPersistTimer);
+        viewportPersistTimer = setTimeout(persist, 150);
+    }
+
     function persist() {
-        // 只存位置（open 不再持久化：面板永远默认收起，见 buildUI 内说明）
+        if (posX == null || posY == null || panelWidth == null || panelHeight == null) return;
         try {
-            chrome.storage.local.set({ [STORE_KEY]: { x: posX, y: posY } });
+            chrome.storage.local.set({
+                [STORE_KEY]: { x: posX, y: posY, width: panelWidth, height: panelHeight }
+            });
         } catch (e) { reviveIfDead(e); }
     }
 
@@ -294,7 +342,6 @@
         panelOpen = (open == null) ? !panelOpen : !!open;
         panel.classList.toggle('open', panelOpen);
         if (panelOpen) { ensureFrame(); updateAddBtn(); }
-        persist();
     }
 
     function updateAddBtn() {
@@ -317,31 +364,75 @@
     }
 
     function makeDraggable(el, handle) {
-        let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+        let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0, width = 0, height = 0;
         handle.addEventListener('pointerdown', e => {
             if (e.target.closest('.pbtn')) return;
+            if (e.button !== 0) return;
+            e.preventDefault();
             dragging = true;
             sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect();
-            ox = r.left; oy = r.top;
-            el.style.right = 'auto';
-            el.style.bottom = 'auto';
+            const g = clampPanelGeometry(
+                r.left, r.top, r.width, r.height, window.innerWidth, window.innerHeight
+            );
+            applyPanelGeometry(g);
+            ox = g.x; oy = g.y; width = g.width; height = g.height;
+            el.classList.add('dragging');
             try { handle.setPointerCapture(e.pointerId); } catch (_) {}
         });
         handle.addEventListener('pointermove', e => {
             if (!dragging) return;
-            let nx = ox + e.clientX - sx;
-            let ny = oy + e.clientY - sy;
-            nx = Math.max(4, Math.min(nx, window.innerWidth - el.offsetWidth - 4));
-            ny = Math.max(4, Math.min(ny, window.innerHeight - 44));
-            el.style.left = nx + 'px';
-            el.style.top = ny + 'px';
+            applyPanelGeometry(clampPanelGeometry(
+                ox + e.clientX - sx,
+                oy + e.clientY - sy,
+                width,
+                height,
+                window.innerWidth,
+                window.innerHeight
+            ));
         });
         const end = () => {
             if (!dragging) return;
             dragging = false;
+            el.classList.remove('dragging');
+            persist();
+        };
+        handle.addEventListener('pointerup', end);
+        handle.addEventListener('pointercancel', end);
+    }
+
+    function makeResizable(el, handle) {
+        let resizing = false, sx = 0, sy = 0;
+        let ox = 0, oy = 0, startWidth = 0, startHeight = 0;
+        handle.addEventListener('pointerdown', e => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            e.stopPropagation();
+            resizing = true;
+            sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect();
-            posX = Math.round(r.left); posY = Math.round(r.top);
+            const g = clampPanelGeometry(
+                r.left, r.top, r.width, r.height, window.innerWidth, window.innerHeight
+            );
+            applyPanelGeometry(g);
+            ox = g.x; oy = g.y; startWidth = g.width; startHeight = g.height;
+            el.classList.add('resizing');
+            try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+        });
+        handle.addEventListener('pointermove', e => {
+            if (!resizing) return;
+            const maxWidth = Math.max(1, window.innerWidth - ox - PANEL_MARGIN);
+            const maxHeight = Math.max(1, window.innerHeight - oy - PANEL_MARGIN);
+            const minWidth = Math.min(PANEL_MIN_WIDTH, maxWidth);
+            const minHeight = Math.min(PANEL_MIN_HEIGHT, maxHeight);
+            const width = Math.max(minWidth, Math.min(startWidth + e.clientX - sx, maxWidth));
+            const height = Math.max(minHeight, Math.min(startHeight + e.clientY - sy, maxHeight));
+            applyPanelGeometry({ x: ox, y: oy, width: width, height: height });
+        });
+        const end = () => {
+            if (!resizing) return;
+            resizing = false;
+            el.classList.remove('resizing');
             persist();
         };
         handle.addEventListener('pointerup', end);
@@ -419,7 +510,8 @@
             handlePlayerCmd: handlePlayerCmd,
             getPlayerState: () => playerState,
             updateMiniUI: updateMiniUI,
-            bridgeDecision: bridgeDecision
+            bridgeDecision: bridgeDecision,
+            clampPanelGeometry: clampPanelGeometry
         });
     }
 

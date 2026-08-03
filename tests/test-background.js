@@ -9,6 +9,7 @@ function makeCtx(opts) {
     opts = opts || {};
     let resp = {};
     const store = {};
+    const clone = value => JSON.parse(JSON.stringify(value));
     const off = { exists: false, createCalls: 0, closeCalls: 0 };
     const offscreenResponder = opts.offscreenResponder || ((msg) => ({ ok: true, echoed: msg.cmd }));
     const connectHandlers = [];
@@ -86,9 +87,12 @@ function makeCtx(opts) {
             windows: { getCurrent: () => Promise.resolve({ id: 1 }) },
             storage: {
                 local: {
-                    get: () => Promise.resolve(Object.assign({}, store)),
-                    set: o => { Object.assign(store, o); return Promise.resolve(); },
-                    remove: () => Promise.resolve()
+                    get: () => Promise.resolve(clone(store)),
+                    set: o => { Object.assign(store, clone(o)); return Promise.resolve(); },
+                    remove: keys => {
+                        for (const key of (Array.isArray(keys) ? keys : [keys])) delete store[key];
+                        return Promise.resolve();
+                    }
                 }
             }
         },
@@ -152,7 +156,7 @@ function makeCtx(opts) {
     ctx = makeCtx();
     ctx.__setResp({ data: { bvid: 'BV1', cid: 9, title: '歌曲', pic: 'http://i0.hdslb.com/x.jpg', owner: { name: 'UP' }, duration: 200, pages: [{ page: 1, cid: 9 }] } });
     const it = await ctx.buildItem('BV1', 1, 'fallback');
-    ok(it.cid === 9 && it.title === '歌曲' && it.owner === 'UP', '元数据正确 (cid=' + it.cid + ',title=' + it.title + ')');
+    ok(!!it.id && it.cid === 9 && it.title === '歌曲' && it.owner === 'UP', '元数据正确且生成稳定 ID (cid=' + it.cid + ',title=' + it.title + ')');
     ok(it.pic === 'https://i0.hdslb.com/x.jpg', '封面 http→https (' + it.pic + ')');
 
     // buildItem 失败回退
@@ -161,17 +165,41 @@ function makeCtx(opts) {
     const it2 = await ctx.buildItem('BV1', 1, '兜底标题');
     ok(it2.cid === 0 && it2.title === '兜底标题', '解析失败用兜底 (' + it2.title + ')');
 
+    console.log('\n[background 存储模型迁移（稳定歌曲 ID / trackId）]');
+    ctx = makeCtx();
+    ctx.__store.bpl_playlists = [{ id: 'legacy', name: '旧歌单', items: [
+        { bvid: 'BV0', cid: 100, title: 'a' },
+        { bvid: 'BV1', cid: 101, title: 'b' }
+    ] }];
+    ctx.__store.bpl_active = 'legacy';
+    ctx.__store.bpl_state = { playlistId: 'legacy', index: 1, playing: false, mode: 'loop' };
+    ctx.__store.bpl_position = { bvid: 'BV1', cid: 101, position: 42 };
+    await ctx.migrate();
+    const migrated = ctx.__store.bpl_playlists[0].items;
+    ok(migrated.every(x => !!x.id) && migrated[0].id !== migrated[1].id, '旧歌曲补齐唯一 ID');
+    ok(ctx.__store.bpl_state.trackId === migrated[1].id && ctx.__store.bpl_state.index === 1,
+        '旧播放索引迁移为 trackId');
+    ok(ctx.__store.bpl_schema_version === 1, '写入存储 schema 版本');
+
+    ctx = makeCtx();
+    ctx.__store.bpl_playlists = [{ id: 'stopped', name: '已停止', items: [{ bvid: 'BV0', cid: 100, title: 'a' }] }];
+    ctx.__store.bpl_active = 'stopped';
+    ctx.__store.bpl_state = { playlistId: 'stopped', index: 0, playing: false, mode: 'loop' };
+    await ctx.migrate();
+    ok(ctx.__store.bpl_state.trackId === null, '旧状态无播放断点时保持“已停止”语义');
+
     console.log('\n[background 批量操作]');
     function seedBatch() {
         const c = makeCtx();
         const items = [];
-        for (let i = 0; i < 5; i++) items.push({ bvid: 'BV' + i, cid: 100 + i, title: 't' + i, pic: '', owner: '', duration: 10, page: 1 });
+        for (let i = 0; i < 5; i++) items.push({ id: 'item' + i, bvid: 'BV' + i, cid: 100 + i, title: 't' + i, pic: '', owner: '', duration: 10, page: 1 });
         c.__store.bpl_playlists = [
             { id: 'plA', name: 'A', items: items },
             { id: 'plB', name: 'B', items: [] }
         ];
         c.__store.bpl_active = 'plA';
-        c.__store.bpl_state = { playlistId: 'plA', index: 2, playing: true, mode: 'loop' };
+        c.__store.bpl_state = { playlistId: 'plA', trackId: 'item2', index: 2, playing: true, mode: 'loop' };
+        c.__store.bpl_position = { trackId: 'item2', bvid: 'BV2', cid: 102, position: 5 };
         return c;
     }
     // 批量删除（删索引 1、3），当前播放索引 2 应左移 1 → 1
@@ -180,7 +208,8 @@ function makeCtx(opts) {
     let pl = ctx.__store.bpl_playlists[0];
     ok(r.ok && pl.items.length === 3, 'batchRemove 删除后剩 3 首');
     ok(pl.items.map(x => x.bvid).join(',') === 'BV0,BV2,BV4', '剩余顺序正确 (' + pl.items.map(x => x.bvid).join(',') + ')');
-    ok(ctx.__store.bpl_state.index === 1, '播放索引左移 (' + ctx.__store.bpl_state.index + ')');
+    ok(ctx.__store.bpl_state.trackId === 'item2' && ctx.__store.bpl_state.index === 1,
+        '按 trackId 重定位播放索引 (' + ctx.__store.bpl_state.index + ')');
 
     // 批量复制到 plB（不影响源）
     ctx = seedBatch();
@@ -188,6 +217,7 @@ function makeCtx(opts) {
     let src = ctx.__store.bpl_playlists[0], dst = ctx.__store.bpl_playlists[1];
     ok(r.ok && src.items.length === 5 && dst.items.length === 2, 'batchCopy 源不变、目标+2');
     ok(dst.items.map(x => x.bvid).join(',') === 'BV0,BV2', '复制内容正确 (' + dst.items.map(x => x.bvid).join(',') + ')');
+    ok(dst.items[0].id !== src.items[0].id && dst.items[1].id !== src.items[2].id, '复制歌曲生成新的稳定 ID');
 
     // 批量复制到 plB 两次 → 去重
     r = await ctx.handleBg({ cmd: 'batchCopy', indices: [0, 2], toId: 'plB' }, null);
@@ -200,7 +230,13 @@ function makeCtx(opts) {
     src = ctx.__store.bpl_playlists[0]; dst = ctx.__store.bpl_playlists[1];
     ok(r.ok && src.items.length === 3 && dst.items.length === 2, 'batchMove 源-2、目标+2');
     ok(src.items.map(x => x.bvid).join(',') === 'BV0,BV3,BV4', '移动后源正确 (' + src.items.map(x => x.bvid).join(',') + ')');
-    ok(ctx.__store.bpl_state.index === 1, '移走正在播的后指向后继 (' + ctx.__store.bpl_state.index + ')');
+    ok(ctx.__store.bpl_state.trackId === null && ctx.__store.bpl_state.playing === false && ctx.__store.bpl_position === null,
+        '移走正在播放歌曲后停止并清除断点');
+
+    ctx = seedBatch();
+    r = await ctx.handleBg({ cmd: 'batchRemove', indices: [2] }, null);
+    ok(r.ok && ctx.__store.bpl_state.trackId === null && ctx.__store.bpl_state.playing === false,
+        '删除正在播放歌曲后清除当前曲目身份');
 
     console.log('\n[background moveItem 拖拽排序]');
     // 向下拖：BV1 拖到 BV3 位置 → BV1 应落在 BV3 原位置
@@ -208,11 +244,27 @@ function makeCtx(opts) {
     await ctx.handleBg({ cmd: 'moveItem', from: 1, to: 3 }, null);
     ok(ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') === 'BV0,BV2,BV1,BV3,BV4',
         '下拖落位准确 (' + ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') + ')');
+    ok(ctx.__store.bpl_state.trackId === 'item2' && ctx.__store.bpl_state.index === 1,
+        '下拖后按 trackId 保持当前歌曲');
     // 向上拖：BV3 拖到 BV1 位置 → BV3 应落在 BV1 原位置
     ctx = seedBatch();
     await ctx.handleBg({ cmd: 'moveItem', from: 3, to: 1 }, null);
     ok(ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') === 'BV0,BV3,BV1,BV2,BV4',
         '上拖落位准确 (' + ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') + ')');
+    ok(ctx.__store.bpl_state.trackId === 'item2' && ctx.__store.bpl_state.index === 3,
+        '上拖后按 trackId 保持当前歌曲');
+
+    console.log('\n[background 歌单写入串行化]');
+    ctx = makeCtx();
+    ctx.__store.bpl_playlists = [];
+    ctx.__store.bpl_state = { playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' };
+    await Promise.all([
+        ctx.handleBg({ cmd: 'createPlaylist', name: '并发 A' }, null),
+        ctx.handleBg({ cmd: 'createPlaylist', name: '并发 B' }, null)
+    ]);
+    ok(ctx.__store.bpl_playlists.length === 2 &&
+        ctx.__store.bpl_playlists.some(p => p.name === '并发 A') && ctx.__store.bpl_playlists.some(p => p.name === '并发 B'),
+        '并发修改依次提交，不发生最后写入覆盖');
 
     console.log('\n[background offscreen 路由（Port 通信）]');
     // sendToOffscreen 正常：创建 offscreen 并经 Port 转发命令
@@ -255,14 +307,14 @@ function makeCtx(opts) {
     // 暂停态 + 断点位置——否则新页面胶囊退回单音符 ♪、与旧页面的暂停态互相矛盾。
     ctx = makeCtx();
     ctx.__store.bpl_playlists = [{ id: 'pl1', name: 'p', items: [
-        { bvid: 'BV0', cid: 100, title: 'a', pic: '', owner: '', duration: 200, page: 1 },
-        { bvid: 'BV1', cid: 101, title: 'b', pic: '', owner: '', duration: 300, page: 1 } ] }];
-    ctx.__store.bpl_state = { playlistId: 'pl1', index: 1, playing: false, mode: 'loop' };
-    ctx.__store.bpl_position = { bvid: 'BV1', cid: 101, position: 77 };
+        { id: 'i0', bvid: 'BV0', cid: 100, title: 'a', pic: '', owner: '', duration: 200, page: 1 },
+        { id: 'i1', bvid: 'BV1', cid: 101, title: 'b', pic: '', owner: '', duration: 300, page: 1 } ] }];
+    ctx.__store.bpl_state = { playlistId: 'pl1', trackId: 'i1', index: 1, playing: false, mode: 'loop' };
+    ctx.__store.bpl_position = { trackId: 'i1', bvid: 'BV1', cid: 101, position: 77 };
     r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'getStatus' } }, null);
     ok(r.ok && r.hasTrack === true && r.playing === false && r.index === 1 && r.position === 77 && r.duration === 300,
         'offscreen 被回收时 getStatus 从存储推导暂停态+断点 (' + r.position + '/' + r.duration + ')');
-    ctx.__store.bpl_position = { bvid: 'BVx', cid: 9, position: 77 };
+    ctx.__store.bpl_position = { trackId: 'other', bvid: 'BV1', cid: 101, position: 77 };
     r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'getStatus' } }, null);
     ok(r.ok && r.hasTrack === true && r.position === 0, '断点曲目不符 → 推导位置归零');
 
@@ -368,7 +420,7 @@ function makeCtx(opts) {
 
     console.log('\n[background 存储代理（供无 chrome.storage 的 offscreen 使用）]');
     ctx = makeCtx();
-    ctx.__store.bpl_state = { playlistId: 'pl1', index: 2, playing: true, mode: 'loop' };
+    ctx.__store.bpl_state = { playlistId: 'pl1', trackId: 'i2', index: 2, playing: true, mode: 'loop' };
     let r2 = await ctx.handleBg({ cmd: 'storageGet', keys: 'bpl_state' });
     ok(r2.ok === true && r2.values && r2.values.bpl_state && r2.values.bpl_state.index === 2, 'storageGet 代理读取');
     r2 = await ctx.handleBg({ cmd: 'storageSet', data: { bpl_volume: 0.3 } });

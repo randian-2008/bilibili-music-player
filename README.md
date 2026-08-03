@@ -7,7 +7,7 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 ```
 ┌─ content.js（注入所有 http/https 网页，Shadow DOM 隔离）
 │    ├─ 可变形胶囊 ★（停止=24px半透明圆♪；有曲目=胶囊：频谱+上一首/播放/下一首）
-│    ├─ 浮动面板（上下两区：小播放器+歌单；可拖拽，点页面空白自动收起）
+│    ├─ 浮动面板（上下两区：小播放器+歌单；可拖拽、缩放，点页面空白自动收起）
 │    ├─「＋加入」按钮（仅 B站视频页，把 bvid/page 发给 background）
 │    └─ postMessage 桥接（iframe 命令 ↔ background；并把 state/progress 广播回传给胶囊）
 │              ▲  window.postMessage          │ chrome.runtime.sendMessage
@@ -43,7 +43,7 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
   - 上一首 / 播放·暂停 / 下一首 按钮（无需展开面板即可控制）
 - **打开面板**：点胶囊频谱 / 点停止时的小圆按钮 / `Ctrl+Shift+B` / 扩展图标
 - **收起面板**：点 × / 再点频谱 / **点击页面任意其他位置自动收起**
-- 面板**位置**自动记忆（chrome.storage）；**开合状态刻意不记忆**——新开页面 / 刷新时面板一律默认收起，
+- 面板**位置和尺寸**自动记忆（chrome.storage）；**开合状态刻意不记忆**——新开页面 / 刷新时面板一律默认收起，
   无论是否正在播放（v2.2.8 起）
 
 ## 已实现功能
@@ -93,8 +93,10 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 
 ### 数据持久化
 - chrome.storage.local
-- 键：`bpl_playlists`（歌单）、`bpl_active`（当前歌单ID）、`bpl_state`（播放状态）、`bpl_panel`（仅面板位置）、
-  `bpl_position`（断点：`{bvid, cid, position}`，供 offscreen 被回收后续播，v2.2.9）
+- 键：`bpl_playlists`（歌单，每首歌曲有稳定 `id`）、`bpl_active`（当前歌单ID）、
+  `bpl_state`（播放状态，以 `trackId` 标识当前歌曲，`index` 仅作位置缓存）、`bpl_panel`（面板位置和尺寸）、
+  `bpl_position`（断点：`{trackId, bvid, cid, position}`，供 offscreen 被回收后续播）、
+  `bpl_schema_version`（存储结构版本，当前为 1）
 - 旧版单歌单数据自动迁移
 
 ## 技术要点
@@ -129,17 +131,23 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 核心逻辑用 Node 在模拟环境中单测（无需浏览器），改动后务必先跑：
 
 ```bash
-node tests/test-offscreen.js    # offscreen 播放引擎：pPlayIndex/多音源容错/blob兜底/5种模式/命令/ping探测/无chrome.storage经bg代理播放/断点续播
-node tests/test-background.js   # B站音频源解析、取cid、拉元数据、批量操作、offscreen 路由(创建/降级非粘性/去踩踏/业务错误透传/relay)、广播双路投递(runtime+tabs.sendMessage)、readBootDiag 死因诊断、存储代理(storageGet/storageSet/logMerge)
-node tests/test-content.js      # 播放命令路由(一律→background player，无兜底)、状态广播同步、桥接来源决策(安全)、失效上下文自愈(一次性重载复活)
+node tests/test-offscreen.js    # offscreen 播放引擎：多音源容错/5种模式/统一停止/trackId/存储代理/断点续播
+node tests/test-background.js   # B站API、存储迁移、歌单串行写入、稳定ID、批量操作、offscreen路由/自愈/广播/存储代理
+node tests/test-content.js      # 播放命令路由、状态同步、桥接来源安全、面板几何边界、失效上下文自愈
 node tests/test-logger.js       # 本地日志：批量落盘、级别、时间戳、上限裁剪、无存储上下文经 bg logMerge 中继
 ```
 
 四个测试均通过 `vm` 注入 mock 的 `chrome/fetch/document`，**直接执行真实源码**
 （offscreen.js / background.js 顶层函数可直接访问；content.js 经 `__BPL_EXPOSE` 钩子；logger.js 直接挂载 `globalThis.BPLLog`），
-共 **114 项断言**（offscreen 36 + background 52 + content 18 + logger 8），全部通过（退出码 0）才算合格。
+共 **127 项断言**（offscreen 37 + background 61 + content 21 + logger 8），全部通过（退出码 0）才算合格。
 注意：浏览器集成层（offscreen 实际创建/发声、postMessage 桥接收发、Referer/Origin 规则、
 autoplay 策略、CORS 真实行为）无法在 Node 中验证，需手动在浏览器确认。
+
+确定性发布（自动运行上述测试、重建 release 目录、逐文件校验 SHA-256 并生成版本化 ZIP）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package.ps1
+```
 
 ## Edge / Offscreen 触发机制（研究结论）
 
@@ -222,6 +230,21 @@ v2.2.4 起，无 `chrome.storage` 的环境（如上述 Edge 的 offscreen）写
 - 面板「歌单菜单 ⋯」内可**查看 / 导出 TXT / 清空** 日志，便于在 Edge 现场定位通信问题。
 
 ## 更新记录
+
+### v2.3.0（稳定曲目身份 + 歌单写入串行化 + 停止语义统一）
+
+- **稳定歌曲 ID**：每个歌单项新增不可变 `id`，`bpl_state.trackId` 成为当前歌曲身份；拖拽、删除、
+  批量移动后通过 `trackId` 重新定位，避免索引变化造成“显示的是下一首、声音仍是被删歌曲”。复制歌曲
+  生成新 ID，移动歌曲保留原 ID。旧数据首次升级自动补 ID，并结合旧断点把播放索引迁移为 `trackId`。
+- **版本化存储迁移**：新增 `bpl_schema_version=1`；旧版没有断点且 `playing=false` 的状态保持“已停止”，
+  不会在升级后误显示成暂停曲目。断点同时记录 `trackId+bvid+cid`，旧断点仍按 bvid+cid 兼容匹配。
+- **歌单写入串行化**：所有增删改、导入、排序、批量操作和歌单切换进入同一 Promise 队列，避免多个
+  标签页同时执行“读全部→修改→写全部”时发生最后写入覆盖。
+- **停止语义统一**：顺序/随机模式自然播完、用户主动停止、当前歌曲被删除或移出播放歌单时，统一清除
+  `<audio>.src`、Blob URL、断点、洗牌状态和 `trackId`，胶囊正确恢复为未播放状态。
+- **可重复发布**：Manifest 升至 2.3.0 并声明 Chromium 109+；新增 `scripts/package.ps1`，测试通过后
+  才按白名单复制运行文件、校验源码/发布文件哈希并生成 ZIP，消除手工打包分叉。
+- 测试：**124 项**（offscreen 37 + background 61 + content 18 + logger 8）全部通过。
 
 ### v2.2.9（断点续播：暂停后被浏览器回收，再按播放从暂停处继续）
 

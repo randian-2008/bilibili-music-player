@@ -4,7 +4,8 @@ if (typeof BPLLog === 'undefined') {
     globalThis.BPLLog = { info() {}, log() {}, warn() {}, error() {}, flush() {}, recent() { return []; } };
 }
 
-const DEF_STATE = { playlistId: null, index: 0, playing: false, mode: 'loop' };
+const DEF_STATE = { playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' };
+const STORAGE_SCHEMA_VERSION = 1;
 
 const MODES = ['order', 'shuffle', 'one', 'loop', 'shuffleLoop'];
 function normalizeMode(st) {
@@ -14,6 +15,32 @@ function normalizeMode(st) {
 }
 
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+function ensurePlaylistItemIds(lists) {
+    const seen = new Set();
+    let changed = false;
+    for (const pl of (lists || [])) {
+        if (!Array.isArray(pl.items)) { pl.items = []; changed = true; }
+        for (const it of pl.items) {
+            let id = (it && typeof it.id === 'string') ? it.id.trim() : '';
+            if (!id || seen.has(id)) {
+                id = genId();
+                it.id = id;
+                changed = true;
+            }
+            seen.add(id);
+        }
+    }
+    return changed;
+}
+
+let playlistMutationChain = Promise.resolve();
+function withPlaylistMutation(fn) {
+    const run = () => fn();
+    const task = playlistMutationChain.then(run, run);
+    playlistMutationChain = task.then(() => {}, () => {});
+    return task;
+}
 
 async function getPlaylists() {
     return (await chrome.storage.local.get('bpl_playlists')).bpl_playlists || [];
@@ -30,6 +57,42 @@ async function getState() {
 }
 async function saveState(s) { await chrome.storage.local.set({ bpl_state: s }); }
 function findPl(lists, id) { return lists.find(p => p.id === id); }
+function positionMatchesItem(pos, it) {
+    if (!pos || !it) return false;
+    if (pos.trackId && it.id) return pos.trackId === it.id;
+    return pos.bvid === it.bvid && (pos.cid || 0) === (it.cid || 0);
+}
+async function reconcileStoredState(lists) {
+    const st = await getState();
+    const before = JSON.stringify(st);
+    let trackRemoved = false;
+    const pl = findPl(lists, st.playlistId);
+    if (!pl) {
+        if (st.playlistId || st.trackId || st.playing || st.index !== 0) {
+            trackRemoved = !!st.trackId;
+            st.playlistId = null;
+            st.trackId = null;
+            st.index = 0;
+            st.playing = false;
+        }
+    } else if (st.trackId) {
+        const index = pl.items.findIndex(it => it.id === st.trackId);
+        if (index >= 0) {
+            st.index = index;
+        } else {
+            trackRemoved = true;
+            st.trackId = null;
+            st.playing = false;
+            st.index = Math.max(0, Math.min(st.index, Math.max(0, pl.items.length - 1)));
+        }
+    } else {
+        st.playing = false;
+        st.index = Math.max(0, Math.min(st.index, Math.max(0, pl.items.length - 1)));
+    }
+    if (before !== JSON.stringify(st)) await saveState(st);
+    if (trackRemoved) await chrome.storage.local.set({ bpl_position: null });
+    return { state: st, trackRemoved };
+}
 function normUrl(u) {
     u = String(u || '');
     return u.indexOf('http://') === 0 ? 'https://' + u.slice(7) : u;
@@ -95,6 +158,7 @@ async function buildItem(bvid, page, fallbackTitle) {
         const d = r.info, pg = r.page;
         const multi = (d.pages || []).length > 1;
         return {
+            id: genId(),
             bvid: d.bvid || bvid,
             cid: r.cid,
             title: (multi && pg.part) ? (d.title + ' · ' + pg.part) : (d.title || bvid),
@@ -104,31 +168,60 @@ async function buildItem(bvid, page, fallbackTitle) {
             page: page
         };
     } catch (e) {
-        return { bvid: bvid, cid: 0, title: fallbackTitle || bvid, pic: '', owner: '', duration: 0, page: page };
+        return { id: genId(), bvid: bvid, cid: 0, title: fallbackTitle || bvid, pic: '', owner: '', duration: 0, page: page };
     }
 }
 
 async function migrate() {
-    const r = await chrome.storage.local.get(['bpl_playlists', 'bpl_list', 'bpl_state', 'bpl_active']);
-    if (r.bpl_playlists && r.bpl_playlists.length) {
-        if (!r.bpl_active) await setActiveId(r.bpl_playlists[0].id);
-        return;
-    }
-    const items = r.bpl_list || [];
-    const id = genId();
-    await savePlaylists([{ id, name: '默认歌单', items }]);
-    await setActiveId(id);
-    if (r.bpl_state) {
-        const st = Object.assign({}, DEF_STATE, r.bpl_state);
-        st.playlistId = id;
-        await saveState(st);
-    }
-    await chrome.storage.local.remove('bpl_list');
+    return await withPlaylistMutation(async () => {
+        const r = await chrome.storage.local.get(['bpl_schema_version', 'bpl_playlists', 'bpl_list', 'bpl_state', 'bpl_active', 'bpl_position']);
+        let lists = (r.bpl_playlists && r.bpl_playlists.length) ? r.bpl_playlists : null;
+        let activeId = r.bpl_active || null;
+        let legacyList = false;
+        if (!lists) {
+            const id = genId();
+            lists = [{ id, name: '默认歌单', items: r.bpl_list || [] }];
+            activeId = id;
+            legacyList = true;
+        }
+        ensurePlaylistItemIds(lists);
+        if (!activeId || !findPl(lists, activeId)) activeId = lists[0].id;
+
+        const rawState = r.bpl_state || {};
+        const st = Object.assign({}, DEF_STATE, rawState);
+        st.mode = normalizeMode(st);
+        if (legacyList) st.playlistId = activeId;
+        if (!Object.prototype.hasOwnProperty.call(rawState, 'trackId')) {
+            const pl = findPl(lists, st.playlistId);
+            const it = pl && pl.items[st.index];
+            const hadTrack = !!rawState.playing || positionMatchesItem(r.bpl_position, it);
+            st.trackId = (it && hadTrack) ? it.id : null;
+        }
+        if (st.trackId) {
+            const pl = findPl(lists, st.playlistId);
+            const index = pl ? pl.items.findIndex(it => it.id === st.trackId) : -1;
+            if (index >= 0) st.index = index;
+            else { st.trackId = null; st.playing = false; st.index = 0; }
+        } else {
+            st.playing = false;
+        }
+
+        await chrome.storage.local.set({
+            bpl_schema_version: STORAGE_SCHEMA_VERSION,
+            bpl_playlists: lists,
+            bpl_active: activeId,
+            bpl_state: st
+        });
+        if (legacyList) await chrome.storage.local.remove('bpl_list');
+    });
 }
 
 async function ensureDefaultPlaylist() {
     const lists = await getPlaylists();
-    if (lists.length) return lists;
+    if (lists.length) {
+        if (ensurePlaylistItemIds(lists)) await savePlaylists(lists);
+        return lists;
+    }
     const id = genId();
     const pls = [{ id, name: '默认歌单', items: [] }];
     await savePlaylists(pls);
@@ -409,10 +502,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 });
 
-async function handleBg(msg, sender) {
+const PLAYLIST_MUTATION_CMDS = new Set([
+    'add', 'remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'moveItem', 'clear',
+    'createPlaylist', 'renamePlaylist', 'deletePlaylist', 'importPlaylist', 'setActive'
+]);
+
+async function handleBg(msg, sender, mutationLocked) {
     // offscreen 的 bgResolveAudio 发 {target:'bg', resolveAudio:{...}}（历史形状，不带 cmd 字段）。
     // 必须在 switch(msg.cmd) 之前拦截，否则落入 default→{ok:false}，offscreen 报“无候选”且 bg 侧毫无日志。
     if (msg.resolveAudio) return await handleResolveAudio(msg.resolveAudio);
+    if (!mutationLocked && PLAYLIST_MUTATION_CMDS.has(msg.cmd)) {
+        return await withPlaylistMutation(() => handleBg(msg, sender, true));
+    }
     switch (msg.cmd) {
         case 'add': {
             const lists = await ensureDefaultPlaylist();
@@ -422,7 +523,8 @@ async function handleBg(msg, sender) {
             const bvid = msg.bvid || (msg.item && msg.item.bvid);
             if (!bvid) return { ok: false };
             const page = msg.page || (msg.item && msg.item.page) || 1;
-            const it = (msg.item && msg.item.cid) ? msg.item : await buildItem(bvid, page, msg.fallbackTitle);
+            const it = Object.assign({}, (msg.item && msg.item.cid) ? msg.item : await buildItem(bvid, page, msg.fallbackTitle));
+            it.id = genId();
             it.pic = normUrl(it.pic);
             if (pl.items.some(x => x.bvid === it.bvid && (x.cid || 0) === (it.cid || 0))) {
                 return { ok: true, dup: true };
@@ -485,11 +587,12 @@ async function handleBg(msg, sender) {
                 const st = await getState();
                 const pls = await getPlaylists();
                 const pl = pls.find(p => p.id === st.playlistId);
-                const it = pl && pl.items && pl.items[st.index];
+                const index = (pl && st.trackId) ? pl.items.findIndex(it => it.id === st.trackId) : -1;
+                const it = index >= 0 ? pl.items[index] : null;
                 if (!it) return { ok: true, position: 0, duration: 0, playing: false, index: -1, hasTrack: false };
                 const pos = (await chrome.storage.local.get('bpl_position')).bpl_position;
-                const at = (pos && pos.bvid === it.bvid && (pos.cid || 0) === (it.cid || 0)) ? (pos.position || 0) : 0;
-                return { ok: true, position: at, duration: it.duration || 0, playing: false, index: st.index, hasTrack: true, mode: st.mode };
+                const at = positionMatchesItem(pos, it) ? (pos.position || 0) : 0;
+                return { ok: true, position: at, duration: it.duration || 0, playing: false, index, trackId: st.trackId, hasTrack: true, mode: st.mode };
             }
             return await sendToOffscreen(payload);
         }
@@ -499,14 +602,8 @@ async function handleBg(msg, sender) {
             if (!pl) return { ok: false };
             const i = msg.index;
             if (i >= 0 && i < pl.items.length) pl.items.splice(i, 1);
-            const st = await getState();
-            if (st.playlistId === pl.id) {
-                if (st.index > i) st.index--;
-                if (!pl.items.length) { st.playing = false; st.index = 0; }
-                else if (st.index >= pl.items.length) st.index = pl.items.length - 1;
-                await saveState(st);
-            }
             await savePlaylists(lists);
+            await reconcileStoredState(lists);
             await broadcastData();
             return { ok: true };
         }
@@ -527,16 +624,9 @@ async function handleBg(msg, sender) {
             if (!pl) return { ok: false };
             const asc = [...new Set(msg.indices || [])].filter(i => i >= 0 && i < pl.items.length).sort((a, b) => a - b);
             if (!asc.length) return { ok: true };
-            const st = await getState();
             for (let k = asc.length - 1; k >= 0; k--) pl.items.splice(asc[k], 1);
-            if (st.playlistId === pl.id) {
-                const before = asc.filter(x => x < st.index).length;
-                st.index = Math.max(0, st.index - before);
-                if (!pl.items.length) { st.playing = false; st.index = 0; }
-                else if (st.index >= pl.items.length) st.index = pl.items.length - 1;
-                await saveState(st);
-            }
             await savePlaylists(lists);
+            await reconcileStoredState(lists);
             await broadcastData();
             return { ok: true, count: asc.length };
         }
@@ -552,22 +642,17 @@ async function handleBg(msg, sender) {
             for (const i of asc) {
                 const it = fromPl.items[i];
                 if (it && !toPl.items.some(x => x.bvid === it.bvid && (x.cid || 0) === (it.cid || 0))) {
-                    toPl.items.push(Object.assign({}, it));
+                    const copy = Object.assign({}, it);
+                    if (msg.cmd === 'batchCopy') copy.id = genId();
+                    toPl.items.push(copy);
                     added++;
                 }
             }
             if (msg.cmd === 'batchMove') {
-                const st = await getState();
                 for (let k = asc.length - 1; k >= 0; k--) fromPl.items.splice(asc[k], 1);
-                if (st.playlistId === fromPl.id) {
-                    const before = asc.filter(x => x < st.index).length;
-                    st.index = Math.max(0, st.index - before);
-                    if (!fromPl.items.length) { st.playing = false; st.index = 0; }
-                    else if (st.index >= fromPl.items.length) st.index = fromPl.items.length - 1;
-                    await saveState(st);
-                }
             }
             await savePlaylists(lists);
+            if (msg.cmd === 'batchMove') await reconcileStoredState(lists);
             await broadcastData();
             return { ok: true, count: asc.length, added: added };
         }
@@ -581,14 +666,8 @@ async function handleBg(msg, sender) {
             const insertAt = from < to ? to - 1 : to;
             const [it] = pl.items.splice(from, 1);
             pl.items.splice(insertAt, 0, it);
-            const st = await getState();
-            if (st.playlistId === pl.id) {
-                if (st.index === from) st.index = insertAt;
-                else if (from < st.index && st.index <= insertAt) st.index--;
-                else if (insertAt <= st.index && st.index < from) st.index++;
-                await saveState(st);
-            }
             await savePlaylists(lists);
+            await reconcileStoredState(lists);
             await broadcastData();
             return { ok: true };
         }
@@ -597,12 +676,8 @@ async function handleBg(msg, sender) {
             const pl = findPl(lists, await getActiveId());
             if (!pl) return { ok: false };
             pl.items = [];
-            const st = await getState();
-            if (st.playlistId === pl.id) {
-                st.playing = false; st.index = 0;
-                await saveState(st);
-            }
             await savePlaylists(lists);
+            await reconcileStoredState(lists);
             await broadcastData();
             return { ok: true };
         }
@@ -637,17 +712,14 @@ async function handleBg(msg, sender) {
                 activeId = lists.length ? lists[0].id : null;
                 await setActiveId(activeId);
             }
-            const st = await getState();
-            if (st.playlistId === msg.id) {
-                st.playlistId = null; st.playing = false; st.index = 0;
-                await saveState(st);
-            }
+            await reconcileStoredState(lists);
             await broadcastData();
             return { ok: true };
         }
         case 'importPlaylist': {
             const lists = await getPlaylists();
             const items = (msg.items || []).filter(x => x && x.bvid).map(x => ({
+                id: genId(),
                 bvid: String(x.bvid),
                 cid: Number(x.cid) || 0,
                 title: String(x.title || x.bvid),
@@ -706,11 +778,14 @@ function logSwStart(reason) {
 // 那一刻旧上下文正在切换，此刻 createDocument 会建出 chrome.storage 未绑定的半残文档（现场实锤：
 // Port 能连但每条命令报 reading 'local'）。升级后改为等首条命令在稳定时刻惰性创建。
 function prewarmOffscreen() { ensureOffscreen().catch(() => {}); }
+function runMigration(reason) {
+    migrate().catch(e => BPLLog.error('bg', '存储迁移失败(' + reason + ')：' + ((e && e.message) || e)));
+}
 chrome.runtime.onInstalled.addListener((d) => {
     logSwStart('installed' + ((d && d.reason) ? ':' + d.reason : ''));
-    migrate();
+    runMigration('installed');
     if (!(d && d.reason === 'update')) prewarmOffscreen();
 });
-chrome.runtime.onStartup.addListener(() => { logSwStart('startup'); migrate(); prewarmOffscreen(); });
+chrome.runtime.onStartup.addListener(() => { logSwStart('startup'); runMigration('startup'); prewarmOffscreen(); });
 // SW 被重新唤醒（非 onInstalled/onStartup 路径，如消息唤起）时也补一条，便于判断回收频率
 logSwStart('eval');

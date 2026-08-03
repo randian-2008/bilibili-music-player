@@ -66,7 +66,7 @@ if (!hasLocalStore) {
 let port = null;
 connectAudioPort();
 
-const DEF_STATE = { playlistId: null, index: 0, playing: false, mode: 'loop' };
+const DEF_STATE = { playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' };
 const P_MODES = ['order', 'shuffle', 'one', 'loop', 'shuffleLoop'];
 const audio = document.getElementById('player');
 let curIndex = -1;
@@ -130,10 +130,15 @@ async function pSetState(patch) {
 // 再按播放，按身份匹配断点 seek 回原位。stop 清除（显式停止=下次从头）。
 function persistPosition(position) {
     if (!curTrack) return;
-    store.set({ bpl_position: { bvid: curTrack.bvid, cid: curTrack.cid, position: position || 0 } }).catch(() => {});
+    store.set({ bpl_position: { trackId: curTrack.id || null, bvid: curTrack.bvid, cid: curTrack.cid, position: position || 0 } }).catch(() => {});
 }
 function clearPosition() {
     store.set({ bpl_position: null }).catch(() => {});
+}
+function positionMatchesTrack(pos, it) {
+    if (!pos || !it) return false;
+    if (pos.trackId && it.id) return pos.trackId === it.id;
+    return pos.bvid === it.bvid && (pos.cid || 0) === (it.cid || 0);
 }
 async function pEnsurePlaylist() {
     const st = await pGetState();
@@ -312,15 +317,14 @@ async function pPlayIndex(i, keepOrder, savedPos) {
         if (res.ok) {
             BPLLog.info('off', '第 ' + (si + 1) + '/' + r.urls.length + ' 源播放成功[' + it.bvid + ']');
             curIndex = i;
-            curTrack = { bvid: it.bvid, cid: it.cid || 0 };
-            const resumeAt = (savedPos && savedPos.bvid === it.bvid &&
-                (savedPos.cid || 0) === (it.cid || 0) && savedPos.position > 0) ? savedPos.position : 0;
+            curTrack = { id: it.id || null, bvid: it.bvid, cid: it.cid || 0 };
+            const resumeAt = (positionMatchesTrack(savedPos, it) && savedPos.position > 0) ? savedPos.position : 0;
             if (resumeAt > 0) {
                 audio.currentTime = resumeAt;
                 BPLLog.info('off', '从断点继续：' + Math.round(resumeAt) + 's[' + it.bvid + ']');
             }
             setupMediaSession(it);
-            await pSetState({ index: i, playing: true });
+            await pSetState({ trackId: it.id || null, index: i, playing: true });
             persistPosition(resumeAt);
             return { ok: true };
         }
@@ -339,10 +343,16 @@ async function pPlayIndex(i, keepOrder, savedPos) {
     };
 }
 async function pStopPlayback() {
-    audio.pause();
     curTrack = null;
-    clearPosition();   // 自然播完=下回从头，不留断点
-    await pSetState({ playing: false });
+    audio.pause();
+    audio.removeAttribute('src');
+    audio.load();
+    if (curBlobUrl) { URL.revokeObjectURL(curBlobUrl); curBlobUrl = null; }
+    curIndex = -1;
+    shuffleOrder = [];
+    shufflePos = -1;
+    clearPosition();
+    await pSetState({ trackId: null, playing: false });
     return { ok: true };
 }
 async function pAdvance() {
@@ -485,9 +495,12 @@ setInterval(() => {
 function onPlaylistsChanged() {
     shuffleOrder = []; shufflePos = -1;
     pGetItems().then(items => {
-        if (!items.length && audio.src) {
-            audio.pause(); audio.removeAttribute('src'); audio.load(); curIndex = -1;
-            curTrack = null; clearPosition();   // 歌单清空：曲目不复存在，断点随之作废
+        const currentExists = !curTrack || items.some(it =>
+            (curTrack.id && it.id) ? curTrack.id === it.id
+                : (curTrack.bvid === it.bvid && (curTrack.cid || 0) === (it.cid || 0))
+        );
+        if (audio.src && (!items.length || !currentExists)) {
+            pStopPlayback();
         }
     });
 }
@@ -507,14 +520,7 @@ async function handleCmd(msg) {
         case 'playIndex': await pEnsurePlaylist(); return await pPlayIndex(msg.index);
         case 'seek': audio.currentTime = msg.value || 0; return { ok: true };
         case 'getStatus': return { ok: true, position: audio.currentTime || 0, duration: audio.duration || 0, playing: !audio.paused, index: curIndex, hasTrack: !!audio.src };
-        case 'stop':
-            audio.pause(); audio.removeAttribute('src'); audio.load();
-            curTrack = null;   // 先断身份：随后异步触发的 pause 事件不再回写断点
-            clearPosition();   // 显式停止 = 下次从头，清断点
-            if (curBlobUrl) { URL.revokeObjectURL(curBlobUrl); curBlobUrl = null; }
-            curIndex = -1; shuffleOrder = []; shufflePos = -1;
-            await pSetState({ playing: false });
-            return { ok: true };
+        case 'stop': return await pStopPlayback();
         case 'setMode': {
             const st = await pGetState();
             const mode = P_MODES.indexOf(msg.mode) >= 0 ? msg.mode : st.mode;

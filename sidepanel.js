@@ -1,4 +1,4 @@
-const DEF_STATE = { playlistId: null, index: 0, playing: false, mode: 'loop' };
+const DEF_STATE = { playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' };
 const $ = s => document.querySelector(s);
 
 const svg = d => '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + d + '</svg>';
@@ -23,6 +23,7 @@ let position = 0;
 let duration = 0;
 let drag = null;
 let lastDrop = 0;
+let failedNowPlayingCover = '';
 
 function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -164,12 +165,25 @@ function activePlaylist() { return playlists.find(p => p.id === activeId) || nul
 function playingPlaylist() { return playlists.find(p => p.id === state.playlistId) || null; }
 function playingItem() {
     const pl = playingPlaylist();
-    return (pl && pl.items[state.index]) || null;
+    if (!pl || !state.trackId) return null;
+    return pl.items.find(it => it.id === state.trackId) || null;
 }
 function itemUrl(s) {
     let url = 'https://www.bilibili.com/video/' + s.bvid;
     if (s.page && s.page > 1) url += '?p=' + s.page;
     return url;
+}
+
+function paintNowPlayingCover(pic) {
+    const coverEl = $('#npCover');
+    const wrap = coverEl.parentElement;
+    if (pic && pic !== failedNowPlayingCover) failedNowPlayingCover = '';
+    const source = pic === failedNowPlayingCover ? '' : pic;
+    const empty = !source;
+    wrap.classList.toggle('cover-empty', empty);
+    coverEl.classList.toggle('cover-empty', empty);
+    if (empty) coverEl.removeAttribute('src');
+    else if (coverEl.getAttribute('src') !== source) coverEl.src = source;
 }
 
 function render() {
@@ -188,10 +202,10 @@ function render() {
     document.body.classList.toggle('playing', !!state.playing);
 
     const it = playingItem();
+    document.body.classList.toggle('has-track', !!it);
     $('#curTitle').textContent = (it && it.title) || '未播放';
     const pic = (it && it.pic) ? httpsUrl(it.pic) : '';
-    const coverEl = $('#npCover');
-    if (coverEl.getAttribute('src') !== pic) coverEl.src = pic;
+    paintNowPlayingCover(pic);
     $('#npBg').style.backgroundImage = pic ? 'url("' + pic.replace(/"/g, '') + '")' : '';
 
     const pl = activePlaylist();
@@ -202,7 +216,7 @@ function render() {
         box.innerHTML = '<div class="empty">这个歌单是空的<br>去B站视频页点「加入听歌列表」</div>';
     } else {
         box.innerHTML = items.map((s, i) => {
-            const isPlaying = showPlaying && i === state.index;
+            const isPlaying = showPlaying && !!state.trackId && s.id === state.trackId;
             return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '">' +
                 '<span class="chk"></span>' +
                 '<img class="cover" src="' + esc(httpsUrl(s.pic)) + '" draggable="false" referrerpolicy="no-referrer">' +
@@ -217,6 +231,7 @@ function render() {
     box.querySelectorAll('.t').forEach(applyMarquee);
     if (selMode) refreshSelUI();
     updateProgress();
+    if (!$('#plMenu').classList.contains('hidden')) positionPlaylistMenu();
 }
 
 function applyMarquee(wrap) {
@@ -242,6 +257,11 @@ function applyMarquee(wrap) {
         wrap.classList.add('overflow');
     }
 }
+
+$('#npCover').addEventListener('error', e => {
+    failedNowPlayingCover = e.currentTarget.getAttribute('src') || '';
+    paintNowPlayingCover(failedNowPlayingCover);
+});
 
 const PLAY_D = 'M8 5v14l11-7z';
 const PAUSE_D = 'M6 5h4v14H6zm8 0h4v14h-4z';
@@ -392,16 +412,46 @@ $('#plNew').addEventListener('click', () => {
 });
 
 const menu = $('#plMenu');
-$('#plMenuBtn').addEventListener('click', e => {
+const menuBtn = $('#plMenuBtn');
+function positionPlaylistMenu() {
+    if (menu.classList.contains('hidden')) return;
+    const rect = menuBtn.getBoundingClientRect();
+    const margin = 8, gap = 6;
+    const below = Math.max(0, window.innerHeight - rect.bottom - gap - margin);
+    const above = Math.max(0, rect.top - gap - margin);
+    const desired = menu.scrollHeight;
+    const openBelow = below >= Math.min(desired, 180) || below >= above;
+    menu.style.left = 'auto';
+    menu.style.right = Math.max(margin, window.innerWidth - rect.right) + 'px';
+    if (openBelow) {
+        menu.style.top = (rect.bottom + gap) + 'px';
+        menu.style.bottom = 'auto';
+        menu.style.maxHeight = Math.max(1, below) + 'px';
+    } else {
+        menu.style.top = 'auto';
+        menu.style.bottom = (window.innerHeight - rect.top + gap) + 'px';
+        menu.style.maxHeight = Math.max(1, above) + 'px';
+    }
+}
+function setPlaylistMenuOpen(open) {
+    menu.classList.toggle('hidden', !open);
+    if (open) {
+        menu.scrollTop = 0;
+        positionPlaylistMenu();
+    }
+}
+menuBtn.addEventListener('click', e => {
     e.stopPropagation();
-    menu.classList.toggle('hidden');
+    setPlaylistMenuOpen(menu.classList.contains('hidden'));
 });
-document.addEventListener('click', () => menu.classList.add('hidden'));
+document.addEventListener('click', () => setPlaylistMenuOpen(false));
+window.addEventListener('resize', positionPlaylistMenu);
+menu.addEventListener('wheel', e => e.stopPropagation(), { passive: true });
 menu.addEventListener('click', e => {
     const act = e.target.dataset.act;
     if (!act) return;
     e.stopPropagation();
-    menu.classList.add('hidden');
+    setPlaylistMenuOpen(false);
     const pl = activePlaylist();
     if (act === 'import') { fileInput.click(); return; }
     if (act === 'log') { openLog(true); return; }

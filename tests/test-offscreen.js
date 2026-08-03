@@ -119,18 +119,18 @@ function makeCtx(opts) {
 
 function setupPlaylist(n) {
     const items = [];
-    for (let i = 0; i < n; i++) items.push({ bvid: 'BV' + i, cid: 100 + i, title: 't' + i, pic: '', owner: '', duration: 10, page: 1 });
+    for (let i = 0; i < n; i++) items.push({ id: 'item' + i, bvid: 'BV' + i, cid: 100 + i, title: 't' + i, pic: '', owner: '', duration: 10, page: 1 });
     return {
         bpl_playlists: [{ id: 'pl1', name: 'p', items }],
         bpl_active: 'pl1',
-        bpl_state: { playlistId: 'pl1', index: 0, playing: false, mode: 'order' }
+        bpl_state: { playlistId: 'pl1', trackId: null, index: 0, playing: false, mode: 'order' }
     };
 }
 const getState = ctx => ctx.pGetState();
 
 async function testPlayIndex() {
     console.log('\n[offscreen pPlayIndex]');
-    let ctx = makeCtx({ store: { bpl_playlists: [{ id: 'pl1', name: 'p', items: [] }], bpl_state: { playlistId: 'pl1', index: 0, playing: false, mode: 'loop' } } });
+    let ctx = makeCtx({ store: { bpl_playlists: [{ id: 'pl1', name: 'p', items: [] }], bpl_state: { playlistId: 'pl1', trackId: null, index: 0, playing: false, mode: 'loop' } } });
     let r = await ctx.pPlayIndex(0);
     ok(r.ok === false && /空/.test(r.error), '空歌单 (' + r.error + ')');
 
@@ -145,6 +145,7 @@ async function testPlayIndex() {
     ctx = makeCtx({ store: setupPlaylist(2) });
     r = await ctx.pPlayIndex(0);
     ok(r.ok === true && ctx.__audio.src === 'https://cdn/audio.m4s', '正常播放设置 src (' + ctx.__audio.src + ')');
+    ok((await getState(ctx)).trackId === 'item0', '起播状态写入稳定 trackId');
 
     // v2.2.6 回归：state 广播必须经 bg 中继（offscreen 直发 {target:'all'} 到不了网页里的 content script，
     // 现场表现为胶囊不变形/图标动画不切换、面板进度条不动）
@@ -195,30 +196,31 @@ async function testPlayIndex() {
 async function testModes() {
     console.log('\n[offscreen 播放模式]');
     let ctx = makeCtx({ store: setupPlaylist(3) });
-    ctx.__store.bpl_state.mode = 'order'; ctx.__store.bpl_state.index = 2;
-    await ctx.pAdvance();
-    ok((await getState(ctx)).playing === false, 'order 末尾停止');
-
-    ctx = makeCtx({ store: setupPlaylist(3) });
-    ctx.__store.bpl_state.mode = 'loop'; ctx.__store.bpl_state.index = 2;
+    ctx.__store.bpl_state.mode = 'order'; ctx.__store.bpl_state.index = 2; ctx.__store.bpl_state.trackId = 'item2';
     await ctx.pAdvance();
     let st = await getState(ctx);
+    ok(st.playing === false && st.trackId === null && ctx.__audio.src === '', 'order 末尾彻底停止并释放音源');
+
+    ctx = makeCtx({ store: setupPlaylist(3) });
+    ctx.__store.bpl_state.mode = 'loop'; ctx.__store.bpl_state.index = 2; ctx.__store.bpl_state.trackId = 'item2';
+    await ctx.pAdvance();
+    st = await getState(ctx);
     ok(st.index === 0 && st.playing === true, 'loop 回首');
 
     ctx = makeCtx({ store: setupPlaylist(4) });
-    ctx.__store.bpl_state.mode = 'shuffle'; ctx.__store.bpl_state.index = 0;
+    ctx.__store.bpl_state.mode = 'shuffle'; ctx.__store.bpl_state.index = 0; ctx.__store.bpl_state.trackId = 'item0';
     let stopped = false;
     for (let i = 0; i < 10; i++) { await ctx.pNext(); if ((await getState(ctx)).playing === false) { stopped = true; break; } }
     ok(stopped, 'shuffle 播完停止');
 
     ctx = makeCtx({ store: setupPlaylist(4) });
-    ctx.__store.bpl_state.mode = 'shuffleLoop'; ctx.__store.bpl_state.index = 0;
+    ctx.__store.bpl_state.mode = 'shuffleLoop'; ctx.__store.bpl_state.index = 0; ctx.__store.bpl_state.trackId = 'item0';
     let kept = true;
     for (let i = 0; i < 12; i++) { await ctx.pNext(); if ((await getState(ctx)).playing === false) { kept = false; break; } }
     ok(kept, 'shuffleLoop 不停');
 
     ctx = makeCtx({ store: setupPlaylist(3) });
-    ctx.__store.bpl_state.mode = 'loop'; ctx.__store.bpl_state.index = 0; ctx.__audio.currentTime = 0;
+    ctx.__store.bpl_state.mode = 'loop'; ctx.__store.bpl_state.index = 0; ctx.__store.bpl_state.trackId = 'item0'; ctx.__audio.currentTime = 0;
     await ctx.pPrev();
     ok((await getState(ctx)).index === 2, 'prev 开头回末尾');
 }
@@ -235,7 +237,7 @@ async function testHandleCmd() {
     r = await ctx.handleCmd({ cmd: 'setVolume', value: 0.5 });
     ok(r.ok === true && ctx.__audio.volume === 0.5 && ctx.__store.bpl_volume === 0.5, 'setVolume 生效并持久化');
     r = await ctx.handleCmd({ cmd: 'stop' });
-    ok(r.ok === true && ctx.__audio.src === '' , 'stop 清空音源');
+    ok(r.ok === true && ctx.__audio.src === '' && (await getState(ctx)).trackId === null, 'stop 清空音源和当前曲目身份');
     r = await ctx.handleCmd({ cmd: 'ping' });
     ok(r.ok === true && r.pong === 1, 'ping 探测应答 pong（健康探测）');
 }
@@ -275,18 +277,19 @@ async function testNoStorage() {
     let r = await ctx.pPlayIndex(0);
     ok(r.ok === true && ctx.__audio.src === 'https://cdn/audio.m4s', '无 storage 也能完整播放（经代理取歌单/状态）');
     let st = await ctx.pGetState();
-    ok(st.index === 0 && st.playing === true, '状态经代理持久化（bpl_state 写回 bg）');
+    ok(st.trackId === 'item0' && st.index === 0 && st.playing === true, '状态经代理持久化（trackId/index 写回 bg）');
     ok(ctx.__store.bpl_state && ctx.__store.bpl_state.playing === true, '写入确实落到（模拟的）bg 存储');
 
     ctx = makeCtx({ store: setupPlaylist(3), noStorage: true });
     r = await ctx.handleCmd({ cmd: 'playIndex', index: 2 });
     ok(r.ok === true && (await ctx.pGetState()).index === 2, 'handleCmd playIndex 经代理闭环');
 
-    // 无 storage.onChanged：改由 background 的 'data' 广播驱动歌单变更同步（清空→停播清源）
-    ctx.__store.bpl_playlists = [];
-    ctx.__driveMsg({ target: 'all', type: 'data', playlists: [] });
+    // 无 storage.onChanged：data 广播驱动歌单变更；即使歌单非空，当前 trackId 被删也必须停播
+    ctx.__store.bpl_playlists[0].items = ctx.__store.bpl_playlists[0].items.slice(0, 2);
+    ctx.__driveMsg({ target: 'all', type: 'data', playlists: ctx.__store.bpl_playlists });
     await ticks(3);
-    ok(ctx.__audio.src === '', 'data 广播驱动空单停播（替代 onChanged）');
+    ok(ctx.__audio.src === '' && (await ctx.pGetState()).trackId === null,
+        'data 广播发现当前 trackId 已删除，停播并清曲目身份（替代 onChanged）');
 }
 
 async function testResume() {
@@ -298,13 +301,13 @@ async function testResume() {
     // ① 暂停时进度落盘（pause 事件驱动，bvid+cid+position 三要素）
     let ctx = makeCtx({ store: setupPlaylist(2) });
     await ctx.pPlayIndex(1);
-    ok(ctx.__store.bpl_position && ctx.__store.bpl_position.bvid === 'BV1' && ctx.__store.bpl_position.position === 0,
-        '起播即写断点 0（身份 BV1/101）');
+    ok(ctx.__store.bpl_position && ctx.__store.bpl_position.trackId === 'item1' && ctx.__store.bpl_position.bvid === 'BV1' && ctx.__store.bpl_position.position === 0,
+        '起播即写断点 0（身份 item1/BV1/101）');
     ctx.__audio.currentTime = 42;
     ctx.__audio.ls.pause.slice().forEach(f => f());   // 触发 pause 事件监听（mock 不自动派发）
     await ticks(3);
     let pos = ctx.__store.bpl_position;
-    ok(pos && pos.bvid === 'BV1' && pos.cid === 101 && pos.position === 42, '暂停时进度落盘 42s (' + JSON.stringify(pos) + ')');
+    ok(pos && pos.trackId === 'item1' && pos.bvid === 'BV1' && pos.cid === 101 && pos.position === 42, '暂停时进度落盘 42s (' + JSON.stringify(pos) + ')');
 
     // ② 文档被回收后重建（新 ctx = 全新空音频，存储共享 = bg 侧持久层），toggle → 从 42s 继续
     const ctx2 = makeCtx({ store: ctx.__store });
@@ -316,13 +319,13 @@ async function testResume() {
 
     // ③ 断点身份不符（歌单变动/换了歌）→ 从头播，不盲跳
     ctx = makeCtx({ store: setupPlaylist(2) });
-    ctx.__store.bpl_position = { bvid: 'BVx', cid: 999, position: 88 };
+    ctx.__store.bpl_position = { trackId: 'other', bvid: 'BV1', cid: 101, position: 88 };
     r = await ctx.pToggle();
     ok(r.ok === true && ctx.__audio.currentTime === 0, '断点曲目不符 → 从头播');
 
     // ④ 显式点歌不吃断点（用户意图明确：就是要听这首的开头）
     ctx = makeCtx({ store: setupPlaylist(2) });
-    ctx.__store.bpl_position = { bvid: 'BV1', cid: 101, position: 88 };
+    ctx.__store.bpl_position = { trackId: 'item1', bvid: 'BV1', cid: 101, position: 88 };
     r = await ctx.handleCmd({ cmd: 'playIndex', index: 1 });
     ok(r.ok === true && ctx.__audio.currentTime === 0, '显式 playIndex 从头播（不续断点）');
 
@@ -330,7 +333,7 @@ async function testResume() {
     ctx = makeCtx({ store: setupPlaylist(2) });
     await ctx.pPlayIndex(0);
     r = await ctx.handleCmd({ cmd: 'stop' });
-    ok(r.ok === true && ctx.__store.bpl_position === null, 'stop 清除断点');
+    ok(r.ok === true && ctx.__store.bpl_position === null && (await ctx.pGetState()).trackId === null, 'stop 清除断点和当前曲目身份');
 }
 
 (async () => {

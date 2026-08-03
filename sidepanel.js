@@ -495,15 +495,21 @@ $('#seek').addEventListener('input', e => send('seek', { value: +e.target.value 
 const volSlider = $('#volSlider');
 const muteBtn = $('#muteBtn');
 let curMuted = false;
+function volumeIcon(v, muted) {
+    const speaker = '<path d="M11 5 6 9H3v6h3l5 4V5z"/>';
+    if (muted || v === 0) return svg(speaker + '<path d="M15 9l6 6M21 9l-6 6"/>');
+    if (v < 0.5) return svg(speaker + '<path d="M15.5 8.5a5 5 0 010 7"/>');
+    return svg(speaker + '<path d="M15.5 8.5a5 5 0 010 7M18 6a8.5 8.5 0 010 12"/>');
+}
 function paintVolume(v, muted) {
     volSlider.value = Math.round(v * 100);
     curMuted = muted;
-    muteBtn.textContent = (muted || v === 0) ? '🔇' : (v < 0.5 ? '🔉' : '🔊');
+    muteBtn.innerHTML = volumeIcon(v, muted);
     muteBtn.classList.toggle('muted', muted);
 }
 volSlider.addEventListener('input', () => {
     const v = (+volSlider.value) / 100;
-    muteBtn.textContent = v === 0 ? '🔇' : (v < 0.5 ? '🔉' : '🔊');
+    muteBtn.innerHTML = volumeIcon(v, curMuted);
     send('setVolume', { value: v });
 });
 muteBtn.addEventListener('click', () => {
@@ -771,7 +777,11 @@ if (IN_FRAME) {
     window.addEventListener('message', e => {
         if (e.source !== window.parent) return;
         const d = e.data;
-        if (d && d.bplBridge === 'broadcast') handleBroadcast(d.msg);
+        if (d && d.bplBridge === 'theme' && THEME_API) {
+            THEME_API.apply(document.documentElement, d.themeId);
+        } else if (d && d.bplBridge === 'broadcast') {
+            handleBroadcast(d.msg);
+        }
     });
 } else {
     chrome.runtime.onMessage.addListener(handleBroadcast);

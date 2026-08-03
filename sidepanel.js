@@ -1,5 +1,8 @@
 const DEF_STATE = { playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' };
 const $ = s => document.querySelector(s);
+const THEME_API = globalThis.BPLTheme || null;
+const THEME_KEY = THEME_API ? THEME_API.STORAGE_KEY : 'bpl_theme';
+if (THEME_API) THEME_API.apply(document.documentElement, THEME_API.DEFAULT_ID);
 
 const svg = d => '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + d + '</svg>';
 const MODES = [
@@ -776,6 +779,7 @@ if (IN_FRAME) {
 
 chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== 'local') return;
+    if (THEME_API && changes[THEME_KEY]) THEME_API.apply(document.documentElement, changes[THEME_KEY].newValue);
     if (changes.bpl_playlists || changes.bpl_active) refresh();
     // bug② 收敛安全网：切歌/模式变化由播放端写 bpl_state。正常经广播链即时刷新，
     // 一旦广播链（播放端→后台广播→content→iframe postMessage）丢失，这里据存储变更兜底重渲染，
@@ -795,7 +799,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
     }
 });
 
-chrome.storage.local.get(['bpl_log', 'bpl_boot']).then(r => {
+chrome.storage.local.get(['bpl_log', 'bpl_boot', THEME_KEY]).then(r => {
+    if (THEME_API) THEME_API.apply(document.documentElement, r && r[THEME_KEY]);
     if (r && Array.isArray(r.bpl_log)) { logCache = r.bpl_log; if (logOpen) renderLog(); }
     if (r && r.bpl_boot) { bootCache = r.bpl_boot; if (logOpen) renderBootInfo(); }
 });

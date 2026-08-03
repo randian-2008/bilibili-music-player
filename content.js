@@ -15,8 +15,10 @@
     // 扩展自身源（如 chrome-extension://abc），用于桥接来源白名单；不用 new URL 以兼容更多环境
     const EXT_ORIGIN = chrome.runtime.getURL('').replace(/\/+$/, '');
     const Z = 2147483646;
+    const THEME_API = globalThis.BPLTheme || null;
+    const THEME_KEY = THEME_API ? THEME_API.STORAGE_KEY : 'bpl_theme';
 
-    let shadow, hostEl, mini, miniPlay, panel, pframe, addBtn, addTxt, resizeGrip;
+    let shadow, hostEl, mini, miniPlay, panel, pframe, addBtn, addTxt, resizeGrip, themePicker;
     let panelOpen = false;
     let frameLoaded = false;
     let built = false;
@@ -90,19 +92,27 @@
 
     const CSS =
         '*{box-sizing:border-box}' +
+        ':host{--bpl-page:#141517;--bpl-raised:#202024;--bpl-control:#2b2b2f;--bpl-hover:#3a3a3f;' +
+        '--bpl-border:#2a2b30;--bpl-border-strong:#3a3a3f;--bpl-border-hover:#55555c;' +
+        '--bpl-text:#e8e8e8;--bpl-faint:#747680;--bpl-accent:#fb7299;--bpl-accent-hover:#fc8bab;' +
+        '--bpl-accent-soft:#2a2026;--bpl-on-accent:#fff;--bpl-shadow:rgba(0,0,0,.45);' +
+        '--bpl-shadow-strong:rgba(0,0,0,.6);--bpl-accent-shadow:rgba(251,114,153,.4);' +
+        '--bpl-control-shadow:inset 0 1px 0 rgba(255,255,255,.12),0 1px 2px rgba(0,0,0,.24);' +
+        '--bpl-control-active-shadow:inset 0 2px 4px rgba(0,0,0,.24);--bpl-surface-highlight:rgba(255,255,255,.07)}' +
         '.mini,.panel{position:fixed;font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif}' +
 
         '.mini{right:20px;bottom:90px;z-index:' + Z + ';display:flex;align-items:center;justify-content:flex-end;' +
-        'width:24px;height:24px;border-radius:12px;background:#232327;border:1px solid #3a3a3f;' +
+        'width:24px;height:24px;border-radius:12px;background:var(--bpl-control);border:1px solid var(--bpl-border-strong);' +
         'cursor:pointer;user-select:none;overflow:hidden;opacity:.4;' +
-        'box-shadow:0 3px 12px rgba(0,0,0,.45);' +
+        'box-shadow:0 3px 12px var(--bpl-shadow),inset 0 1px 0 var(--bpl-surface-highlight);' +
         'transition:width .36s cubic-bezier(.34,1.56,.64,1),height .36s cubic-bezier(.34,1.56,.64,1),' +
         'border-radius .36s,opacity .22s,background .25s,border-color .25s,box-shadow .3s;' +
         'animation:miniIn .5s cubic-bezier(.34,1.56,.64,1) backwards}' +
-        '.mini:hover{opacity:1;border-color:#55555c}' +
-        '.mini.loaded{width:112px;height:32px;border-radius:16px;opacity:.75;cursor:default;background:#202024}' +
+        '.mini:hover{opacity:1;border-color:var(--bpl-border-hover)}' +
+        '.mini.loaded{width:112px;height:32px;border-radius:16px;opacity:.75;cursor:default;background:var(--bpl-raised)}' +
         '.mini.loaded:hover{opacity:1}' +
-        '.mini.playing{opacity:1;border-color:#fb7299;box-shadow:0 3px 18px rgba(251,114,153,.4)}' +
+        '.mini.playing{opacity:1;border-color:var(--bpl-accent);' +
+        'box-shadow:0 3px 18px var(--bpl-accent-shadow),inset 0 1px 0 var(--bpl-surface-highlight)}' +
         '.mini.dragging{transition:none;opacity:1}' +
         '@keyframes miniIn{from{transform:scale(0)}to{transform:scale(1)}}' +
 
@@ -113,33 +123,36 @@
         'display:flex;align-items:center;justify-content:center;cursor:pointer}' +
         '.mini.loaded .m-core{margin:0 4px 0 2px}' +
 
-        '.m-ico{font-size:12px;color:#fb7299;line-height:1;transition:opacity .2s}' +
+        '.m-ico{font-size:12px;color:var(--bpl-accent);line-height:1;transition:opacity .2s}' +
         '.mini.loaded .m-ico{opacity:0}' +
 
         '.m-spec{position:absolute;inset:0;display:flex;align-items:flex-end;justify-content:center;' +
         'gap:2px;padding:5px 4px 6px;opacity:0;transition:opacity .25s}' +
         '.mini.loaded .m-spec{opacity:1}' +
-        '.m-spec i{width:3px;border-radius:1.5px;background:#fb7299;height:20%;transition:height .25s,background .2s}' +
+        '.m-spec i{width:3px;border-radius:1.5px;background:var(--bpl-accent);height:20%;transition:height .25s,background .2s}' +
         '.mini.playing .m-spec i{animation:specB .9s ease-in-out infinite}' +
         '.mini.playing .m-spec i:nth-child(2){animation-delay:.18s}' +
         '.mini.playing .m-spec i:nth-child(3){animation-delay:.36s}' +
         '.mini.playing .m-spec i:nth-child(4){animation-delay:.1s}' +
-        '.m-spec:hover i{background:#fc8bab}' +
+        '.m-spec:hover i{background:var(--bpl-accent-hover)}' +
         '@keyframes specB{0%,100%{height:18%}50%{height:100%}}' +
 
         '.m-btn{flex:none;width:24px;height:24px;border:none;border-radius:50%;background:transparent;' +
-        'color:#ddd;cursor:pointer;display:flex;align-items:center;justify-content:center;' +
+        'color:var(--bpl-text);cursor:pointer;display:flex;align-items:center;justify-content:center;' +
         'transition:background .15s,color .15s,transform .15s}' +
         '.m-btn svg{display:block}' +
-        '.m-btn:hover{background:#33333a;color:#fff;transform:scale(1.12)}' +
+        '.m-btn:hover{background:var(--bpl-hover);color:var(--bpl-text);transform:scale(1.12)}' +
         '.m-btn:active{transform:scale(.86)}' +
-        '.m-btn.m-play{background:#fb7299;color:#fff}' +
-        '.m-btn.m-play:hover{background:#fc8bab}' +
+        '.m-btn.m-play{background:var(--bpl-accent);color:var(--bpl-on-accent);box-shadow:var(--bpl-control-shadow)}' +
+        '.m-btn.m-play:hover{background:var(--bpl-accent-hover)}' +
+        '.m-btn.m-play:active{box-shadow:var(--bpl-control-active-shadow)}' +
 
         '.panel{z-index:' + (Z + 1) + ';width:340px;height:540px;max-width:92vw;' +
         'max-height:calc(100vh - 160px);right:20px;bottom:146px;' +
-        'background:#18191c;border:1px solid #33333a;border-top:2px solid #fb7299;border-radius:12px;' +
-        'overflow:hidden;display:flex;flex-direction:column;box-shadow:0 14px 44px rgba(0,0,0,.6);' +
+        'background:var(--bpl-page-bg,var(--bpl-page));border:1px solid var(--bpl-border-strong);border-top:2px solid var(--bpl-accent);border-radius:12px;' +
+        'overflow:hidden;display:flex;flex-direction:column;' +
+        'box-shadow:0 14px 44px var(--bpl-shadow-strong),0 0 0 1px var(--bpl-control-soft),' +
+        'inset 0 1px 0 var(--bpl-surface-highlight);' +
         'transform-origin:100% 100%;opacity:0;visibility:hidden;transform:scale(.55) translateY(18px);' +
         'transition:opacity .2s ease,transform .28s cubic-bezier(.34,1.56,.64,1),visibility 0s linear .28s}' +
         '.panel.open{opacity:1;visibility:visible;transform:none;' +
@@ -148,20 +161,90 @@
         '.panel.dragging,.panel.resizing{transition:none}' +
         '.panel.dragging .pframe,.panel.resizing .pframe{pointer-events:none}' +
 
-        '.phead{flex:none;display:flex;align-items:center;gap:6px;padding:5px 8px;background:#202024;' +
-        'border-bottom:1px solid #2b2b2f;cursor:move;user-select:none;min-height:30px}' +
-        '.gripbar{flex:1;font-size:13px;color:#4a4a52;line-height:1;letter-spacing:1px}' +
-        '.pbtn{flex:none;width:26px;height:26px;border:none;border-radius:6px;background:#2b2b2f;' +
-        'color:#ccc;font-size:15px;line-height:1;cursor:pointer;transition:.13s}' +
-        '.pbtn:hover{background:#3a3a3f;color:#fff}' +
-        '.pbtn.add{color:#fb7299;font-size:13px;width:auto;padding:0 9px;font-weight:600}' +
-        '.pbtn.add:hover{background:#2a2026}' +
+        '.phead{flex:none;display:flex;align-items:center;gap:6px;padding:5px 8px;background:var(--bpl-raised);' +
+        'border-bottom:1px solid var(--bpl-border);cursor:move;user-select:none;min-height:30px}' +
+        '.gripbar{flex:1;min-width:12px;font-size:13px;color:var(--bpl-faint);line-height:1;letter-spacing:1px}' +
+        '.pbtn{flex:none;width:26px;height:26px;border:1px solid var(--bpl-border-strong);border-radius:6px;' +
+        'background:var(--bpl-control);color:var(--bpl-text);font-size:15px;line-height:1;cursor:pointer;' +
+        'box-shadow:var(--bpl-control-shadow);transition:.13s}' +
+        '.pbtn:hover{background:var(--bpl-hover);color:var(--bpl-text)}' +
+        '.pbtn:active{transform:translateY(1px);box-shadow:var(--bpl-control-active-shadow)}' +
+        '.pbtn.add{color:var(--bpl-accent);font-size:13px;width:auto;padding:0 9px;font-weight:600}' +
+        '.pbtn.add:hover{background:var(--bpl-accent-soft)}' +
+        '.theme-picker{flex:none;display:flex;align-items:center;gap:4px}' +
+        '.theme-swatches{display:flex;align-items:center;gap:5px;max-width:0;opacity:0;overflow:hidden;' +
+        'pointer-events:none;transition:max-width .22s ease,opacity .16s ease}' +
+        '.theme-picker.open .theme-swatches{max-width:144px;opacity:1;pointer-events:auto}' +
+        '.theme-toggle{display:flex;align-items:center;justify-content:center}' +
+        '.theme-toggle::before{content:"";width:14px;height:14px;border-radius:50%;' +
+        'background:conic-gradient(from 25deg,var(--bpl-accent),#ffd43b,#56cc9d,#4d96ff,#c77dff,var(--bpl-accent));' +
+        'box-shadow:0 0 0 1px var(--bpl-border-hover);transition:transform .35s ease,filter .2s ease}' +
+        '.theme-toggle:hover::before{transform:rotate(90deg);filter:saturate(1.25)}' +
+        '.theme-picker.open .theme-toggle::before{transform:rotate(135deg);filter:saturate(1.2)}' +
+        '.theme-swatch{width:18px;height:18px;padding:0;border-radius:50%;border:2px solid var(--bpl-border-strong);' +
+        'background:var(--swatch);box-shadow:none}' +
+        '.theme-swatch:hover{background:var(--swatch);border-color:var(--bpl-text);transform:scale(1.08)}' +
+        '.theme-swatch.selected{background:var(--swatch);border-color:var(--bpl-text);box-shadow:0 0 0 2px var(--bpl-accent)}' +
         '.pbody{flex:1;min-height:0;position:relative}' +
-        '.pframe{width:100%;height:100%;border:none;display:block;background:#18191c}' +
+        '.pframe{width:100%;height:100%;border:none;display:block;background:var(--bpl-page)}' +
         '.resize-grip{position:absolute;right:0;bottom:0;z-index:3;width:18px;height:18px;' +
-        'cursor:nwse-resize;color:#777982;touch-action:none}' +
-        '.resize-grip::after{content:"";position:absolute;right:3px;bottom:3px;width:8px;height:8px;' +
-        'border-right:2px solid currentColor;border-bottom:2px solid currentColor}';
+        'cursor:nwse-resize;color:var(--bpl-faint);touch-action:none}' +
+        '.resize-grip::before,.resize-grip::after{content:"";position:absolute;height:2px;border-radius:1px;' +
+        'background:currentColor;transform:rotate(-45deg);transform-origin:center}' +
+        '.resize-grip::before{right:1px;bottom:5px;width:10px}' +
+        '.resize-grip::after{right:3px;bottom:2px;width:6px}';
+
+    function syncThemePicker(id) {
+        if (!themePicker) return;
+        themePicker.querySelectorAll('[data-theme-id]').forEach(button => {
+            const selected = button.dataset.themeId === id;
+            button.classList.toggle('selected', selected);
+            button.setAttribute('aria-selected', selected ? 'true' : 'false');
+        });
+    }
+
+    function applyOuterTheme(id) {
+        if (!THEME_API || !hostEl) return null;
+        const theme = THEME_API.apply(hostEl, id);
+        syncThemePicker(theme.id);
+        return theme;
+    }
+
+    function setThemePickerOpen(open) {
+        if (!themePicker) return;
+        themePicker.classList.toggle('open', !!open);
+        const toggleBtn = themePicker.querySelector('.theme-toggle');
+        if (toggleBtn) toggleBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+
+    function initThemePicker() {
+        if (!THEME_API || !themePicker) return;
+        themePicker.addEventListener('pointerdown', e => e.stopPropagation());
+        themePicker.addEventListener('click', e => {
+            e.stopPropagation();
+            const swatch = e.target.closest('[data-theme-id]');
+            if (swatch) {
+                const theme = applyOuterTheme(swatch.dataset.themeId);
+                setThemePickerOpen(false);
+                if (theme) {
+                    try { chrome.storage.local.set({ [THEME_KEY]: theme.id }); } catch (err) { reviveIfDead(err); }
+                }
+                return;
+            }
+            if (e.target.closest('.theme-toggle')) {
+                setThemePickerOpen(!themePicker.classList.contains('open'));
+            }
+        });
+        chrome.storage.local.get(THEME_KEY).then(result => {
+            applyOuterTheme(result && result[THEME_KEY]);
+        }).catch(err => reviveIfDead(err));
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area === 'local' && changes[THEME_KEY]) {
+                applyOuterTheme(changes[THEME_KEY].newValue);
+            }
+        });
+        syncThemePicker(THEME_API.DEFAULT_ID);
+    }
 
     function buildUI() {
         if (built || document.getElementById(HOST_ID)) return;
@@ -172,7 +255,15 @@
         host.id = HOST_ID;
         host.style.cssText = 'all:initial;position:fixed;top:0;left:0;width:0;height:0;z-index:' + Z;
         hostEl = host;
+        if (THEME_API) THEME_API.apply(host, THEME_API.DEFAULT_ID);
         shadow = host.attachShadow({ mode: 'closed' });
+        const themeMarkup = THEME_API
+            ? '<div class="theme-picker"><div class="theme-swatches" role="listbox" aria-label="播放器配色">' +
+                THEME_API.themes.map(theme => '<button class="pbtn theme-swatch" data-theme-id="' + theme.id +
+                    '" title="' + theme.name + '" aria-label="' + theme.name + '" role="option" style="--swatch:' +
+                    theme.swatch + '"></button>').join('') +
+                '</div><button class="pbtn theme-toggle" title="切换配色" aria-label="切换配色" aria-expanded="false"></button></div>'
+            : '';
         shadow.innerHTML =
             '<style>' + CSS + '</style>' +
             '<div class="mini" title="B站听歌列表">' +
@@ -189,6 +280,7 @@
             '<div class="panel">' +
             '<div class="phead">' +
             '<span class="gripbar" title="拖动面板">⠿</span>' +
+            themeMarkup +
             '<button class="pbtn add" title="把当前B站视频加入歌单" style="display:none"><span class="addtxt">＋加入</span></button>' +
             '</div>' +
             '<div class="pbody"><iframe class="pframe" title="playlist" allow="autoplay"></iframe></div>' +
@@ -202,8 +294,10 @@
         addBtn = shadow.querySelector('.add');
         addTxt = shadow.querySelector('.addtxt');
         resizeGrip = shadow.querySelector('.resize-grip');
+        themePicker = shadow.querySelector('.theme-picker');
 
         makeMiniDraggable();
+        initThemePicker();
         addBtn.addEventListener('click', addCurrent);
         makeDraggable(panel, shadow.querySelector('.phead'));
         makeResizable(panel, resizeGrip);
@@ -341,6 +435,7 @@
     function toggle(open) {
         panelOpen = (open == null) ? !panelOpen : !!open;
         panel.classList.toggle('open', panelOpen);
+        if (!panelOpen) setThemePickerOpen(false);
         if (panelOpen) { ensureFrame(); updateAddBtn(); }
     }
 

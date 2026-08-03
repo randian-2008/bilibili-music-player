@@ -19,7 +19,8 @@ $tests = @(
     'tests/test-offscreen.js',
     'tests/test-background.js',
     'tests/test-content.js',
-    'tests/test-logger.js'
+    'tests/test-logger.js',
+    'tests/test-theme.js'
 )
 foreach ($test in $tests) {
     & node (Join-Path $projectRoot $test)
@@ -37,7 +38,8 @@ $runtimeFiles = @(
     'rules.json',
     'sidepanel.css',
     'sidepanel.html',
-    'sidepanel.js'
+    'sidepanel.js',
+    'theme.js'
 )
 $iconFiles = @('icon16.png', 'icon48.png', 'icon128.png')
 

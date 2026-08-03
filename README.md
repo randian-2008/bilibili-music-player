@@ -45,6 +45,8 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 - **收起面板**：点 × / 再点频谱 / **点击页面任意其他位置自动收起**
 - 面板**位置和尺寸**自动记忆（chrome.storage）；**开合状态刻意不记忆**——新开页面 / 刷新时面板一律默认收起，
   无论是否正在播放（v2.2.8 起）
+- 面板标题栏的调色盘按钮可横向展开固定色块，在**经典粉 / 钴蓝黄 / 翡翠珊瑚 / 曜石金 / 明亮白 / 星夜蓝**之间即时切换；
+  配色同时作用于浮动外壳、迷你播放器和 iframe 内的完整播放器，并自动记忆
 
 ## 已实现功能
 
@@ -95,7 +97,7 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 - chrome.storage.local
 - 键：`bpl_playlists`（歌单，每首歌曲有稳定 `id`）、`bpl_active`（当前歌单ID）、
   `bpl_state`（播放状态，以 `trackId` 标识当前歌曲，`index` 仅作位置缓存）、`bpl_panel`（面板位置和尺寸）、
-  `bpl_position`（断点：`{trackId, bvid, cid, position}`，供 offscreen 被回收后续播）、
+  `bpl_position`（断点：`{trackId, bvid, cid, position}`，供 offscreen 被回收后续播）、`bpl_theme`（固定主题 ID）、
   `bpl_schema_version`（存储结构版本，当前为 1）
 - 旧版单歌单数据自动迁移
 
@@ -135,11 +137,12 @@ node tests/test-offscreen.js    # offscreen 播放引擎：多音源容错/5种�
 node tests/test-background.js   # B站API、存储迁移、歌单串行写入、稳定ID、批量操作、offscreen路由/自愈/广播/存储代理
 node tests/test-content.js      # 播放命令路由、状态同步、桥接来源安全、面板几何边界、失效上下文自愈
 node tests/test-logger.js       # 本地日志：批量落盘、级别、时间戳、上限裁剪、无存储上下文经 bg logMerge 中继
+node tests/test-theme.js        # 固定主题定义、核心变量完整性、非法主题回退、主题应用
 ```
 
-四个测试均通过 `vm` 注入 mock 的 `chrome/fetch/document`，**直接执行真实源码**
+五个测试均通过 `vm` 注入 mock 的 `chrome/fetch/document`，**直接执行真实源码**
 （offscreen.js / background.js 顶层函数可直接访问；content.js 经 `__BPL_EXPOSE` 钩子；logger.js 直接挂载 `globalThis.BPLLog`），
-共 **127 项断言**（offscreen 37 + background 61 + content 21 + logger 8），全部通过（退出码 0）才算合格。
+共 **138 项断言**（offscreen 37 + background 61 + content 21 + logger 8 + theme 11），全部通过（退出码 0）才算合格。
 注意：浏览器集成层（offscreen 实际创建/发声、postMessage 桥接收发、Referer/Origin 规则、
 autoplay 策略、CORS 真实行为）无法在 Node 中验证，需手动在浏览器确认。
 
@@ -230,6 +233,16 @@ v2.2.4 起，无 `chrome.storage` 的环境（如上述 Edge 的 offscreen）写
 - 面板「歌单菜单 ⋯」内可**查看 / 导出 TXT / 清空** 日志，便于在 Edge 现场定位通信问题。
 
 ## 更新记录
+
+### v2.4.0（固定主题配色）
+
+- 新增经典粉、钴蓝黄、翡翠珊瑚、曜石金、明亮白、星夜蓝六套完整配色；标题栏调色盘按钮横向展开色块，点击即时切换并持久化。
+  蓝黄与翡翠珊瑚使用高饱和撞色覆盖页面、面板、工具栏和控件，黑金主题使用曜石分层表面与金色强调。
+- 星夜蓝使用深蓝到亮蓝的渐变，并以轻量 CSS 点阵在歌单主区域生成克制的星光，不增加图片资源。
+- 新增共享 `theme.js`，用语义 CSS 变量同时驱动网页内 closed Shadow DOM 外壳与 iframe 播放器，主题不再只是背景替换。
+- 参考 Bootstrap 的按钮层次，以轻微内高光、1px 投影和按下内阴影增强控件边界，不引入厚重拟物效果。
+- 播放器与歌单之间使用 4px 主题渐变边、高光和轻阴影建立层次；面板边框增加低对比度外沿，右下角缩放提示改为双斜线。
+- 测试：**138 项**（offscreen 37 + background 61 + content 21 + logger 8 + theme 11）全部通过。
 
 ### v2.3.0（稳定曲目身份 + 歌单写入串行化 + 停止语义统一）
 

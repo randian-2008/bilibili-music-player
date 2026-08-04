@@ -1,0 +1,51 @@
+name: 缺陷报告
+description: 报告一个可以稳定复现的扩展问题。
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请勿在公开 Issue 中提交账号、Cookie、完整日志或可复现安全漏洞。
+  - type: input
+    id: version
+    attributes:
+      label: 扩展版本
+      description: 请填写扩展详情页中显示的完整版本号。
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: 浏览器与版本
+      placeholder: Chrome 126 / Edge 126
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为与实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 相关日志或截图（可选）
+      description: 请先移除账号、Cookie、音频 URL 等敏感信息。
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我已确认扩展为当前版本，并搜索过已有 Issue。
+          required: true

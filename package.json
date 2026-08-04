@@ -1,0 +1,20 @@
+{
+  "name": "bilibili-music-player",
+  "version": "2.5.1",
+  "private": true,
+  "license": "GPL-3.0-or-later",
+  "description": "Manifest V3 Bilibili background audio player with playlists.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check": "node --check background.js && node --check content.js && node --check logger.js && node --check offscreen-boot.js && node --check offscreen.js && node --check sidepanel.js && node --check theme.js",
+    "test:offscreen": "node tests/test-offscreen.js",
+    "test:background": "node tests/test-background.js",
+    "test:content": "node tests/test-content.js",
+    "test:logger": "node tests/test-logger.js",
+    "test:theme": "node tests/test-theme.js",
+    "test": "npm run check && npm run test:offscreen && npm run test:background && npm run test:content && npm run test:logger && npm run test:theme",
+    "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1"
+  }
+}

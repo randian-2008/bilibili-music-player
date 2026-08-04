@@ -15,21 +15,13 @@ if ((Split-Path $releaseDir -Leaf) -ne 'bilibili-music-player' -or
     throw "Unsafe release directory: $releaseDir"
 }
 
-$tests = @(
-    'tests/test-offscreen.js',
-    'tests/test-background.js',
-    'tests/test-content.js',
-    'tests/test-logger.js',
-    'tests/test-theme.js'
-)
-foreach ($test in $tests) {
-    & node (Join-Path $projectRoot $test)
-    if ($LASTEXITCODE -ne 0) { throw "Test failed: $test" }
-}
+& npm.cmd --prefix $projectRoot test
+if ($LASTEXITCODE -ne 0) { throw 'Syntax checks or tests failed' }
 
-$runtimeFiles = @(
+$packageFiles = @(
     'background.js',
     'content.js',
+    'LICENSE',
     'logger.js',
     'manifest.json',
     'offscreen-boot.js',
@@ -39,7 +31,8 @@ $runtimeFiles = @(
     'sidepanel.css',
     'sidepanel.html',
     'sidepanel.js',
-    'theme.js'
+    'theme.js',
+    'USER_GUIDE.md'
 )
 $iconFiles = @('icon16.png', 'icon48.png', 'icon128.png')
 
@@ -53,14 +46,14 @@ if (Test-Path -LiteralPath $releaseDir) {
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir 'icons') | Out-Null
 
-foreach ($file in $runtimeFiles) {
+foreach ($file in $packageFiles) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination (Join-Path $releaseDir $file)
 }
 foreach ($file in $iconFiles) {
     Copy-Item -LiteralPath (Join-Path $projectRoot (Join-Path 'icons' $file)) -Destination (Join-Path $releaseDir (Join-Path 'icons' $file))
 }
 
-$packagedFiles = $runtimeFiles + ($iconFiles | ForEach-Object { Join-Path 'icons' $_ })
+$packagedFiles = $packageFiles + ($iconFiles | ForEach-Object { Join-Path 'icons' $_ })
 foreach ($file in $packagedFiles) {
     $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $projectRoot $file)).Hash
     $releaseHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir $file)).Hash

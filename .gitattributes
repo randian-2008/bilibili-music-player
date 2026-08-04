@@ -1,0 +1,7 @@
+# Keep repository text stable across Windows, macOS, and Linux contributors.
+* text=auto eol=lf
+
+*.png binary
+*.zip binary
+*.crx binary
+*.pem binary

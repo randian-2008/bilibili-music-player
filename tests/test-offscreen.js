@@ -234,6 +234,19 @@ async function testHandleCmd() {
     ok(r.ok === true && typeof r.position === 'number' && r.hasTrack === false, 'getStatus 返回状态');
     r = await ctx.handleCmd({ cmd: 'playIndex', index: 1 });
     ok(r.ok === true && (await getState(ctx)).index === 1, 'playIndex 命令');
+
+    const customStore = setupPlaylist(1);
+    customStore.bpl_playlists.push({ id: 'pl2', name: '新歌单', items: [
+        { id: 'custom0', bvid: 'BVCUSTOM', cid: 909, title: 'custom', pic: '', owner: '', duration: 10, page: 1 }
+    ] });
+    customStore.bpl_active = 'pl2';
+    const customCtx = makeCtx({ store: customStore });
+    r = await customCtx.handleCmd({ cmd: 'playIndex', index: 0, playlistId: 'pl2' });
+    const customState = await customCtx.pGetState();
+    const resolveReq = customCtx.__sent.find(m => m && m.cmd === 'resolveAudio');
+    ok(r.ok === true && customState.playlistId === 'pl2' && customState.trackId === 'custom0' &&
+        resolveReq && resolveReq.resolveAudio.bvid === 'BVCUSTOM' && resolveReq.resolveAudio.playlistId === 'pl2',
+        'playIndex 按显式歌单 ID 取曲并切换播放身份');
     r = await ctx.handleCmd({ cmd: 'setVolume', value: 0.5 });
     ok(r.ok === true && ctx.__audio.volume === 0.5 && ctx.__store.bpl_volume === 0.5, 'setVolume 生效并持久化');
     r = await ctx.handleCmd({ cmd: 'stop' });

@@ -98,10 +98,10 @@ function pGetState() {
 function pGetPlaylists() {
     return store.get('bpl_playlists').then(r => r.bpl_playlists || []);
 }
-async function pGetItems() {
+async function pGetItems(playlistId) {
     const st = await pGetState();
     const pls = await pGetPlaylists();
-    const pl = pls.find(p => p.id === st.playlistId);
+    const pl = pls.find(p => p.id === (playlistId || st.playlistId));
     return pl ? pl.items : [];
 }
 // 广播统一经 background 中继（cmd:'relay' → bg 以 target:'all' 转发）。现场实证（v2.2.5）：
@@ -193,12 +193,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 });
 
-function bgResolveAudio(it) {
+function bgResolveAudio(it, playlistId) {
     return new Promise(res => {
         let done = false;
         const finish = v => { if (!done) { done = true; res(v); } };
         try {
-            chrome.runtime.sendMessage({ target: 'bg', cmd: 'resolveAudio', resolveAudio: { bvid: it.bvid, cid: it.cid || 0, page: it.page || 1 } }, r => {
+            chrome.runtime.sendMessage({
+                target: 'bg', cmd: 'resolveAudio',
+                resolveAudio: {
+                    bvid: it.bvid, cid: it.cid || 0, page: it.page || 1,
+                    playlistId: playlistId || null, itemId: it.id || null
+                }
+            }, r => {
                 finish(r || { ok: false, error: '获取音频失败（后台无响应）' });
             });
         } catch (e) {
@@ -297,14 +303,15 @@ async function tryPlayUrl(url) {
 
 // savedPos：可选断点 {bvid, cid, position}——仅 toggle 从空音频起播时传入（回收后续播），
 // 身份匹配才 seek 回去；显式点歌/切歌一律不传，从头播。
-async function pPlayIndex(i, keepOrder, savedPos) {
-    const items = await pGetItems();
+async function pPlayIndex(i, keepOrder, savedPos, playlistId) {
+    const st = await pGetState();
+    const targetPlaylistId = playlistId || st.playlistId;
+    const items = await pGetItems(targetPlaylistId);
     if (!items.length) return { ok: false, error: '当前播放的歌单为空' };
     if (i < 0 || i >= items.length) return { ok: false, error: '播放索引越界 (' + i + '/' + items.length + ')' };
-    const st = await pGetState();
     if (pIsShuffle(st.mode) && !keepOrder) pBuildFrom(items.length, i);
     const it = items[i];
-    const r = await bgResolveAudio(it);
+    const r = await bgResolveAudio(it, targetPlaylistId);
     if (!r || !r.ok || !r.urls || !r.urls.length) {
         BPLLog.error('off', 'resolveAudio 失败[' + it.bvid + ']：' + ((r && r.error) || '无候选（取音源模块无有效应答）'));
         BPLLog.flush();
@@ -317,14 +324,14 @@ async function pPlayIndex(i, keepOrder, savedPos) {
         if (res.ok) {
             BPLLog.info('off', '第 ' + (si + 1) + '/' + r.urls.length + ' 源播放成功[' + it.bvid + ']');
             curIndex = i;
-            curTrack = { id: it.id || null, bvid: it.bvid, cid: it.cid || 0 };
+            curTrack = { id: it.id || null, bvid: it.bvid, cid: r.cid || it.cid || 0 };
             const resumeAt = (positionMatchesTrack(savedPos, it) && savedPos.position > 0) ? savedPos.position : 0;
             if (resumeAt > 0) {
                 audio.currentTime = resumeAt;
                 BPLLog.info('off', '从断点继续：' + Math.round(resumeAt) + 's[' + it.bvid + ']');
             }
             setupMediaSession(it);
-            await pSetState({ trackId: it.id || null, index: i, playing: true });
+            await pSetState({ playlistId: targetPlaylistId, trackId: it.id || null, index: i, playing: true });
             persistPosition(resumeAt);
             return { ok: true };
         }
@@ -517,7 +524,9 @@ async function handleCmd(msg) {
         case 'toggle': return await pToggle();
         case 'next': return await pNext();
         case 'prev': return await pPrev();
-        case 'playIndex': await pEnsurePlaylist(); return await pPlayIndex(msg.index);
+        case 'playIndex':
+            if (!msg.playlistId) await pEnsurePlaylist();
+            return await pPlayIndex(msg.index, false, null, msg.playlistId);
         case 'seek': audio.currentTime = msg.value || 0; return { ok: true };
         case 'getStatus': return { ok: true, position: audio.currentTime || 0, duration: audio.duration || 0, playing: !audio.paused, index: curIndex, hasTrack: !!audio.src };
         case 'stop': return await pStopPlayback();

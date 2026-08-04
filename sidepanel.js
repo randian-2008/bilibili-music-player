@@ -35,6 +35,7 @@ function esc(s) {
 }
 function httpsUrl(u) {
     u = String(u || '');
+    if (u.indexOf('//') === 0) return 'https:' + u;
     return u.indexOf('http://') === 0 ? 'https://' + u.slice(7) : u;
 }
 function fmt(sec) {
@@ -220,9 +221,13 @@ function render() {
     } else {
         box.innerHTML = items.map((s, i) => {
             const isPlaying = showPlaying && !!state.trackId && s.id === state.trackId;
+            const coverUrl = httpsUrl(s.pic);
+            const coverHtml = coverUrl
+                ? '<img class="cover" src="' + esc(coverUrl) + '" draggable="false" referrerpolicy="no-referrer">'
+                : '<span class="cover cover-empty" draggable="false" aria-hidden="true"></span>';
             return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '">' +
                 '<span class="chk"></span>' +
-                '<img class="cover" src="' + esc(httpsUrl(s.pic)) + '" draggable="false" referrerpolicy="no-referrer">' +
+                coverHtml +
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
                 '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
@@ -637,7 +642,7 @@ function dragCancel() {
     cleanupDrag();
 }
 function showCoverPop(cover) {
-    if (box.classList.contains('drag-on') || !cover.isConnected) return;
+    if (box.classList.contains('drag-on') || !cover.isConnected || cover.classList.contains('cover-empty')) return;
     const r = cover.getBoundingClientRect();
     const pop = $('#coverPop'), img = $('#coverPopImg');
     // 4.2×（46×30 → 约 193×126）：比 3× 更醒目，仍稳处 340px 面板之内
@@ -701,7 +706,7 @@ box.addEventListener('click', e => {
     if (!it) return;
     const i = +it.dataset.i;
     if (selMode) { toggleSel(i); return; }
-    act('playIndex', { index: i });
+    act('playIndex', { index: i, playlistId: activeId });
 });
 
 box.addEventListener('mouseover', e => {

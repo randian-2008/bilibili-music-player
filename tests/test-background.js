@@ -38,7 +38,9 @@ function makeCtx(opts) {
     const sandbox = {
         console, Math, JSON, Promise, Date,
         setTimeout: (fn) => { setImmediate(fn); return 0; }, clearTimeout: () => {},
-        fetch: () => Promise.resolve({ json: () => Promise.resolve(resp) }),
+        fetch: (url) => Promise.resolve({
+            json: () => Promise.resolve(opts.fetchResponder ? opts.fetchResponder(url) : resp)
+        }),
         __setResp: r => { resp = r; },
         __store: store,
         __off: off,
@@ -152,6 +154,12 @@ function makeCtx(opts) {
     rc = await ctx.resolveCid('BV1', 1);
     ok(rc.cid === 111, '第一P cid (' + rc.cid + ')');
 
+    ctx = makeCtx({ fetchResponder: url => url.includes('/x/web-interface/view')
+        ? { code: -352, message: '风控校验失败' }
+        : { code: 0, data: [{ page: 1, cid: 333, part: '备用分P', duration: 88 }] } });
+    rc = await ctx.resolveCid('BV1', 1);
+    ok(rc.cid === 333, 'view 受限时经 pagelist 备用接口解析 cid (' + rc.cid + ')');
+
     console.log('\n[background buildItem（加入视频时拉元数据）]');
     ctx = makeCtx();
     ctx.__setResp({ data: { bvid: 'BV1', cid: 9, title: '歌曲', pic: 'http://i0.hdslb.com/x.jpg', owner: { name: 'UP' }, duration: 200, pages: [{ page: 1, cid: 9 }] } });
@@ -162,8 +170,9 @@ function makeCtx(opts) {
     // buildItem 失败回退
     ctx = makeCtx();
     ctx.__setResp({ code: -404, message: '啥都木有' });
-    const it2 = await ctx.buildItem('BV1', 1, '兜底标题');
-    ok(it2.cid === 0 && it2.title === '兜底标题', '解析失败用兜底 (' + it2.title + ')');
+    const it2 = await ctx.buildItem('BV1', 1, { title: '兜底标题', pic: '//i0.hdslb.com/fallback.jpg' });
+    ok(it2.cid === 0 && it2.title === '兜底标题' && it2.pic === 'https://i0.hdslb.com/fallback.jpg',
+        '解析失败保留页面元数据且封面协议规范化 (' + it2.title + ')');
 
     console.log('\n[background 存储模型迁移（稳定歌曲 ID / trackId）]');
     ctx = makeCtx();
@@ -265,6 +274,35 @@ function makeCtx(opts) {
     ok(ctx.__store.bpl_playlists.length === 2 &&
         ctx.__store.bpl_playlists.some(p => p.name === '并发 A') && ctx.__store.bpl_playlists.some(p => p.name === '并发 B'),
         '并发修改依次提交，不发生最后写入覆盖');
+
+    console.log('\n[background 新建歌单点播路由 / 残缺条目修复]');
+    ctx = makeCtx({ offscreenResponder: msg => ({ ok: true, echoed: msg.cmd }) });
+    ctx.__store.bpl_playlists = [
+        { id: 'default', name: '默认', items: [{ id: 'old0', bvid: 'BVOLD', cid: 10, title: '旧歌', pic: '', page: 1 }] },
+        { id: 'custom', name: '新建', items: [{ id: 'new0', bvid: 'BVNEW', cid: 20, title: '新歌', pic: '', page: 1 }] }
+    ];
+    ctx.__store.bpl_active = 'custom';
+    ctx.__store.bpl_state = { playlistId: 'default', trackId: 'old0', index: 0, playing: false, mode: 'loop' };
+    r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'playIndex', index: 0 } }, null);
+    const routedPlay = ctx.__portSent.find(m => m.cmd === 'playIndex');
+    ok(r.ok === true && routedPlay && routedPlay.playlistId === 'custom',
+        'playIndex 自动携带活动歌单 ID，不再按默认歌单解释索引');
+
+    ctx = makeCtx({ fetchResponder: url => {
+        if (url.includes('/x/web-interface/view')) return {
+            code: 0,
+            data: { bvid: 'BVNEW', title: '已修复歌曲', pic: 'http://i0.hdslb.com/repaired.jpg', owner: { name: 'UP' }, pages: [{ page: 1, cid: 222, duration: 99 }] }
+        };
+        return { code: 0, data: { dash: { audio: [{ baseUrl: 'https://cdn/repaired.m4s', bandwidth: 1 }] } } };
+    }});
+    ctx.__store.bpl_playlists = [{ id: 'custom', name: '新建', items: [
+        { id: 'new0', bvid: 'BVNEW', cid: 0, title: '页面兜底标题', pic: '', owner: '', duration: 0, page: 1 }
+    ] }];
+    ctx.__store.bpl_active = 'custom';
+    r = await ctx.handleResolveAudio({ bvid: 'BVNEW', cid: 0, page: 1, playlistId: 'custom', itemId: 'new0' });
+    const repaired = ctx.__store.bpl_playlists[0].items[0];
+    ok(r.ok === true && r.cid === 222 && repaired.cid === 222 && repaired.pic === 'https://i0.hdslb.com/repaired.jpg' && repaired.title === '已修复歌曲',
+        '播放残缺条目时补齐 cid、封面和标题');
 
     console.log('\n[background offscreen 路由（Port 通信）]');
     // sendToOffscreen 正常：创建 offscreen 并经 Port 转发命令

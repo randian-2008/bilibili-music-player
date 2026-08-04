@@ -228,6 +228,11 @@ input[type=range]:hover::-webkit-slider-thumb { transform: scale(1.3); }
     cursor: grab; transition: opacity .15s;
 }
 .item .cover:active { cursor: grabbing; }
+.item .cover-empty {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--bpl-faint); font-size: 15px;
+}
+.item .cover-empty::after { content: '\266A'; }
 .item.dragging { position: relative; z-index: 10; opacity: .45; }
 .item.drag-over { box-shadow: inset 0 2px 0 var(--bpl-accent); }
 .list.drag-on { user-select: none; }

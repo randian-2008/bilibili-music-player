@@ -95,6 +95,7 @@ async function reconcileStoredState(lists) {
 }
 function normUrl(u) {
     u = String(u || '');
+    if (u.indexOf('//') === 0) return 'https:' + u;
     return u.indexOf('http://') === 0 ? 'https://' + u.slice(7) : u;
 }
 async function biliFetch(url) {
@@ -102,12 +103,37 @@ async function biliFetch(url) {
     return await r.json();
 }
 async function resolveCid(bvid, page) {
-    const j = await biliFetch('https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid));
-    const d = j && j.data;
-    if (!d) throw new Error((j && j.message) || '无法解析视频信息');
-    const pages = d.pages || [];
-    const pg = (page && pages.find(x => x.page === page)) || pages[0] || {};
-    return { cid: pg.cid || d.cid || 0, info: d, page: pg };
+    let info = null;
+    let viewError = null;
+    try {
+        const j = await biliFetch('https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid));
+        info = j && j.data;
+        if (!info) viewError = new Error((j && j.message) || '无法解析视频信息');
+    } catch (e) {
+        viewError = e;
+    }
+
+    const pages = (info && info.pages) || [];
+    let pg = (page && pages.find(x => x.page === page)) || pages[0] || {};
+    let cid = pg.cid || (info && info.cid) || 0;
+    if (cid) return { cid: cid, info: info, page: pg };
+
+    // view 接口偶尔会被风控，但 pagelist 仍可用。播放只依赖 cid，因此保留这条独立兜底。
+    try {
+        const j = await biliFetch('https://api.bilibili.com/x/player/pagelist?bvid=' + encodeURIComponent(bvid));
+        const fallbackPages = (j && j.code === 0 && Array.isArray(j.data)) ? j.data : [];
+        pg = (page && fallbackPages.find(x => x.page === page)) || fallbackPages[0] || {};
+        cid = pg.cid || 0;
+        if (cid) {
+            const fallbackInfo = info || { bvid: bvid };
+            if (!Array.isArray(fallbackInfo.pages) || !fallbackInfo.pages.length) fallbackInfo.pages = fallbackPages;
+            return { cid: cid, info: fallbackInfo, page: pg };
+        }
+        if (!viewError) viewError = new Error((j && j.message) || '无法解析视频 cid');
+    } catch (e) {
+        if (!viewError) viewError = e;
+    }
+    throw viewError || new Error('无法解析视频 cid');
 }
 async function getAudioUrls(bvid, cid) {
     const base = 'https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) + '&cid=' + encodeURIComponent(cid);
@@ -152,24 +178,47 @@ async function getAudioUrls(bvid, cid) {
     BPLLog.info('bg', 'getAudioUrls[' + bvid + '/' + cid + '] 得 ' + uniq.length + ' 个候选' + tag);
     return uniq;
 }
-async function buildItem(bvid, page, fallbackTitle) {
+function resolvedItemFields(r, bvid, page, fallback) {
+    const d = r.info || {}, pg = r.page || {};
+    const pages = d.pages || [];
+    const multi = pages.length > 1;
+    fallback = fallback || {};
+    return {
+        bvid: d.bvid || bvid,
+        cid: r.cid || 0,
+        title: (multi && pg.part) ? ((d.title || fallback.title || bvid) + ' · ' + pg.part) : (d.title || fallback.title || bvid),
+        pic: normUrl(d.pic || fallback.pic),
+        owner: (d.owner && d.owner.name) || fallback.owner || '',
+        duration: pg.duration || d.duration || fallback.duration || 0,
+        page: page
+    };
+}
+async function buildItem(bvid, page, fallback) {
+    if (typeof fallback === 'string') fallback = { title: fallback };
+    fallback = fallback || {};
     try {
         const r = await resolveCid(bvid, page);
-        const d = r.info, pg = r.page;
-        const multi = (d.pages || []).length > 1;
-        return {
-            id: genId(),
-            bvid: d.bvid || bvid,
-            cid: r.cid,
-            title: (multi && pg.part) ? (d.title + ' · ' + pg.part) : (d.title || bvid),
-            pic: normUrl(d.pic),
-            owner: (d.owner && d.owner.name) || '',
-            duration: pg.duration || d.duration || 0,
-            page: page
-        };
+        return Object.assign({ id: genId() }, resolvedItemFields(r, bvid, page, fallback));
     } catch (e) {
-        return { id: genId(), bvid: bvid, cid: 0, title: fallbackTitle || bvid, pic: '', owner: '', duration: 0, page: page };
+        BPLLog.warn('bg', 'buildItem[' + bvid + '] 元数据暂未解析：' + String((e && e.message) || e));
+        return {
+            id: genId(), bvid: bvid, cid: 0, title: fallback.title || bvid,
+            pic: normUrl(fallback.pic), owner: fallback.owner || '', duration: fallback.duration || 0, page: page
+        };
     }
+}
+
+async function repairResolvedItem(p, resolved) {
+    if (!p || !p.playlistId || !p.itemId || !resolved) return;
+    await withPlaylistMutation(async () => {
+        const lists = await getPlaylists();
+        const pl = findPl(lists, p.playlistId);
+        const it = pl && pl.items.find(x => x.id === p.itemId);
+        if (!it || it.bvid !== p.bvid || it.cid) return;
+        Object.assign(it, resolvedItemFields(resolved, p.bvid, p.page || 1, it));
+        await savePlaylists(lists);
+        await broadcastData();
+    });
 }
 
 async function migrate() {
@@ -323,10 +372,14 @@ async function waitForPort(timeout) {
 async function handleResolveAudio(p) {
     try {
         let cid = p.cid || 0;
-        if (!cid) cid = (await resolveCid(p.bvid, p.page || 1)).cid;
+        if (!cid) {
+            const resolved = await resolveCid(p.bvid, p.page || 1);
+            cid = resolved.cid;
+            await repairResolvedItem(p, resolved);
+        }
         if (!cid) return { ok: false, error: '无法解析视频 cid' };
         const urls = await getAudioUrls(p.bvid, cid);
-        return { ok: true, urls: urls };
+        return { ok: true, urls: urls, cid: cid };
     } catch (e) {
         BPLLog.error('bg', 'resolveAudio[' + (p && p.bvid) + '] 失败：' + String((e && e.message) || e));
         return { ok: false, error: String((e && e.message) || e) };
@@ -523,7 +576,13 @@ async function handleBg(msg, sender, mutationLocked) {
             const bvid = msg.bvid || (msg.item && msg.item.bvid);
             if (!bvid) return { ok: false };
             const page = msg.page || (msg.item && msg.item.page) || 1;
-            const it = Object.assign({}, (msg.item && msg.item.cid) ? msg.item : await buildItem(bvid, page, msg.fallbackTitle));
+            const fallback = {
+                title: msg.fallbackTitle,
+                pic: msg.fallbackPic,
+                owner: msg.fallbackOwner,
+                duration: msg.fallbackDuration
+            };
+            const it = Object.assign({}, (msg.item && msg.item.cid) ? msg.item : await buildItem(bvid, page, fallback));
             it.id = genId();
             it.pic = normUrl(it.pic);
             if (pl.items.some(x => x.bvid === it.bvid && (x.cid || 0) === (it.cid || 0))) {
@@ -532,7 +591,7 @@ async function handleBg(msg, sender, mutationLocked) {
             pl.items.push(it);
             await savePlaylists(lists);
             await broadcastData();
-            return { ok: true };
+            return { ok: true, incomplete: !it.cid };
         }
         case 'resolveAudio': {
             return await handleResolveAudio(msg.resolveAudio || msg);
@@ -578,7 +637,10 @@ async function handleBg(msg, sender, mutationLocked) {
             return { ok: true };
         }
         case 'player': {
-            const payload = msg.payload || {};
+            const payload = Object.assign({}, msg.payload || {});
+            // 浏览中的歌单(activeId)与正在播放的歌单(state.playlistId)可以不同。
+            // 显式点歌必须携带用户点击的歌单，否则 offscreen 会继续按旧歌单解释同一个索引。
+            if (payload.cmd === 'playIndex' && !payload.playlistId) payload.playlistId = await getActiveId();
             if (payload.cmd !== 'getStatus' && payload.cmd !== 'ping') BPLLog.info('bg', '收到 player 命令：' + payload.cmd);
             if (payload.cmd === 'getStatus' && !offscreenPort && !(await hasOffscreen())) {
                 // v2.2.9：offscreen 暂停 ~30s 即被浏览器当空闲文档回收（AUDIO_PLAYBACK 只在出声时保活），

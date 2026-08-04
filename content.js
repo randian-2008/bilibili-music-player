@@ -483,11 +483,25 @@
         if (!m) return;
         const bvid = m[1];
         const page = Math.max(1, parseInt(new URLSearchParams(location.search).get('p'), 10) || 1);
+        const meta = selector => {
+            const el = document.querySelector(selector);
+            return el ? String(el.content || el.getAttribute('content') || '').trim() : '';
+        };
+        const heading = document.querySelector('h1.video-title');
+        const fallbackTitle = (heading && String(heading.title || heading.textContent || '').trim()) ||
+            meta('meta[property="og:title"]') || document.title;
+        const fallbackPic = meta('meta[itemprop="image"]') || meta('meta[property="og:image"]');
+        const fallbackOwner = meta('meta[name="author"]');
         const old = addTxt.textContent;
         addTxt.textContent = '加入中…';
-        chrome.runtime.sendMessage({ target: 'bg', cmd: 'add', bvid: bvid, page: page, fallbackTitle: document.title }, res => {
+        chrome.runtime.sendMessage({
+            target: 'bg', cmd: 'add', bvid: bvid, page: page,
+            fallbackTitle: fallbackTitle, fallbackPic: fallbackPic, fallbackOwner: fallbackOwner
+        }, res => {
             if (chrome.runtime.lastError) { addTxt.textContent = old; return; }
-            addTxt.textContent = (res && res.dup) ? '已在列表' : '已加入';
+            if (!res || res.ok === false) addTxt.textContent = '加入失败';
+            else if (res.dup) addTxt.textContent = '已在列表';
+            else addTxt.textContent = res.incomplete ? '待解析' : '已加入';
             setTimeout(() => { addTxt.textContent = old; }, 1500);
         });
     }

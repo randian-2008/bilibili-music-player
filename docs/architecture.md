@@ -9,6 +9,7 @@
 ├── icons/              # Chrome 扩展图标
 ├── scripts/            # 确定性发布脚本
 ├── tests/              # 无浏览器依赖的 Node 测试
+├── CHANGELOG.md        # 自首次公开发布起的正式版本记录
 ├── USER_GUIDE.md       # 随发布包提供的最终用户指南
 ├── manifest.json       # Manifest V3 入口
 ├── background.js       # Service Worker

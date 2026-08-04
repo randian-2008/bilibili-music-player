@@ -1,6 +1,6 @@
 {
   "name": "bilibili-music-player",
-  "version": "2.5.1",
+  "version": "2.5.2",
   "private": true,
   "license": "GPL-3.0-or-later",
   "description": "Manifest V3 Bilibili background audio player with playlists.",

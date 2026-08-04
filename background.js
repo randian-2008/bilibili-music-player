@@ -289,6 +289,7 @@ let lastCreateAt = 0;   // 本次 createDocument 的时刻：用于判断 bpl_bo
 let offscreenBroken = false;   // 测出上下文整体失效（Extension context invalidated），下条命令需重建
 let lastRecreateAt = 0;        // 上次重建时刻：冷却闸，防止“损坏→重建→仍损坏”退化成新一轮踩踏
 const RECREATE_COOLDOWN_MS = 10000;
+const CMD_TIMEOUT_MS = 15000;  // 单条命令双通道响应预算：冷启动要建 offscreen + 拉取/解析音源，4s 常不够（v2.5.2 由 4s/2.5s 放宽，与面板/内容页对齐）
 
 async function hasOffscreen() {
     if (chrome.offscreen.hasDocument) {
@@ -443,23 +444,27 @@ async function recreateOffscreen() {
 }
 // 单次投递：优先 Port，Port 不可用/无响应再走 sendMessage（同一 offscreen 宿主的两条通道，非页内兜底）。
 // 恒返回一个结果对象（成功/业务错误/上下文损坏/无响应），从不返回 undefined，便于上层统一判定。
+// v2.5.2：双通道响应预算放宽到 CMD_TIMEOUT_MS（15s，与面板/内容页一致）；Port 超时不再丢弃连接。
+// v2.5.1 的“丢弃陈旧连接、下条命令将重连”是虚假承诺：offscreen 只在 onDisconnect 时重连，而 bg 从不
+// 主动 disconnect，丢弃后 waitForPort 永远等不到新连接，sendMessage 兜底在故障环境同样不通——文档活着
+// 但所有命令全死（僵尸按钮根因）。现在超时保留 Port、仅本条改走 sendMessage；确属僵死时由
+// sendToOffscreenOnce 的有界自愈（连续 3 次无响应→重建）兜住。
 async function trySendOnce(msg) {
     await ensureOffscreen();
     // boot ping 已证明文档存活，给 offscreen.js 充分的加载/连接窗口
     if (await waitForPort(2500)) {
-        const res = await sendViaPort(msg, 4000);
+        const res = await sendViaPort(msg, CMD_TIMEOUT_MS);
         if (res !== undefined) return res;   // 成功 / 业务错误 / 上下文损坏，均交由上层判定
-        // Port 连上却无响应：连接陈旧（SW 重启后残留），丢弃让下条命令重连，本轮不踩踏
-        offscreenReady = false;
-        offscreenPort = null;
-        BPLLog.warn('bg', 'Port 已连接但命令无响应，已丢弃陈旧连接（下条命令将重连）');
+        BPLLog.warn('bg', 'Port 已连接但本条命令超时，保留连接，本轮改走 sendMessage 兜底');
     }
-    return await sendViaMessage(msg, 2500);
+    return await sendViaMessage(msg, CMD_TIMEOUT_MS);
 }
-// 关键修复（v2.2.1 去踩踏 / v2.2.3 自愈覆盖双通道）：
+// 关键修复（v2.2.1 去踩踏 / v2.2.3 自愈覆盖双通道 / v2.5.2 僵死自愈）：
 // 旧 v2.1 实现在每次失败时 closeDocument + 立即重建，2 秒一轮反复踩踏，把正在初始化的 offscreen.js 踩死。
 // 新实现：创建一次、耐心等 Port；命令若报“上下文损坏”（reading 'local' 等，无论来自 Port 还是 sendMessage
 // 通道）则带冷却地重建一次重试（恢复同一宿主，非页内兜底）；纯无响应则读 bpl_boot 给确切死因上报 UI。
+// v2.5.2 补第二种自愈：连续 3 条命令双通道均无响应 = 通道僵死（文档活着、Port 看似连着、命令全不通），
+// 此状态无自然出口（播放中的文档不会被回收），带 10s 冷却闸强制 close+重建一次并重试本条。
 async function sendToOffscreenOnce(msg) {
     const cooldownOk = () => Date.now() - lastRecreateAt > RECREATE_COOLDOWN_MS;
     // 进入前若上次命令已测出上下文整体失效（Extension context invalidated），先带冷却地重建一次
@@ -477,8 +482,20 @@ async function sendToOffscreenOnce(msg) {
         offscreenFailCount = 0;
         return res;
     }
-    // 纯无响应/彻底失败：读 bpl_boot 把确切死因直接上报 UI（关闭重建只会踩死正在初始化的文档，不做）
+    // 纯无响应/彻底失败
     offscreenFailCount++;
+    // v2.5.2 僵死自愈：文档活着、Port 看似连着但双通道全不通的状态没有自然出口——播放中的文档不会被
+    // 回收，后续命令只会一直超时。连续 3 次无响应即强制 close+重建一次（10s 冷却闸防踩踏），重试本条。
+    if (offscreenFailCount >= 3 && cooldownOk()) {
+        BPLLog.warn('bg', 'offscreen 连续 ' + offscreenFailCount + ' 次无响应，判定通道僵死，强制重建一次');
+        BPLLog.flush();
+        await recreateOffscreen();
+        const retry = await trySendOnce(msg);
+        if (retry && !(retry.ok === false && retry.error && /无响应/.test(retry.error))) {
+            offscreenFailCount = 0;
+            return retry;
+        }
+    }
     const diag = await readBootDiag();
     BPLLog.error('bg', 'offscreen 通信失败（累计 ' + offscreenFailCount + ' 次）：' + diag);
     BPLLog.flush();

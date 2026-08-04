@@ -356,12 +356,13 @@ function makeCtx(opts) {
     r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'getStatus' } }, null);
     ok(r.ok && r.hasTrack === true && r.position === 0, '断点曲目不符 → 推导位置归零');
 
-    // offscreen 持续无响应 → 返回带确切诊断的错误；关键回归：不再 close+重建踩踏
-    // （旧实现失败即关闭重建，2s 一轮把正在初始化的 offscreen.js 反复踩死，是本次故障元凶）
+    // offscreen 无响应 → 返回带确切诊断的错误；关键回归：单次失败不再 close+重建踩踏
+    // （旧实现失败即关闭重建，2s 一轮把正在初始化的 offscreen.js 反复踩死，是本次故障元凶；
+    // 连续 3 次无响应的僵死自愈见下方 v2.5.2 段）
     ctx = makeCtx({ offscreenResponder: () => undefined });
     r = await ctx.sendToOffscreen({ cmd: 'toggle' });
-    ok(r.ok === false && /音频模块通信失败/.test(r.error), 'offscreen 持续无响应返回错误');
-    ok(ctx.__off.closeCalls === 0, '失败不再关闭重建（去踩踏，closeCalls=' + ctx.__off.closeCalls + '）');
+    ok(r.ok === false && /音频模块通信失败/.test(r.error), 'offscreen 无响应返回错误');
+    ok(ctx.__off.closeCalls === 0, '单次失败不关闭重建（去踩踏，closeCalls=' + ctx.__off.closeCalls + '）');
 
     // 业务错误（如歌单为空）经 Port 原样返回、不重试
     ctx = makeCtx({ offscreenResponder: (msg) => ({ ok: false, error: '当前播放的歌单为空' }) });
@@ -455,6 +456,44 @@ function makeCtx(opts) {
     r = await ctx.sendToOffscreen({ cmd: 'toggle' });
     ok(r.ok === true && r.echoed === 'toggle' && ctx.__off.closeCalls === 1,
         'sendMessage 通道的上下文损坏也触发自愈重建（closeCalls=' + ctx.__off.closeCalls + '）');
+
+    console.log('\n[background v2.5.2 僵尸通道修复（D1 预算 / D2 保留 Port / D3 僵死自愈）]');
+    // D1：单条命令响应预算放宽到 15s，与面板/内容页一致。现场实证：4s 预算把用户机器 4.73s 的
+    // 冷启动 playIndex 误判为无响应，是僵尸按钮的起点。
+    ctx = makeCtx();
+    ok(vm.runInContext('CMD_TIMEOUT_MS', ctx) === 15000, 'D1：单条命令响应预算放宽到 15s（与面板/内容页对齐）');
+
+    // D2：Port 超时不再丢弃连接。offscreen 只在 onDisconnect 时重连、bg 从不主动 disconnect，
+    // 丢弃后 waitForPort 永远等不到新连接 → 文档活着但所有命令全死。现在保留连接、仅本条改走 sendMessage。
+    ctx = makeCtx({ offscreenResponder: () => undefined });
+    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
+    ok(r.ok === false && /音频模块通信失败/.test(r.error), 'D2：Port 超时本条降级 sendMessage，仍无响应则报错');
+    ok(ctx.__portSent.length === 1 && ctx.__msgSent.some(m => m.target === 'offscreen' && m.cmd === 'toggle'),
+        'D2：Port 尝试 + sendMessage 兜底各一次');
+    r = await ctx.sendToOffscreen({ cmd: 'next' });
+    ok(r.ok === false && ctx.__portSent.length === 2,
+        'D2：超时后 Port 保留，下条命令仍优先走 Port（v2.5.1 在此置空 → 永久僵尸）');
+    ok(ctx.__off.closeCalls === 0, 'D2：未达僵死阈值不重建（closeCalls=' + ctx.__off.closeCalls + '）');
+
+    // D3：连续 3 次双通道无响应 = 通道僵死（文档活着、Port 看似连着、命令全不通），此状态无自然出口
+    // （播放中的文档不会被回收）→ 强制重建一次并重试本条。重建后恢复者：第 3 条即成功。
+    ctx = makeCtx({ offscreenResponder: (msg) => (ctx.__off.closeCalls > 0 ? { ok: true, echoed: msg.cmd } : undefined) });
+    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
+    ok(r.ok === false && ctx.__off.closeCalls === 0, 'D3：第 1 次无响应只报错，不重建');
+    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
+    ok(r.ok === false && ctx.__off.closeCalls === 0, 'D3：第 2 次无响应仍不重建（未达阈值）');
+    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
+    ok(r.ok === true && r.echoed === 'toggle' && ctx.__off.closeCalls === 1,
+        'D3：第 3 次无响应判定僵死 → 强制重建一次，重试本条成功');
+    ok(vm.runInContext('offscreenFailCount', ctx) === 0, 'D3：恢复成功后失败计数归零');
+    r = await ctx.sendToOffscreen({ cmd: 'next' });
+    ok(r.ok === true && ctx.__off.closeCalls === 1, 'D3：通道恢复后续命令正常，不再重建');
+
+    // D3 冷却闸：僵死未愈（重建后仍无响应）→ 10s 内至多重建一次，不退化成新一轮踩踏风暴
+    ctx = makeCtx({ offscreenResponder: () => undefined });
+    for (let k = 0; k < 6; k++) await ctx.sendToOffscreen({ cmd: 'toggle' });
+    ok(ctx.__off.closeCalls === 1 && ctx.__off.createCalls === 2,
+        'D3：6 次连续无响应仅重建一次（冷却闸防踩踏，closeCalls=' + ctx.__off.closeCalls + '）');
 
     console.log('\n[background 存储代理（供无 chrome.storage 的 offscreen 使用）]');
     ctx = makeCtx();

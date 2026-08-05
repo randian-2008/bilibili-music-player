@@ -57,7 +57,11 @@ flowchart LR
 
 iframe 不能直接依赖 `chrome.runtime.sendMessage`。`sidepanel.js` 使用 `window.postMessage` 将请求交给宿主页的 `content.js`，再由后者调用扩展 API。桥接时必须校验 `event.origin`，并保持请求 ID 与响应 ID 一一对应。
 
-`background.js` 与 `offscreen.js` 优先使用长连接 Port；短消息只作为该通道不可用时的传输降级，不改变“offscreen 是唯一音频宿主”的业务边界。
+`background.js` 与 `offscreen.js` 优先使用长连接 Port。offscreen 收到命令后立即 ACK；Port 未及时 ACK 时，background 主动断开陈旧连接，并以相同 `_requestId` 经 `runtime.sendMessage` 重发。offscreen 同时缓存进行中请求和近期完成结果，因此跨通道重发不会重复执行播放命令。短消息只承担单条命令的传输降级，不改变“offscreen 是唯一音频宿主”的业务边界。
+
+播放/切歌命令和音量、进度、模式等快速控制分别使用 28s 与 7s 的后台预算。它们不经过全局串行队列；offscreen 用单调递增的播放意图取消旧取源、旧媒体请求和旧 Blob 结果，保证最后一次用户操作获胜。B站 API、媒体 fetch、Blob 读取和 `audio.play()` 另有局部超时，外层播放流程总预算为 25s。
+
+通信异常只允许在本条命令中重建 offscreen 一次，并受 10s 冷却保护。播放途中出现 `audio.error` 或长期 `stalled` 时，offscreen 会重新解析候选源、从当前断点有限重试；短暂卡流自行恢复会取消排队任务，三次恢复仍失败则停止播放并广播 `playerError`。
 
 ## 本地检查与发布
 
@@ -69,4 +73,4 @@ npm test
 npm run package:windows
 ```
 
-GitHub Actions 会在推送到 `master` 和每个 Pull Request 上运行同一套语法检查与 Node 测试。发布包由 PowerShell 脚本生成，产物位于项目同级的 `release/` 目录，不进入源码仓库。
+GitHub Actions 会在推送到 `main` 和每个 Pull Request 上运行同一套语法检查与 Node 测试。发布包由 PowerShell 脚本生成，产物位于项目同级的 `release/` 目录，不进入源码仓库。

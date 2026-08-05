@@ -8,7 +8,7 @@
 
 ## 安装
 
-1. 从 GitHub Releases 下载 `bilibili-music-player-v2.5.1.zip`，不要下载名称为 `Source code` 的自动源码包。
+1. 从 GitHub Releases 下载 `bilibili-music-player-v2.5.2.zip`，不要下载名称为 `Source code` 的自动源码包。
 2. 将 ZIP 解压到一个准备长期保留的目录。
 3. Chrome 打开 `chrome://extensions/`；Edge 打开 `edge://extensions/`。
 4. 开启“开发者模式”，点击“加载已解压的扩展程序”。
@@ -59,7 +59,7 @@
 - 长按歌曲文字区域约半秒进入批量选择，可移动、复制或删除多首歌曲。
 - 点击歌单栏的“⋯”可重命名、清空或删除歌单，并可导入、导出歌单。
 
-JSON 是完整备份与恢复格式；TXT 和 Markdown 更适合阅读或分享。导入的 JSON 至少需要为每首歌曲提供 `bvid`。
+JSON 是当前歌单的备份与恢复格式；TXT 和 Markdown 更适合阅读或分享。需要备份多个歌单时，请分别切换并导出。导入的 JSON 至少需要为每首歌曲提供 `bvid`。
 
 ## 调整界面
 

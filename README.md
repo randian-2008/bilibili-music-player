@@ -138,8 +138,8 @@ Chrome 扩展（Manifest V3）：浏览器级 B站后台音频播放器，自带
 npm test
 
 # 或单独运行某个测试文件
-node tests/test-offscreen.js    # offscreen 播放引擎：多音源容错/5种模式/统一停止/trackId/存储代理/断点续播
-node tests/test-background.js   # B站API、存储迁移、歌单串行写入、稳定ID、批量操作、offscreen路由/自愈/广播/存储代理
+node tests/test-offscreen.js    # offscreen 播放引擎：多音源容错/异步取消/请求去重/断点续播/网络自恢复
+node tests/test-background.js   # B站API、存储迁移、歌单串行写入、跨歌单点播、offscreen通信/自愈/存储代理
 node tests/test-content.js      # 播放命令路由、状态同步、桥接来源安全、面板几何边界、失效上下文自愈
 node tests/test-logger.js       # 本地日志：批量落盘、级别、时间戳、上限裁剪、无存储上下文经 bg logMerge 中继
 node tests/test-theme.js        # 固定主题定义、核心变量完整性、非法主题回退、主题应用
@@ -147,7 +147,7 @@ node tests/test-theme.js        # 固定主题定义、核心变量完整性、�
 
 五个测试均通过 `vm` 注入 mock 的 `chrome/fetch/document`，**直接执行真实源码**
 （offscreen.js / background.js 顶层函数可直接访问；content.js 经 `__BPL_EXPOSE` 钩子；logger.js 直接挂载 `globalThis.BPLLog`），
-共 **146 项断言**（offscreen 37 + background 61 + content 21 + logger 8 + theme 19），全部通过（退出码 0）才算合格。
+共 **163 项断言**（offscreen 45 + background 70 + content 21 + logger 8 + theme 19），全部通过（退出码 0）才算合格。
 注意：浏览器集成层（offscreen 实际创建/发声、postMessage 桥接收发、Referer/Origin 规则、
 autoplay 策略、CORS 真实行为）无法在 Node 中验证，需手动在浏览器确认。
 
@@ -183,14 +183,13 @@ Edge 基于 Chromium（79+ 起），MV3 与 Offscreen Document（Chrome/Edge 109
 
 据此，`background.sendToOffscreen` 遵循：
 1. **每次都重新核验** offscreen 是否存在（`hasDocument()`+`getContexts()`），不依赖可能已过期的模块状态；
-2. **始终优先 Port**，冷启动/重连给足等待窗口（首轮 1.5s）；offscreen 侧断线后每 500ms 自动重连；
-3. **降级只作“本轮一次性”**：Port 未就绪时才临时用 sendMessage 兜底，**绝不把通道永久切到 sendMessage**
-   （旧版 `useMsgChannel` 一旦置位即永久锁死坏通道，是“全部按钮失效”的根因）；
+2. **始终优先 Port**，冷启动/重连最多等待 2.5s；命令进入 offscreen 后立即 ACK，后台不会把正常的慢速取源误判为通道失联；
+3. **降级只作“本条一次性”**：只有 Port 未在 1.2s 内 ACK 时才主动断开陈旧连接并临时使用 `sendMessage`；两条通道复用同一 `_requestId`，offscreen 对进行中和近期完成的请求去重，不会重复播放；
 4. **不拿 ready ping 当硬门槛**：ping 丢失不代表命令通道也坏（v2.1.0 曾因等不到 ping 而一次都没真正
    尝试 sendMessage 就判失败）——直接试发送，以实际响应判定成败；
-5. **单飞（single-flight）串行化**：快速连点产生的并发命令排队执行，杜绝多路并发 create/close
-   offscreen 互相踩踏（现场日志中约 30 次 `createDocument 成功`却无一次 Port 连上，踩踏是重要诱因）；
-6. 任一轮失败即**关闭并重建** offscreen 再重试（最多 2 轮、总耗时上有界），不卡死 UI。
+5. **播放意图可取消**：播放取源与音量、进度、模式等快速控制不再共用全局串行队列；新点歌、切歌、暂停或停止会使旧异步结果失效，旧音源不能晚到覆盖新歌曲；
+6. **分级且有界**：播放/切歌命令预算 28s，快速控制预算 7s；UI 等待时间略长于后台，避免界面先超时；API、媒体请求、Blob 读取和 `audio.play()` 各自还有更短的局部超时；
+7. **本条命令内自愈一次**：上下文损坏或双通道无响应时关闭并重建 offscreen 后重试，10s 冷却闸防止持续异常退化为重建循环。播放途中发生 `audio.error` 或长期 `stalled` 时会重新解析音源、从断点有限重试；最终失败会停止播放并向 UI 广播明确错误。
 
 ### 无兜底：offscreen 是唯一音频宿主（产品决策）
 
@@ -249,14 +248,14 @@ AI 生成内容均经过维护者检查、测试和取舍；项目的维护、�
 
 ## 版本记录
 
-当前公开版本为 **v2.5.1**。正式版本说明和安装包请查看 [GitHub Releases](https://github.com/randian-2008/bilibili-music-player/releases)。
+当前公开版本为 **v2.5.2**。正式版本说明和安装包请查看 [GitHub Releases](https://github.com/randian-2008/bilibili-music-player/releases)。
 
 自首次公开发布起的版本变化记录见 [CHANGELOG.md](CHANGELOG.md)；此前的内部迭代保留在 Git 提交历史中。
 
 ## 项目状态
 
-当前版本为 **v2.5.1**。播放、歌单、跨页面持久播放、可调尺寸面板和六套固定主题均已进入稳定使用阶段；
-核心逻辑共有 **146 项**自动化断言，并由 GitHub Actions 在每个 Pull Request 上复跑。
+当前版本为 **v2.5.2**。播放、歌单、跨页面持久播放、可调尺寸面板和六套固定主题均已进入稳定使用阶段；
+核心逻辑共有 **163 项**自动化断言，并由 GitHub Actions 在每个 Pull Request 上复跑。
 
 已知取舍与后续方向：
 - 浏览器完全关闭后音频停止（offscreen 随浏览器生命周期）。

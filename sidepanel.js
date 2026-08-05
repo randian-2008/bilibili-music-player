@@ -120,13 +120,18 @@ if (logEl) {
 
 function send(cmd, extra) {
     const payload = Object.assign({ target: 'bg', cmd }, extra || {});
+    const timeoutMs = ({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000;
     const report = r => {
         if (r && r.ok === false && r.error) BPLLog.error('ui', cmd + ' 失败：' + r.error);
         else if (!r) BPLLog.warn('ui', cmd + '：后台无响应（超时）');
     };
     if (!IN_FRAME) {
         return new Promise(res => {
-            chrome.runtime.sendMessage(payload, r => { report(r); res(r); });
+            let done = false;
+            const finish = r => { if (!done) { done = true; clearTimeout(timer); report(r); res(r); } };
+            const timer = setTimeout(() => finish(undefined), timeoutMs);
+            try { chrome.runtime.sendMessage(payload, r => finish(r)); }
+            catch (error) { finish({ ok: false, error: String((error && error.message) || error) }); }
         });
     }
     return new Promise(res => {
@@ -141,7 +146,7 @@ function send(cmd, extra) {
         window.addEventListener('message', onMsg);
         try { window.parent.postMessage({ bplBridge: 'req', id: id, payload: payload }, '*'); } catch (_) {}
         // 冷启动需创建 offscreen + 解析音源（可能走 blob 兜底），4s 常不够，放宽到 15s 以免误报“后台无响应”
-        setTimeout(() => finish(undefined), 15000);
+        setTimeout(() => finish(undefined), timeoutMs);
     });
 }
 
@@ -775,6 +780,8 @@ function handleBroadcast(msg) {
         duration = msg.duration || 0;
         if (msg.playing != null) state.playing = msg.playing;
         updateProgress();
+    } else if (msg.type === 'playerError') {
+        toast(msg.error || '音频播放失败，请检查网络后重试');
     }
 }
 

@@ -98,41 +98,81 @@ function normUrl(u) {
     if (u.indexOf('//') === 0) return 'https:' + u;
     return u.indexOf('http://') === 0 ? 'https://' + u.slice(7) : u;
 }
+const NETWORK_TIMEOUT_MS = 5000;
+const NETWORK_RETRY_DELAY_MS = 250;
+function waitMs(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function isRetryableNetworkError(error) {
+    const status = Number(error && error.status) || 0;
+    return !status || status === 408 || status === 429 || status >= 500;
+}
+async function biliFetchOnce(url, timeout) {
+    const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    let timer = null;
+    let settled = false;
+    return await new Promise((resolve, reject) => {
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            fn(value);
+        };
+        timer = setTimeout(() => {
+            if (controller) { try { controller.abort(); } catch (_) {} }
+            const error = new Error('网络请求超时');
+            error.name = 'TimeoutError';
+            finish(reject, error);
+        }, timeout || NETWORK_TIMEOUT_MS);
+        const options = { credentials: 'include' };
+        if (controller) options.signal = controller.signal;
+        Promise.resolve(fetch(url, options)).then(async response => {
+            if (response && response.ok === false) {
+                const error = new Error('HTTP ' + response.status);
+                error.status = response.status;
+                throw error;
+            }
+            return await response.json();
+        }).then(value => finish(resolve, value), error => finish(reject, error));
+    });
+}
 async function biliFetch(url) {
-    const r = await fetch(url, { credentials: 'include' });
-    return await r.json();
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try { return await biliFetchOnce(url, NETWORK_TIMEOUT_MS); }
+        catch (error) {
+            lastError = error;
+            if (attempt || !isRetryableNetworkError(error)) break;
+            await waitMs(NETWORK_RETRY_DELAY_MS);
+        }
+    }
+    throw lastError || new Error('网络请求失败');
 }
 async function resolveCid(bvid, page) {
-    let info = null;
-    let viewError = null;
-    try {
-        const j = await biliFetch('https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid));
-        info = j && j.data;
-        if (!info) viewError = new Error((j && j.message) || '无法解析视频信息');
-    } catch (e) {
-        viewError = e;
-    }
-
+    const encoded = encodeURIComponent(bvid);
+    const viewTask = biliFetch('https://api.bilibili.com/x/web-interface/view?bvid=' + encoded)
+        .then(value => ({ value })).catch(error => ({ error }));
+    const pageTask = biliFetch('https://api.bilibili.com/x/player/pagelist?bvid=' + encoded)
+        .then(value => ({ value })).catch(error => ({ error }));
+    const viewResult = await viewTask;
+    const view = viewResult.value;
+    const info = view && view.data;
+    let viewError = viewResult.error || (!info ? new Error((view && view.message) || '无法解析视频信息') : null);
     const pages = (info && info.pages) || [];
     let pg = (page && pages.find(x => x.page === page)) || pages[0] || {};
     let cid = pg.cid || (info && info.cid) || 0;
     if (cid) return { cid: cid, info: info, page: pg };
 
-    // view 接口偶尔会被风控，但 pagelist 仍可用。播放只依赖 cid，因此保留这条独立兜底。
-    try {
-        const j = await biliFetch('https://api.bilibili.com/x/player/pagelist?bvid=' + encodeURIComponent(bvid));
-        const fallbackPages = (j && j.code === 0 && Array.isArray(j.data)) ? j.data : [];
-        pg = (page && fallbackPages.find(x => x.page === page)) || fallbackPages[0] || {};
-        cid = pg.cid || 0;
-        if (cid) {
-            const fallbackInfo = info || { bvid: bvid };
-            if (!Array.isArray(fallbackInfo.pages) || !fallbackInfo.pages.length) fallbackInfo.pages = fallbackPages;
-            return { cid: cid, info: fallbackInfo, page: pg };
-        }
-        if (!viewError) viewError = new Error((j && j.message) || '无法解析视频 cid');
-    } catch (e) {
-        if (!viewError) viewError = e;
+    // view 与 pagelist 并发请求，避免异常网络下两个超时顺序叠加。
+    const pageResult = await pageTask;
+    const fallback = pageResult.value;
+    const fallbackPages = (fallback && fallback.code === 0 && Array.isArray(fallback.data)) ? fallback.data : [];
+    pg = (page && fallbackPages.find(x => x.page === page)) || fallbackPages[0] || {};
+    cid = pg.cid || 0;
+    if (cid) {
+        const fallbackInfo = info || { bvid: bvid };
+        if (!Array.isArray(fallbackInfo.pages) || !fallbackInfo.pages.length) fallbackInfo.pages = fallbackPages;
+        return { cid: cid, info: fallbackInfo, page: pg };
     }
+    if (!viewError) viewError = pageResult.error || new Error((fallback && fallback.message) || '无法解析视频 cid');
     throw viewError || new Error('无法解析视频 cid');
 }
 async function getAudioUrls(bvid, cid) {
@@ -283,13 +323,22 @@ let creating = null;
 let offscreenPort = null;
 let offscreenReady = false;
 let portMsgId = 0;
+let requestSeq = 0;
 const portWaiters = {};
 let lastPingAt = 0;
 let lastCreateAt = 0;   // 本次 createDocument 的时刻：用于判断 bpl_boot 是否来自当前这份文档
 let offscreenBroken = false;   // 测出上下文整体失效（Extension context invalidated），下条命令需重建
 let lastRecreateAt = 0;        // 上次重建时刻：冷却闸，防止“损坏→重建→仍损坏”退化成新一轮踩踏
 const RECREATE_COOLDOWN_MS = 10000;
-const CMD_TIMEOUT_MS = 15000;  // 单条命令双通道响应预算：冷启动要建 offscreen + 拉取/解析音源，4s 常不够（v2.5.2 由 4s/2.5s 放宽，与面板/内容页对齐）
+const PORT_ACK_TIMEOUT_MS = 1200;
+const LONG_CMD_TIMEOUT_MS = 28000;
+const FAST_CMD_TIMEOUT_MS = 7000;
+const LONG_PLAYER_CMDS = new Set(['playIndex', 'next', 'prev', 'toggle']);
+function commandTimeout(cmd) { return LONG_PLAYER_CMDS.has(cmd) ? LONG_CMD_TIMEOUT_MS : FAST_CMD_TIMEOUT_MS; }
+function nextRequestId() {
+    requestSeq = (requestSeq + 1) % 1000000;
+    return Date.now().toString(36) + '-' + requestSeq.toString(36) + '-' + Math.random().toString(36).slice(2, 8);
+}
 
 async function hasOffscreen() {
     if (chrome.offscreen.hasDocument) {
@@ -386,43 +435,66 @@ async function handleResolveAudio(p) {
         return { ok: false, error: String((e && e.message) || e) };
     }
 }
-// 经 Port 发命令；超时/发送失败 resolve(undefined)（offscreen 正常响应恒为对象，故 undefined 即失败）
+// Port 先等即时 ACK。收到 ACK 说明命令已经进入 offscreen 执行；未收到 ACK
+// 才判定为陈旧连接，并使用同一 requestId 走 sendMessage，避免重复播放。
 function sendViaPort(msg, timeout) {
     return new Promise(resolve => {
         const id = ++portMsgId;
-        let settled = false;
-        const done = v => { if (!settled) { settled = true; delete portWaiters[id]; clearTimeout(timer); resolve(v); } };
-        portWaiters[id] = done;
-        const timer = setTimeout(() => done(undefined), timeout);
-        try { offscreenPort.postMessage(Object.assign({ _id: id }, msg)); }
-        catch (e) { done(undefined); }
+        const targetPort = offscreenPort;
+        let settled = false, acknowledged = false, resultTimer = null, ackTimer = null;
+        const done = outcome => {
+            if (settled) return;
+            settled = true;
+            delete portWaiters[id];
+            if (resultTimer) clearTimeout(resultTimer);
+            if (ackTimer) clearTimeout(ackTimer);
+            resolve(outcome);
+        };
+        portWaiters[id] = incoming => {
+            if (incoming && incoming.disconnected) {
+                done({ kind: acknowledged ? 'acked-timeout' : 'unacked' });
+                return;
+            }
+            if (incoming && incoming.ack) {
+                acknowledged = true;
+                if (ackTimer) clearTimeout(ackTimer);
+                return;
+            }
+            if (incoming && Object.prototype.hasOwnProperty.call(incoming, 'result')) done({ kind: 'result', value: incoming.result });
+        };
+        resultTimer = setTimeout(() => done({ kind: acknowledged ? 'acked-timeout' : 'unacked' }), Math.max(1, timeout));
+        ackTimer = setTimeout(() => { if (!acknowledged) done({ kind: 'unacked' }); }, Math.max(1, Math.min(PORT_ACK_TIMEOUT_MS, timeout)));
+        try { targetPort.postMessage(Object.assign({ _id: id }, msg)); }
+        catch (_) { done({ kind: 'unacked' }); }
     });
 }
-// 经 runtime.sendMessage 发命令：仅在 Port 未就绪时【本轮一次性】兜底，绝不长期粘用
 function sendViaMessage(msg, timeout) {
     return new Promise(resolve => {
         const id = ++portMsgId;
-        let settled = false;
-        const done = v => { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } };
-        const timer = setTimeout(() => done({ ok: false, error: '音频模块通信失败：offscreen 无响应' }), timeout);
+        let settled = false, timer = null;
+        const done = outcome => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            resolve(outcome);
+        };
+        timer = setTimeout(() => done({ kind: 'timeout' }), Math.max(1, timeout));
         try {
-            chrome.runtime.sendMessage(Object.assign({ target: 'offscreen', _id: id }, msg), r => {
-                done((r === undefined) ? { ok: false, error: '音频模块通信失败：offscreen 无响应' } : r);
+            chrome.runtime.sendMessage(Object.assign({ target: 'offscreen', _id: id }, msg), response => {
+                done(response === undefined ? { kind: 'timeout' } : { kind: 'result', value: response });
             });
-        } catch (e) {
-            done({ ok: false, error: '音频模块通信失败：' + String((e && e.message) || e) });
+        } catch (error) {
+            done({ kind: 'result', value: { ok: false, error: '音频模块通信失败：' + String((error && error.message) || error) } });
         }
     });
 }
 
-// 单飞（single-flight）：所有发往 offscreen 的命令串行执行，避免并发 create 互相干扰。
-let sendChain = Promise.resolve();
+// 快速控制不再被慢速取源命令串行阻塞；播放竞态由 offscreen 的播放意图取消机制处理。
 let offscreenFailCount = 0;
 function sendToOffscreen(msg) {
-    const run = () => sendToOffscreenOnce(msg);
-    const p = sendChain.then(run, run);
-    sendChain = p.then(() => { }, () => { });
-    return p;
+    const request = Object.assign({}, msg);
+    if (!request._requestId) request._requestId = nextRequestId();
+    return sendToOffscreenOnce(request, Date.now() + commandTimeout(request.cmd));
 }
 // 识别“offscreen 上下文损坏”的错误签名：chrome.runtime 在、chrome.storage 未绑定（多见于升级
 // installed:update 瞬间建出的半残文档），或上下文整体失效。这类错误重建一次即可恢复，区别于
@@ -442,59 +514,58 @@ async function recreateOffscreen() {
     await new Promise(r => setTimeout(r, 150));
     await ensureOffscreen();
 }
-// 单次投递：优先 Port，Port 不可用/无响应再走 sendMessage（同一 offscreen 宿主的两条通道，非页内兜底）。
-// 恒返回一个结果对象（成功/业务错误/上下文损坏/无响应），从不返回 undefined，便于上层统一判定。
-// v2.5.2：双通道响应预算放宽到 CMD_TIMEOUT_MS（15s，与面板/内容页一致）；Port 超时不再丢弃连接。
-// v2.5.1 的“丢弃陈旧连接、下条命令将重连”是虚假承诺：offscreen 只在 onDisconnect 时重连，而 bg 从不
-// 主动 disconnect，丢弃后 waitForPort 永远等不到新连接，sendMessage 兜底在故障环境同样不通——文档活着
-// 但所有命令全死（僵尸按钮根因）。现在超时保留 Port、仅本条改走 sendMessage；确属僵死时由
-// sendToOffscreenOnce 的有界自愈（连续 3 次无响应→重建）兜住。
-async function trySendOnce(msg) {
+// 单次投递：优先 Port，只有未收到 ACK 才断开并走 sendMessage 兜底。
+async function trySendOnce(msg, deadline) {
     await ensureOffscreen();
-    // boot ping 已证明文档存活，给 offscreen.js 充分的加载/连接窗口
-    if (await waitForPort(2500)) {
-        const res = await sendViaPort(msg, CMD_TIMEOUT_MS);
-        if (res !== undefined) return res;   // 成功 / 业务错误 / 上下文损坏，均交由上层判定
-        BPLLog.warn('bg', 'Port 已连接但本条命令超时，保留连接，本轮改走 sendMessage 兜底');
+    let remaining = deadline - Date.now();
+    if (remaining <= 0) return { ok: false, error: '音频操作超时', _transport: 'deadline' };
+    if (await waitForPort(Math.min(2500, remaining))) {
+        remaining = deadline - Date.now();
+        const attemptedPort = offscreenPort;
+        const outcome = await sendViaPort(msg, remaining);
+        if (outcome.kind === 'result') return outcome.value;
+        if (outcome.kind === 'acked-timeout') return { ok: false, error: '音频操作执行超时，请稍后重试', _transport: 'acked-timeout' };
+        BPLLog.warn('bg', 'Port 未确认命令，断开陈旧连接并改走 sendMessage');
+        if (attemptedPort && attemptedPort === offscreenPort) {
+            offscreenPort = null;
+            offscreenReady = false;
+            try { if (attemptedPort.disconnect) attemptedPort.disconnect(); } catch (_) {}
+        }
     }
-    return await sendViaMessage(msg, CMD_TIMEOUT_MS);
+    remaining = deadline - Date.now();
+    if (remaining <= 0) return { ok: false, error: '音频模块通信超时', _transport: 'no-response' };
+    const fallback = await sendViaMessage(msg, remaining);
+    if (fallback.kind === 'result') return fallback.value;
+    return { ok: false, error: '音频模块通信失败：offscreen 无响应', _transport: 'no-response' };
 }
-// 关键修复（v2.2.1 去踩踏 / v2.2.3 自愈覆盖双通道 / v2.5.2 僵死自愈）：
-// 旧 v2.1 实现在每次失败时 closeDocument + 立即重建，2 秒一轮反复踩踏，把正在初始化的 offscreen.js 踩死。
-// 新实现：创建一次、耐心等 Port；命令若报“上下文损坏”（reading 'local' 等，无论来自 Port 还是 sendMessage
-// 通道）则带冷却地重建一次重试（恢复同一宿主，非页内兜底）；纯无响应则读 bpl_boot 给确切死因上报 UI。
-// v2.5.2 补第二种自愈：连续 3 条命令双通道均无响应 = 通道僵死（文档活着、Port 看似连着、命令全不通），
-// 此状态无自然出口（播放中的文档不会被回收），带 10s 冷却闸强制 close+重建一次并重试本条。
-async function sendToOffscreenOnce(msg) {
+async function sendToOffscreenOnce(msg, deadline) {
     const cooldownOk = () => Date.now() - lastRecreateAt > RECREATE_COOLDOWN_MS;
-    // 进入前若上次命令已测出上下文整体失效（Extension context invalidated），先带冷却地重建一次
+    let recreated = false;
     if (offscreenBroken && cooldownOk()) await recreateOffscreen();
-    let res = await trySendOnce(msg);
-    // v2.2.3 补缺：自愈不能只看 Port 路径——命令走 sendMessage 返回上下文损坏时同样要重建重试
+    let res = await trySendOnce(msg, deadline);
     if (isFatalContextError(res) && cooldownOk()) {
         BPLLog.warn('bg', 'offscreen 上下文损坏（' + res.error + '），重建一次重试');
         BPLLog.flush();
         await recreateOffscreen();
-        res = await trySendOnce(msg);
+        recreated = true;
+        res = await trySendOnce(msg, deadline);
     }
-    // 成功或业务错误（如歌单为空）或重建后的最终结果：原样返回，不当通信失败
-    if (res && !(res.ok === false && res.error && /无响应/.test(res.error))) {
+    if (res && res._transport !== 'no-response') {
         offscreenFailCount = 0;
         return res;
     }
-    // 纯无响应/彻底失败
     offscreenFailCount++;
-    // v2.5.2 僵死自愈：文档活着、Port 看似连着但双通道全不通的状态没有自然出口——播放中的文档不会被
-    // 回收，后续命令只会一直超时。连续 3 次无响应即强制 close+重建一次（10s 冷却闸防踩踏），重试本条。
-    if (offscreenFailCount >= 3 && cooldownOk()) {
-        BPLLog.warn('bg', 'offscreen 连续 ' + offscreenFailCount + ' 次无响应，判定通道僵死，强制重建一次');
+    if (!recreated && cooldownOk() && deadline - Date.now() > 500) {
+        BPLLog.warn('bg', 'offscreen 双通道无响应，强制重建一次并重试本条命令');
         BPLLog.flush();
         await recreateOffscreen();
-        const retry = await trySendOnce(msg);
-        if (retry && !(retry.ok === false && retry.error && /无响应/.test(retry.error))) {
+        recreated = true;
+        const retry = await trySendOnce(msg, deadline);
+        if (retry && retry._transport !== 'no-response') {
             offscreenFailCount = 0;
             return retry;
         }
+        res = retry;
     }
     const diag = await readBootDiag();
     BPLLog.error('bg', 'offscreen 通信失败（累计 ' + offscreenFailCount + ' 次）：' + diag);
@@ -516,11 +587,17 @@ chrome.runtime.onConnect.addListener(port => {
             return;
         }
         const w = portWaiters[msg._id];
-        if (w) { delete portWaiters[msg._id]; w(msg.result); }
+        if (w) { w(msg); }
     });
     port.onDisconnect.addListener(() => {
-        if (offscreenPort === port) offscreenPort = null;
-        offscreenReady = false;
+        const wasActive = offscreenPort === port;
+        if (wasActive) {
+            offscreenPort = null;
+            offscreenReady = false;
+            Object.keys(portWaiters).forEach(id => {
+                try { portWaiters[id]({ disconnected: true }); } catch (_) {}
+            });
+        }
         BPLLog.warn('bg', 'offscreen Port 断开：bpl-audio');
     });
 });
@@ -858,7 +935,8 @@ function logSwStart(reason) {
 // Port 能连但每条命令报 reading 'local'）。升级后改为等首条命令在稳定时刻惰性创建。
 function prewarmOffscreen() { ensureOffscreen().catch(() => {}); }
 function runMigration(reason) {
-    migrate().catch(e => BPLLog.error('bg', '存储迁移失败(' + reason + ')：' + ((e && e.message) || e)));
+    migrate()
+        .catch(e => BPLLog.error('bg', '存储迁移失败(' + reason + ')：' + ((e && e.message) || e)));
 }
 chrome.runtime.onInstalled.addListener((d) => {
     logSwStart('installed' + ((d && d.reason) ? ':' + d.reason : ''));

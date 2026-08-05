@@ -9,17 +9,25 @@ function makeCtx(opts) {
     opts = opts || {};
     const store = opts.store || {};
     const resolveAudioRes = opts.resolveAudioRes || { ok: true, urls: ['https://cdn/audio.m4s'] };
+    let resolveAudioCalls = 0;
+    const resolveAudio = payload => {
+        resolveAudioCalls++;
+        return opts.resolveAudioResponder ? opts.resolveAudioResponder(payload, resolveAudioCalls) : resolveAudioRes;
+    };
     const playFailUrls = new Set(opts.playFailUrls || []);
+    const playNeverUrls = new Set(opts.playNeverUrls || []);
     const fetchFailUrls = new Set(opts.fetchFailUrls || []);
     const asyncErrorUrls = new Set(opts.asyncErrorUrls || []);   // play() 成功后异步触发 error（模拟 CDN 403）
     const audio = {
         paused: true, currentTime: 0, duration: 0, playbackRate: 1, volume: 1, muted: false,
-        error: null, networkState: 1, readyState: 0,
+        error: null, networkState: 1, readyState: 0, playCalls: 0,
         ls: {},
         _src: '',
         addEventListener(t, f) { (this.ls[t] = this.ls[t] || []).push(f); },
         removeEventListener(t, f) { const l = this.ls[t]; if (l) { const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); } },
         play() {
+            this.playCalls++;
+            if (playNeverUrls.has(this._src)) return new Promise(() => {});
             if (playFailUrls.has(this._src)) {
                 const e = new Error('The element has no supported sources.');
                 e.name = 'NotSupportedError';
@@ -51,7 +59,7 @@ function makeCtx(opts) {
             portSent.push(msg);
             if (msg && msg.resolveAudio) {
                 Promise.resolve().then(() => {
-                    handlers.forEach(fn => fn({ _id: msg._id, result: resolveAudioRes }));
+                    Promise.resolve(resolveAudio(msg.resolveAudio)).then(result => handlers.forEach(fn => fn({ _id: msg._id, result })));
                 });
             }
         },
@@ -72,7 +80,7 @@ function makeCtx(opts) {
             return undefined;
         }
         if (cb && payload && payload.resolveAudio) {
-            Promise.resolve().then(() => cb(resolveAudioRes));
+            Promise.resolve().then(() => Promise.resolve(resolveAudio(payload.resolveAudio)).then(cb));
             return undefined;
         }
         return Promise.resolve(undefined);
@@ -94,20 +102,42 @@ function makeCtx(opts) {
     // noStorage 变体：复刻现场 Edge——chrome.runtime 完好、chrome.storage 恒为 undefined。
     // offscreen 必须完全经 background 代理完成存储读写并照常播放。
     if (opts.noStorage) chromeObj.storage = undefined;
+    let timerSeq = 0;
+    const timers = new Map();
+    const fastSetTimeout = fn => {
+        const id = ++timerSeq;
+        const handle = setImmediate(() => {
+            if (!timers.has(id)) return;
+            timers.delete(id);
+            fn();
+        });
+        timers.set(id, handle);
+        return id;
+    };
+    const fastClearTimeout = id => {
+        const handle = timers.get(id);
+        if (handle) clearImmediate(handle);
+        timers.delete(id);
+    };
+    const windowHandlers = {};
     const sandbox = {
         console, Math, JSON, Promise, Date, URLSearchParams,
         // setImmediate 驱动：offscreen 的 playSettled 宽限计时需真实触发（忽略延时、立即排队）
-        setTimeout: (fn) => { setImmediate(fn); return 0; }, clearTimeout: () => {}, setInterval: () => 0,
+        setTimeout: fastSetTimeout, clearTimeout: fastClearTimeout, setInterval: () => 0,
         fetch: (url) => {
             if (fetchFailUrls.has(url)) return Promise.reject(new Error('fetch fail'));
             return Promise.resolve({ ok: true, blob: () => Promise.resolve({}) });
         },
         URL: { createObjectURL: () => 'blob:mock', revokeObjectURL: () => {} },
-        window: { addEventListener() {} },
+        window: {
+            addEventListener(type, fn) { (windowHandlers[type] = windowHandlers[type] || []).push(fn); },
+            dispatch(type) { (windowHandlers[type] || []).slice().forEach(fn => fn()); }
+        },
         navigator: {},
         document: { getElementById: () => audio },
         chrome: chromeObj,
         __audio: audio, __store: store,
+        __resolveAudioCalls: () => resolveAudioCalls,
         __port: port, __portSent: portSent, __sent: sent,
         __drive: (msg) => { handlers.forEach(fn => fn(msg)); },
         __driveMsg: (msg) => { msgListeners.forEach(fn => fn(msg)); }
@@ -262,17 +292,18 @@ async function testPort() {
     ctx.__drive({ _id: 42, cmd: 'setMode', mode: 'shuffle' });
     let resp = null;
     for (let i = 0; i < 20; i++) {
-        resp = ctx.__portSent.slice(before).find(m => m._id === 42);
+        resp = ctx.__portSent.slice(before).find(m => m._id === 42 && Object.prototype.hasOwnProperty.call(m, 'result'));
         if (resp) break;
         await new Promise(r => setTimeout(r, 5));
     }
     ok(resp && resp.result && resp.result.ok === true && (await ctx.pGetState()).mode === 'shuffle',
         'Port 命令→响应闭环（setMode）');
+    ok(ctx.__portSent.slice(before).some(m => m._id === 42 && m.ack === true), 'Port 收到命令后立即 ACK');
 
     ctx.__drive({ _id: 43, cmd: 'getStatus' });
     resp = null;
     for (let i = 0; i < 20; i++) {
-        resp = ctx.__portSent.slice(before).find(m => m._id === 43);
+        resp = ctx.__portSent.slice(before).find(m => m._id === 43 && Object.prototype.hasOwnProperty.call(m, 'result'));
         if (resp) break;
         await new Promise(r => setTimeout(r, 5));
     }
@@ -349,6 +380,81 @@ async function testResume() {
     ok(r.ok === true && ctx.__store.bpl_position === null && (await ctx.pGetState()).trackId === null, 'stop 清除断点和当前曲目身份');
 }
 
+async function testRecoveryAndCancellation() {
+    console.log('\n[offscreen 异步取消 / 请求去重 / 播放自恢复]');
+    const ticks = async n => { for (let i = 0; i < n; i++) await new Promise(resolve => setImmediate(resolve)); };
+
+    let releaseFirst;
+    let ctx = makeCtx({
+        store: setupPlaylist(2),
+        resolveAudioResponder: (payload, call) => call === 1
+            ? new Promise(resolve => { releaseFirst = resolve; })
+            : { ok: true, urls: ['https://cdn/newest.m4s'], cid: payload.cid }
+    });
+    const oldPlay = ctx.pPlayIndex(0);
+    while (!releaseFirst) await ticks(1);
+    const newest = await ctx.pPlayIndex(1);
+    releaseFirst({ ok: true, urls: ['https://cdn/stale.m4s'], cid: 100 });
+    const stale = await oldPlay;
+    ok(newest.ok === true && stale.cancelled === true && ctx.__audio.src === 'https://cdn/newest.m4s' && (await ctx.pGetState()).index === 1,
+        '新播放取消旧异步结果，旧音源不能晚到覆盖当前曲目');
+
+    ctx = makeCtx({ store: setupPlaylist(2) });
+    const sameRequest = { _requestId: 'same-play', cmd: 'playIndex', index: 0 };
+    const deduped = await Promise.all([ctx.runRequest(sameRequest), ctx.runRequest(Object.assign({}, sameRequest))]);
+    ok(deduped.every(x => x.ok) && ctx.__resolveAudioCalls() === 1 && ctx.__audio.playCalls === 1,
+        '同一 requestId 的并发/跨通道请求只执行一次');
+
+    ctx = makeCtx({
+        store: setupPlaylist(2),
+        resolveAudioRes: { ok: true, urls: ['https://cdn/hang.m4s', 'https://cdn/good.m4s'] },
+        playNeverUrls: ['https://cdn/hang.m4s'],
+        fetchFailUrls: ['https://cdn/hang.m4s']
+    });
+    const bounded = await ctx.pPlayIndex(0);
+    ok(bounded.ok === true && ctx.__audio.src === 'https://cdn/good.m4s', 'audio.play 永久挂起时在预算内切换下一音源');
+
+    let recoverMode = false;
+    ctx = makeCtx({
+        store: setupPlaylist(2),
+        resolveAudioResponder: () => recoverMode
+            ? { ok: true, urls: ['https://cdn/recovered.m4s'] }
+            : { ok: true, urls: ['https://cdn/initial.m4s'] }
+    });
+    await ctx.pPlayIndex(0);
+    recoverMode = true;
+    ctx.__audio.error = { code: 2, message: 'network' };
+    (ctx.__audio.ls.error || []).slice().forEach(fn => fn());
+    await ticks(30);
+    ok(ctx.__audio.src === 'https://cdn/recovered.m4s' && ctx.__resolveAudioCalls() >= 2,
+        '运行中 audio error 自动刷新音源并从断点恢复');
+
+    ctx = makeCtx({ store: setupPlaylist(2) });
+    await ctx.pPlayIndex(0);
+    const callsBeforeStall = ctx.__resolveAudioCalls();
+    (ctx.__audio.ls.stalled || []).slice().forEach(fn => fn());
+    (ctx.__audio.ls.playing || []).slice().forEach(fn => fn());
+    await ticks(10);
+    ok(ctx.__resolveAudioCalls() === callsBeforeStall,
+        '短暂 stalled 自行恢复后取消排队任务，不会无故重播');
+
+    let failRecovery = false;
+    ctx = makeCtx({
+        store: setupPlaylist(2),
+        resolveAudioResponder: () => failRecovery
+            ? { ok: false, error: '网络不可用' }
+            : { ok: true, urls: ['https://cdn/initial.m4s'] }
+    });
+    await ctx.pPlayIndex(0);
+    failRecovery = true;
+    ctx.__audio.error = { code: 2, message: 'offline' };
+    (ctx.__audio.ls.error || []).slice().forEach(fn => fn());
+    await ticks(80);
+    const playerError = ctx.__sent.find(m => m && m.cmd === 'relay' && m.data && m.data.type === 'playerError');
+    ok(ctx.__audio.src === '' && (await ctx.pGetState()).playing === false && !!playerError,
+        '自恢复最多重试三次，最终停止并广播可读错误');
+}
+
 (async () => {
     try {
         await testPlayIndex();
@@ -357,6 +463,7 @@ async function testResume() {
         await testPort();
         await testNoStorage();
         await testResume();
+        await testRecoveryAndCancellation();
     } catch (e) { console.error('测试执行异常:', e); fail++; }
     console.log('\n=================');
     console.log('通过: ' + pass + '  失败: ' + fail);

@@ -8,12 +8,14 @@ function ok(cond, msg) { if (cond) { pass++; console.log('  PASS: ' + msg); } el
 function makeCtx(opts) {
     opts = opts || {};
     let resp = {};
+    let fetchCalls = 0;
     const store = {};
     const clone = value => JSON.parse(JSON.stringify(value));
-    const off = { exists: false, createCalls: 0, closeCalls: 0 };
+    const off = { exists: false, createCalls: 0, closeCalls: 0, disconnectCalls: 0 };
     const offscreenResponder = opts.offscreenResponder || ((msg) => ({ ok: true, echoed: msg.cmd }));
     const connectHandlers = [];
     const portHandlers = [];
+    const disconnectHandlers = [];
     const portSent = [];
     const msgSent = [];
     const tabSent = [];
@@ -24,24 +26,50 @@ function makeCtx(opts) {
         postMessage(msg) {
             portSent.push(msg);
             if (msg._id != null && msg.cmd) {
+                if (!opts.noAck) Promise.resolve().then(() => portHandlers.forEach(fn => fn({ _id: msg._id, ack: true })));
                 Promise.resolve().then(() => {
                     const res = offscreenResponder(msg);
                     Promise.resolve(res).then(r => {
-                        portHandlers.forEach(fn => fn({ _id: msg._id, result: r }));
+                        if (r !== undefined) portHandlers.forEach(fn => fn({ _id: msg._id, result: r }));
                     });
                 });
             }
         },
         onMessage: { addListener: (fn) => portHandlers.push(fn) },
-        onDisconnect: { addListener() {} }
+        onDisconnect: { addListener: (fn) => disconnectHandlers.push(fn) },
+        disconnect() { off.disconnectCalls++; connected = false; disconnectHandlers.slice().forEach(fn => fn()); }
+    };
+    let timerSeq = 0;
+    const timers = new Map();
+    const fastSetTimeout = fn => {
+        const id = ++timerSeq;
+        const handle = setImmediate(() => {
+            if (!timers.has(id)) return;
+            timers.delete(id);
+            fn();
+        });
+        timers.set(id, handle);
+        return id;
+    };
+    const fastClearTimeout = id => {
+        const handle = timers.get(id);
+        if (handle) clearImmediate(handle);
+        timers.delete(id);
     };
     const sandbox = {
         console, Math, JSON, Promise, Date,
-        setTimeout: (fn) => { setImmediate(fn); return 0; }, clearTimeout: () => {},
-        fetch: (url) => Promise.resolve({
-            json: () => Promise.resolve(opts.fetchResponder ? opts.fetchResponder(url) : resp)
-        }),
+        setTimeout: opts.realTimers ? setTimeout : fastSetTimeout,
+        clearTimeout: opts.realTimers ? clearTimeout : fastClearTimeout,
+        fetch: (url) => {
+            fetchCalls++;
+            if (opts.fetchNever) return new Promise(() => {});
+            return Promise.resolve({
+                ok: true,
+                json: () => Promise.resolve(opts.fetchResponder ? opts.fetchResponder(url) : resp)
+            });
+        },
         __setResp: r => { resp = r; },
+        __fetchCalls: () => fetchCalls,
         __store: store,
         __off: off,
         __portSent: portSent,
@@ -145,6 +173,11 @@ function makeCtx(opts) {
     let threw = false;
     try { await ctx.getAudioUrls('BV1', 1); } catch (e) { threw = /需要登录|未获取到音频流/.test(e.message); }
     ok(threw, '接口错误抛异常');
+
+    ctx = makeCtx({ fetchNever: true });
+    threw = false;
+    try { await ctx.biliFetch('https://api.bilibili.com/hang'); } catch (e) { threw = /超时/.test(e.message); }
+    ok(threw && ctx.__fetchCalls() === 2, '网络永久挂起会超时并仅重试一次');
 
     console.log('\n[background resolveCid]');
     ctx = makeCtx();
@@ -356,13 +389,11 @@ function makeCtx(opts) {
     r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'getStatus' } }, null);
     ok(r.ok && r.hasTrack === true && r.position === 0, '断点曲目不符 → 推导位置归零');
 
-    // offscreen 无响应 → 返回带确切诊断的错误；关键回归：单次失败不再 close+重建踩踏
-    // （旧实现失败即关闭重建，2s 一轮把正在初始化的 offscreen.js 反复踩死，是本次故障元凶；
-    // 连续 3 次无响应的僵死自愈见下方 v2.5.2 段）
-    ctx = makeCtx({ offscreenResponder: () => undefined });
+    // 双通道均未 ACK/响应时，本条命令内重建一次；冷却闸阻止反复踩踏。
+    ctx = makeCtx({ offscreenResponder: () => undefined, noAck: true });
     r = await ctx.sendToOffscreen({ cmd: 'toggle' });
     ok(r.ok === false && /音频模块通信失败/.test(r.error), 'offscreen 无响应返回错误');
-    ok(ctx.__off.closeCalls === 0, '单次失败不关闭重建（去踩踏，closeCalls=' + ctx.__off.closeCalls + '）');
+    ok(ctx.__off.closeCalls === 1, '单次调用内有界重建一次（closeCalls=' + ctx.__off.closeCalls + '）');
 
     // 业务错误（如歌单为空）经 Port 原样返回、不重试
     ctx = makeCtx({ offscreenResponder: (msg) => ({ ok: false, error: '当前播放的歌单为空' }) });
@@ -457,43 +488,31 @@ function makeCtx(opts) {
     ok(r.ok === true && r.echoed === 'toggle' && ctx.__off.closeCalls === 1,
         'sendMessage 通道的上下文损坏也触发自愈重建（closeCalls=' + ctx.__off.closeCalls + '）');
 
-    console.log('\n[background v2.5.2 僵尸通道修复（D1 预算 / D2 保留 Port / D3 僵死自愈）]');
-    // D1：单条命令响应预算放宽到 15s，与面板/内容页一致。现场实证：4s 预算把用户机器 4.73s 的
-    // 冷启动 playIndex 误判为无响应，是僵尸按钮的起点。
+    console.log('\n[background 有界通信（分级预算 / ACK / 去重 requestId / 自愈）]');
     ctx = makeCtx();
-    ok(vm.runInContext('CMD_TIMEOUT_MS', ctx) === 15000, 'D1：单条命令响应预算放宽到 15s（与面板/内容页对齐）');
+    ok(vm.runInContext('LONG_CMD_TIMEOUT_MS', ctx) === 28000 && vm.runInContext('FAST_CMD_TIMEOUT_MS', ctx) === 7000,
+        '播放取源与快速控制使用不同响应预算');
 
-    // D2：Port 超时不再丢弃连接。offscreen 只在 onDisconnect 时重连、bg 从不主动 disconnect，
-    // 丢弃后 waitForPort 永远等不到新连接 → 文档活着但所有命令全死。现在保留连接、仅本条改走 sendMessage。
-    ctx = makeCtx({ offscreenResponder: () => undefined });
+    // 未 ACK 的 Port 主动断开；sendMessage 复用同一 requestId，offscreen 可据此去重。
+    ctx = makeCtx({ noAck: true, offscreenResponder: msg => msg.target === 'offscreen' ? { ok: true, echoed: msg.cmd } : undefined });
     r = await ctx.sendToOffscreen({ cmd: 'toggle' });
-    ok(r.ok === false && /音频模块通信失败/.test(r.error), 'D2：Port 超时本条降级 sendMessage，仍无响应则报错');
-    ok(ctx.__portSent.length === 1 && ctx.__msgSent.some(m => m.target === 'offscreen' && m.cmd === 'toggle'),
-        'D2：Port 尝试 + sendMessage 兜底各一次');
-    r = await ctx.sendToOffscreen({ cmd: 'next' });
-    ok(r.ok === false && ctx.__portSent.length === 2,
-        'D2：超时后 Port 保留，下条命令仍优先走 Port（v2.5.1 在此置空 → 永久僵尸）');
-    ok(ctx.__off.closeCalls === 0, 'D2：未达僵死阈值不重建（closeCalls=' + ctx.__off.closeCalls + '）');
+    const portReq = ctx.__portSent.find(m => m.cmd === 'toggle');
+    const msgReq = ctx.__msgSent.find(m => m.target === 'offscreen' && m.cmd === 'toggle');
+    ok(r.ok === true && ctx.__off.disconnectCalls === 1, '未 ACK 的陈旧 Port 立即断开并由消息通道恢复');
+    ok(portReq && msgReq && portReq._requestId === msgReq._requestId, '双通道复用稳定 requestId，避免重复执行');
 
-    // D3：连续 3 次双通道无响应 = 通道僵死（文档活着、Port 看似连着、命令全不通），此状态无自然出口
-    // （播放中的文档不会被回收）→ 强制重建一次并重试本条。重建后恢复者：第 3 条即成功。
-    ctx = makeCtx({ offscreenResponder: (msg) => (ctx.__off.closeCalls > 0 ? { ok: true, echoed: msg.cmd } : undefined) });
-    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
-    ok(r.ok === false && ctx.__off.closeCalls === 0, 'D3：第 1 次无响应只报错，不重建');
-    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
-    ok(r.ok === false && ctx.__off.closeCalls === 0, 'D3：第 2 次无响应仍不重建（未达阈值）');
-    r = await ctx.sendToOffscreen({ cmd: 'toggle' });
-    ok(r.ok === true && r.echoed === 'toggle' && ctx.__off.closeCalls === 1,
-        'D3：第 3 次无响应判定僵死 → 强制重建一次，重试本条成功');
-    ok(vm.runInContext('offscreenFailCount', ctx) === 0, 'D3：恢复成功后失败计数归零');
-    r = await ctx.sendToOffscreen({ cmd: 'next' });
-    ok(r.ok === true && ctx.__off.closeCalls === 1, 'D3：通道恢复后续命令正常，不再重建');
+    // 收到 ACK 后允许慢命令完成，不走第二通道。该真实延迟覆盖现场 4.73s 冷启动。
+    ctx = makeCtx({ realTimers: true, offscreenResponder: msg => new Promise(resolve => setTimeout(() => resolve({ ok: true, echoed: msg.cmd }), 4730)) });
+    const slowStarted = Date.now();
+    r = await ctx.sendToOffscreen({ cmd: 'playIndex' });
+    ok(r.ok === true && Date.now() - slowStarted >= 4700 && !ctx.__msgSent.some(m => m.target === 'offscreen'),
+        'Port ACK 后 4.73s 慢响应成功且不跨通道重发');
 
-    // D3 冷却闸：僵死未愈（重建后仍无响应）→ 10s 内至多重建一次，不退化成新一轮踩踏风暴
-    ctx = makeCtx({ offscreenResponder: () => undefined });
-    for (let k = 0; k < 6; k++) await ctx.sendToOffscreen({ cmd: 'toggle' });
+    // 持续僵死时 10s 冷却窗内至多重建一次。
+    ctx = makeCtx({ offscreenResponder: () => undefined, noAck: true });
+    for (let k = 0; k < 3; k++) await ctx.sendToOffscreen({ cmd: 'toggle' });
     ok(ctx.__off.closeCalls === 1 && ctx.__off.createCalls === 2,
-        'D3：6 次连续无响应仅重建一次（冷却闸防踩踏，closeCalls=' + ctx.__off.closeCalls + '）');
+        '连续无响应仅重建一次（冷却闸防踩踏，closeCalls=' + ctx.__off.closeCalls + '）');
 
     console.log('\n[background 存储代理（供无 chrome.storage 的 offscreen 使用）]');
     ctx = makeCtx();

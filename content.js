@@ -46,6 +46,7 @@
 
     // ===================== 音频播放（offscreen 唯一宿主，命令一律经后台转发，无兜底） =====================
     const PLAYER_CMDS = { toggle: 1, next: 1, prev: 1, playIndex: 1, seek: 1, getStatus: 1, stop: 1, setMode: 1, setVolume: 1, setMute: 1, getVolume: 1 };
+    const LONG_PLAYER_CMDS = { toggle: 1, next: 1, prev: 1, playIndex: 1 };
     let playerState = { playing: false, hasTrack: false, index: 0, mode: 'loop' };
     let loggedBridgeOrigin = false;
     let loggedBroadcast = false;
@@ -85,7 +86,7 @@
         });
     }
     // 命令路由：offscreen 是唯一音频宿主（按产品决策放弃一切兜底）。播放命令一律经后台转发给 offscreen 文档。
-    function handlePlayerCmd(payload) { return sendBgPlayer(payload, 15000); }
+    function handlePlayerCmd(payload) { return sendBgPlayer(payload, LONG_PLAYER_CMDS[payload && payload.cmd] ? 32000 : 10000); }
     // =================================================================================
 
     const PLAY_D = 'M8 5v14l11-7z';

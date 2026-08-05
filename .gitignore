@@ -19,3 +19,6 @@ npm-debug.log*
 
 # Chrome 加载扩展时生成的 declarativeNetRequest 规则缓存
 _metadata/
+
+# One-time local recovery snapshot; never publish personal playlists.
+recovery-playlists.json

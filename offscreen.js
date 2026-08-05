@@ -9,33 +9,44 @@ if (typeof BPLLog === 'undefined') {
 // manifest 声明）。对策：offscreen 不再直接碰 chrome.storage；本上下文有则用本地（Chrome 等
 // 正常环境），没有则把读写经 runtime 消息转发给 background（bg 的 chrome.storage 正常）。
 // offscreen 的职责收敛为“只持有 <audio>”。
+const REMOTE_STORAGE_TIMEOUT_MS = 4500;
 function remoteGet(keys) {
     return new Promise(res => {
-        let done = false;
-        const finish = v => { if (!done) { done = true; res(v); } };
+        let done = false, timer = null;
+        const finish = v => { if (!done) { done = true; if (timer) clearTimeout(timer); res(v); } };
         try {
             chrome.runtime.sendMessage({ target: 'bg', cmd: 'storageGet', keys: keys }, r => {
                 finish((r && r.ok && r.values) ? r.values : {});
             });
         } catch (e) { finish({}); }
-        setTimeout(() => finish({}), 4000);
+        timer = setTimeout(() => finish({}), REMOTE_STORAGE_TIMEOUT_MS);
     });
 }
 function remoteSet(data) {
     return new Promise(res => {
-        let done = false;
-        const finish = v => { if (!done) { done = true; res(v); } };
+        let done = false, timer = null;
+        const finish = v => { if (!done) { done = true; if (timer) clearTimeout(timer); res(v); } };
         try {
             chrome.runtime.sendMessage({ target: 'bg', cmd: 'storageSet', data: data }, r => {
                 finish(!!(r && r.ok));
             });
         } catch (e) { finish(false); }
-        setTimeout(() => finish(false), 4000);
+        timer = setTimeout(() => finish(false), REMOTE_STORAGE_TIMEOUT_MS);
     });
 }
 const remoteStore = { get: remoteGet, set: remoteSet, remove: () => Promise.resolve() };
 const hasLocalStore = (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local);
 const store = hasLocalStore ? chrome.storage.local : remoteStore;
+
+function runAsync(label, operation) {
+    try {
+        Promise.resolve(operation()).catch(error => {
+            BPLLog.error('off', label + '：' + String((error && error.message) || error));
+        });
+    } catch (error) {
+        BPLLog.error('off', label + '：' + String((error && error.message) || error));
+    }
+}
 
 BPLLog.info('off', 'offscreen.js 已加载' + (hasLocalStore ? '' : '（chrome.storage 缺失，存储经 background 代理）'));
 // 立即落盘两条证据：BPLLog 有 1s 节流，若文档被快速关闭会丢；这里直写存储确保留痕
@@ -64,6 +75,9 @@ if (!hasLocalStore) {
 // 命令通道也能在第一时间立起来，background 得以尽快感知 offscreen 存活。
 // （connectAudioPort/handleCmd 均为函数声明、已提升；port 在此先行初始化以避暂时性死区。）
 let port = null;
+const inflightRequests = new Map();
+const completedRequests = new Map();
+const COMPLETED_REQUEST_TTL_MS = 60000;
 connectAudioPort();
 
 const DEF_STATE = { playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' };
@@ -74,6 +88,11 @@ let curTrack = null;   // 当前曲身份 {bvid, cid}：断点落盘以此为键
 let shuffleOrder = [];
 let shufflePos = -1;
 let curBlobUrl = null;
+let recoveryTimer = null;
+let recoveryAttempts = 0;
+let recoveryRunning = false;
+let recoveryPending = false;
+let suppressRecoveryUntil = 0;
 
 // 诊断辅助：从 src 提取 host（测试环境 URL 可能非构造器，安全降级为截断字符串）
 function hostOf(u) {
@@ -160,8 +179,9 @@ function connectAudioPort() {
     BPLLog.info('off', '已连接音频通道(Port)');
     p.onMessage.addListener(msg => {
         if (!msg || msg._id == null) return;
+        try { p.postMessage({ _id: msg._id, ack: true }); } catch (_) {}
         if (msg.cmd) {
-            handleCmd(msg).then(res => {
+            runRequest(msg).then(res => {
                 try { p.postMessage({ _id: msg._id, result: res || { ok: true } }); } catch (e) {}
             }).catch(e => {
                 try { p.postMessage({ _id: msg._id, result: { ok: false, error: String((e && e.message) || e) } }); } catch (_) {}
@@ -176,6 +196,26 @@ function connectAudioPort() {
     });
 }
 
+function requestKey(msg) { return msg && (msg._requestId || msg._id); }
+function runRequest(msg) {
+    const key = requestKey(msg);
+    if (!key) return Promise.resolve(handleCmd(msg));
+    const now = Date.now();
+    for (const [id, entry] of completedRequests) if (now - entry.at > COMPLETED_REQUEST_TTL_MS) completedRequests.delete(id);
+    if (inflightRequests.has(key)) return inflightRequests.get(key);
+    if (completedRequests.has(key)) return Promise.resolve(completedRequests.get(key).value);
+    const task = Promise.resolve().then(() => handleCmd(msg)).then(value => {
+        inflightRequests.delete(key);
+        completedRequests.set(key, { at: Date.now(), value: value });
+        return value;
+    }, error => {
+        inflightRequests.delete(key);
+        throw error;
+    });
+    inflightRequests.set(key, task);
+    return task;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg) return;
     // 歌单数据变更：background 每次改歌单都会广播 {target:'all', type:'data'}。无 chrome.storage
@@ -184,7 +224,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === 'data' && Array.isArray(msg.playlists)) { onPlaylistsChanged(); return; }
     if (msg.target !== 'offscreen' || msg._id == null) return;
     if (msg.cmd) {
-        handleCmd(msg).then(res => {
+        runRequest(msg).then(res => {
             try { sendResponse(res || { ok: true }); } catch (e) {}
         }).catch(e => {
             try { sendResponse({ ok: false, error: String((e && e.message) || e) }); } catch (_) {}
@@ -210,7 +250,7 @@ function bgResolveAudio(it, playlistId) {
         } catch (e) {
             finish({ ok: false, error: String((e && e.message) || e) });
         }
-        setTimeout(() => finish({ ok: false, error: '获取音频失败（后台超时）' }), 8000);
+        setTimeout(() => finish({ ok: false, error: '获取音频失败（后台超时）' }), 22000);
     });
 }
 function pShuffled(count) {
@@ -236,19 +276,49 @@ function pIsShuffle(mode) { return mode === 'shuffle' || mode === 'shuffleLoop';
 // （如 CDN 403 触发 MEDIA_ERR_SRC_NOT_SUPPORTED）。仅凭 play() 的 resolve 会误判“已起播”，
 // 导致无声却跳过其余候选源。这里让 play() 与 'error' 竞速，并在 resolve 后给一段宽限再查 audio.error。
 const PLAY_GRACE_MS = 350;
-function playSettled(a) {
+const PLAY_TIMEOUT_MS = 4500;
+const BLOB_TIMEOUT_MS = 8000;
+const MAX_BLOB_BYTES = 64 * 1024 * 1024;
+const PLAY_TOTAL_TIMEOUT_MS = 25000;
+let playIntent = 0;
+let playAbortController = null;
+let playbackAttemptActive = 0;
+function newAbortController() { return (typeof AbortController !== 'undefined') ? new AbortController() : null; }
+function isCurrentPlay(token) { return token === playIntent; }
+function startPlayIntent() {
+    if (playAbortController) { try { playAbortController.abort(); } catch (_) {} }
+    playAbortController = newAbortController();
+    return { id: ++playIntent, signal: playAbortController && playAbortController.signal };
+}
+function cancelPlayIntent() {
+    ++playIntent;
+    if (playAbortController) { try { playAbortController.abort(); } catch (_) {} }
+    playAbortController = null;
+}
+function playSettled(a, timeout, signal) {
     return new Promise(resolve => {
         let settled = false, timer = null;
         const finish = v => {
             if (settled) return;
             settled = true;
             try { a.removeEventListener('error', onErr); } catch (_) {}
+            if (signal) { try { signal.removeEventListener('abort', onAbort); } catch (_) {} }
             if (timer) clearTimeout(timer);
             resolve(v);
         };
         const onErr = () => finish({ ok: false, mediaError: (a.error && a.error.code) || 0 });
+        const onAbort = () => finish({ ok: false, cancelled: true });
         try { a.addEventListener('error', onErr); } catch (_) {}
-        a.play().then(() => {
+        if (signal) {
+            if (signal.aborted) { onAbort(); return; }
+            try { signal.addEventListener('abort', onAbort, { once: true }); } catch (_) {}
+        }
+        timer = setTimeout(() => { const error = new Error('音频播放超时'); error.name = 'TimeoutError'; finish({ ok: false, playError: error }); }, Math.max(1, timeout || PLAY_TIMEOUT_MS));
+        let playPromise;
+        try { playPromise = a.play(); } catch (error) { finish({ ok: false, playError: error }); return; }
+        Promise.resolve(playPromise).then(() => {
+            if (settled) return;
+            if (timer) clearTimeout(timer);
             timer = setTimeout(() => {
                 if (a.error) finish({ ok: false, mediaError: a.error.code || 0 });
                 else finish({ ok: true });
@@ -256,10 +326,74 @@ function playSettled(a) {
         }).catch(e => finish({ ok: false, playError: e }));
     });
 }
-async function tryPlayUrl(url) {
+function fetchMedia(url, timeout, parentSignal) {
+    const controller = newAbortController();
+    let timer = null, abortHandler = null;
+    const request = (() => {
+        const options = { credentials: 'include' };
+        if (controller) options.signal = controller.signal;
+        return Promise.resolve(fetch(url, options));
+    })();
+    const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => {
+            if (controller) { try { controller.abort(); } catch (_) {} }
+            const error = new Error('音频网络请求超时'); error.name = 'TimeoutError'; reject(error);
+        }, Math.max(1, timeout));
+    });
+    const parentPromise = parentSignal ? new Promise((_, reject) => {
+        abortHandler = () => {
+            if (controller) { try { controller.abort(); } catch (_) {} }
+            const error = new Error('播放请求已取消'); error.name = 'AbortError'; reject(error);
+        };
+        if (parentSignal.aborted) abortHandler();
+        else { try { parentSignal.addEventListener('abort', abortHandler, { once: true }); } catch (_) {} }
+    }) : null;
+    return Promise.race([request, timeoutPromise, parentPromise].filter(Boolean)).finally(() => {
+        if (timer) clearTimeout(timer);
+        if (abortHandler && parentSignal) { try { parentSignal.removeEventListener('abort', abortHandler); } catch (_) {} }
+    });
+}
+function promiseWithTimeout(promise, timeout, message) {
+    return new Promise((resolve, reject) => {
+        let settled = false, timer = null;
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            fn(value);
+        };
+        timer = setTimeout(() => finish(reject, new Error(message || '操作超时')), Math.max(1, timeout));
+        Promise.resolve(promise).then(value => finish(resolve, value), error => finish(reject, error));
+    });
+}
+async function readLimitedBlob(response, deadline) {
+    const declared = Number(response && response.headers && response.headers.get && response.headers.get('content-length')) || 0;
+    if (declared > MAX_BLOB_BYTES) throw new Error('音频文件过大');
+    if (response && response.body && response.body.getReader && typeof Blob !== 'undefined') {
+        const reader = response.body.getReader();
+        const chunks = [];
+        let total = 0;
+        while (true) {
+            const part = await promiseWithTimeout(reader.read(), deadline - Date.now(), '读取音频数据超时');
+            if (part.done) break;
+            total += part.value ? part.value.byteLength : 0;
+            if (total > MAX_BLOB_BYTES) { try { reader.cancel(); } catch (_) {} throw new Error('音频文件过大'); }
+            chunks.push(part.value);
+        }
+        return new Blob(chunks, { type: (response.headers && response.headers.get && response.headers.get('content-type')) || 'audio/mp4' });
+    }
+    const blob = await promiseWithTimeout(response.blob(), deadline - Date.now(), '读取音频数据超时');
+    if (blob && blob.size > MAX_BLOB_BYTES) throw new Error('音频文件过大');
+    return blob;
+}
+async function tryPlayUrl(url, token, deadline) {
+    if (!isCurrentPlay(token)) return { cancelled: true };
     const host = hostOf(url);
     audio.src = url;
-    const res = await playSettled(audio);
+    playbackAttemptActive++;
+    const res = await playSettled(audio, Math.min(PLAY_TIMEOUT_MS, Math.max(1, deadline - Date.now())), playAbortController && playAbortController.signal);
+    playbackAttemptActive--;
+    if (res.cancelled || !isCurrentPlay(token)) return { cancelled: true };
     if (res.ok) {
         BPLLog.info('off', '直接播放成功：' + host);
         return { ok: true };
@@ -272,13 +406,22 @@ async function tryPlayUrl(url) {
         : ((res.playError && res.playError.name) || '未知');
     BPLLog.warn('off', '直接播放失败(' + why + ')，转 fetch+blob：' + host);
     try {
-        const resp = await fetch(url, { credentials: 'include' });
+        const remaining = deadline - Date.now();
+        if (remaining <= 0 || !isCurrentPlay(token)) return { cancelled: true };
+        const blobDeadline = Math.min(deadline, Date.now() + BLOB_TIMEOUT_MS);
+        const resp = await fetchMedia(url, blobDeadline - Date.now(), playAbortController && playAbortController.signal);
         if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const blob = await resp.blob();
+        const blob = await readLimitedBlob(resp, blobDeadline);
+        if (!isCurrentPlay(token)) return { cancelled: true };
+        const nextBlobUrl = URL.createObjectURL(blob);
+        if (!isCurrentPlay(token)) { URL.revokeObjectURL(nextBlobUrl); return { cancelled: true }; }
         if (curBlobUrl) URL.revokeObjectURL(curBlobUrl);
-        curBlobUrl = URL.createObjectURL(blob);
+        curBlobUrl = nextBlobUrl;
         audio.src = curBlobUrl;
-        const res2 = await playSettled(audio);
+        playbackAttemptActive++;
+        const res2 = await playSettled(audio, Math.min(PLAY_TIMEOUT_MS, Math.max(1, deadline - Date.now())), playAbortController && playAbortController.signal);
+        playbackAttemptActive--;
+        if (res2.cancelled || !isCurrentPlay(token)) return { cancelled: true };
         if (res2.ok) {
             BPLLog.info('off', 'fetch+blob 兜底播放成功：' + host);
             return { ok: true };
@@ -303,8 +446,18 @@ async function tryPlayUrl(url) {
 
 // savedPos：可选断点 {bvid, cid, position}——仅 toggle 从空音频起播时传入（回收后续播），
 // 身份匹配才 seek 回去；显式点歌/切歌一律不传，从头播。
-async function pPlayIndex(i, keepOrder, savedPos, playlistId) {
+async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
+    const isRecovery = !!(options && options.recovery);
+    if (!isRecovery) {
+        recoveryPending = false;
+        recoveryAttempts = 0;
+        if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
+    }
+    suppressRecoveryUntil = Date.now() + 1200;
+    const intent = startPlayIntent();
+    const deadline = Date.now() + PLAY_TOTAL_TIMEOUT_MS;
     const st = await pGetState();
+    if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
     const targetPlaylistId = playlistId || st.playlistId;
     const items = await pGetItems(targetPlaylistId);
     if (!items.length) return { ok: false, error: '当前播放的歌单为空' };
@@ -312,6 +465,7 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId) {
     if (pIsShuffle(st.mode) && !keepOrder) pBuildFrom(items.length, i);
     const it = items[i];
     const r = await bgResolveAudio(it, targetPlaylistId);
+    if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
     if (!r || !r.ok || !r.urls || !r.urls.length) {
         BPLLog.error('off', 'resolveAudio 失败[' + it.bvid + ']：' + ((r && r.error) || '无候选（取音源模块无有效应答）'));
         BPLLog.flush();
@@ -320,7 +474,9 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId) {
     BPLLog.info('off', 'resolveAudio 返回 ' + r.urls.length + ' 个候选[' + it.bvid + '，' + (it.title || '') + ']');
     let blocked = false;
     for (let si = 0; si < r.urls.length; si++) {
-        const res = await tryPlayUrl(r.urls[si]);
+        if (Date.now() >= deadline) break;
+        const res = await tryPlayUrl(r.urls[si], intent.id, deadline);
+        if (res.cancelled || !isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
         if (res.ok) {
             BPLLog.info('off', '第 ' + (si + 1) + '/' + r.urls.length + ' 源播放成功[' + it.bvid + ']');
             curIndex = i;
@@ -333,10 +489,12 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId) {
             setupMediaSession(it);
             await pSetState({ playlistId: targetPlaylistId, trackId: it.id || null, index: i, playing: true });
             persistPosition(resumeAt);
+            suppressRecoveryUntil = 0;
             return { ok: true };
         }
         if (res.blocked) { blocked = true; break; }
     }
+    if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
     audio.removeAttribute('src');
     audio.load();
     broadcastState(await pGetState());
@@ -350,6 +508,10 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId) {
     };
 }
 async function pStopPlayback() {
+    recoveryPending = false;
+    recoveryAttempts = 0;
+    if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
+    cancelPlayIntent();
     curTrack = null;
     audio.pause();
     audio.removeAttribute('src');
@@ -402,11 +564,18 @@ async function pToggle() {
             const savedPos = (await store.get('bpl_position')).bpl_position;
             return await pPlayIndex(st.index, false, savedPos);
         }
-        try { await audio.play(); } catch (e) {
-            return { ok: false, error: '浏览器阻止了自动播放：请先点一下页面或浮动按钮再试' };
-        }
+        const intent = startPlayIntent();
+        playbackAttemptActive++;
+        const resumed = await playSettled(audio, PLAY_TIMEOUT_MS, playAbortController && playAbortController.signal);
+        playbackAttemptActive--;
+        if (!isCurrentPlay(intent.id) || resumed.cancelled) return { ok: true, cancelled: true };
+        if (!resumed.ok) return { ok: false, error: (resumed.playError && resumed.playError.name === 'NotAllowedError')
+            ? '浏览器阻止了自动播放：请先点一下页面或浮动按钮再试' : '恢复播放超时，请稍后重试' };
         await pSetState({ playing: true });
     } else {
+        recoveryPending = false;
+        if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
+        cancelPlayIntent();
         audio.pause();
         await pSetState({ playing: false });
     }
@@ -424,35 +593,103 @@ function setupMediaSession(it) {
         });
         // 系统媒体键“播放”：音频为空（文档曾被回收）时走 toggle 的断点续播路径
         navigator.mediaSession.setActionHandler('play', () => {
-            if (!audio.src) pToggle();
-            else audio.play().catch(() => {});
+            if (audio.paused) runAsync('系统媒体键播放失败', () => pToggle());
         });
-        navigator.mediaSession.setActionHandler('pause', () => { audio.pause(); });
-        navigator.mediaSession.setActionHandler('previoustrack', () => { pPrev(); });
-        navigator.mediaSession.setActionHandler('nexttrack', () => { pNext(); });
+        navigator.mediaSession.setActionHandler('pause', () => {
+            if (!audio.paused) runAsync('系统媒体键暂停失败', () => pToggle());
+        });
+        navigator.mediaSession.setActionHandler('previoustrack', () => runAsync('系统媒体键上一首失败', () => pPrev()));
+        navigator.mediaSession.setActionHandler('nexttrack', () => runAsync('系统媒体键下一首失败', () => pNext()));
     } catch (e) {}
 }
 
-audio.addEventListener('ended', async () => {
-    const st = await pGetState();
-    if (st.mode === 'one') {
-        audio.currentTime = 0;
-        try { await audio.play(); } catch (e) {}
-        await pSetState({ playing: true });
-    } else {
-        pAdvance();
+function broadcastPlayerError(error, reason) {
+    relayBroadcast({ type: 'playerError', error: String(error || '音频播放失败'), reason: reason || 'network' });
+}
+function scheduleRecovery(reason, delay) {
+    if (!curTrack || !audio.src || playbackAttemptActive || recoveryRunning) return;
+    recoveryPending = true;
+    if (recoveryTimer) clearTimeout(recoveryTimer);
+    recoveryTimer = setTimeout(() => {
+        recoveryTimer = null;
+        recoverPlayback(reason);
+    }, Math.max(0, delay == null ? 1200 : delay));
+}
+async function recoverPlayback(reason) {
+    if (!recoveryPending || recoveryRunning || !curTrack || !audio.src) return;
+    recoveryRunning = true;
+    recoveryAttempts++;
+    const track = Object.assign({}, curTrack);
+    const index = curIndex;
+    let result;
+    try {
+        const st = await pGetState();
+        result = await pPlayIndex(index, true, {
+            trackId: track.id,
+            bvid: track.bvid,
+            cid: track.cid,
+            position: audio.currentTime || 0
+        }, st.playlistId, { recovery: true });
+    } catch (error) {
+        result = { ok: false, error: String((error && error.message) || error) };
     }
+    recoveryRunning = false;
+    if (result && result.ok && !result.cancelled) {
+        recoveryAttempts = 0;
+        recoveryPending = false;
+        BPLLog.info('off', '音频自恢复成功：' + reason);
+        return;
+    }
+    if (!recoveryPending) return;
+    if (recoveryAttempts < 3 && curTrack) {
+        const backoff = [1000, 3000, 7000][recoveryAttempts - 1] || 7000;
+        scheduleRecovery(reason + '（重试）', backoff);
+        return;
+    }
+    recoveryPending = false;
+    recoveryAttempts = 0;
+    await pStopPlayback();
+    const message = (result && result.error) || '网络异常，音频无法恢复';
+    BPLLog.error('off', '音频自恢复失败：' + message);
+    BPLLog.flush();
+    broadcastPlayerError(message, reason);
+}
+
+audio.addEventListener('ended', () => {
+    runAsync('自动切歌失败', async () => {
+        const st = await pGetState();
+        if (st.mode === 'one') {
+            audio.currentTime = 0;
+            const intent = startPlayIntent();
+            playbackAttemptActive++;
+            const result = await playSettled(audio, PLAY_TIMEOUT_MS, playAbortController && playAbortController.signal);
+            playbackAttemptActive--;
+            if (result.ok && isCurrentPlay(intent.id)) await pSetState({ playing: true });
+            else if (!result.cancelled) scheduleRecovery('repeat playback failed', 800);
+        } else {
+            await pAdvance();
+        }
+    });
 });
 audio.addEventListener('play', () => {
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-    pSetState({ playing: true });
+    runAsync('播放状态同步失败', () => pSetState({ playing: true }));
+});
+audio.addEventListener('playing', () => {
+    // 短暂 stalled 后若媒体自行恢复，不再让旧定时器重新解析并打断正常播放。
+    if (recoveryPending && !recoveryRunning) {
+        recoveryPending = false;
+        recoveryAttempts = 0;
+        if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
+        BPLLog.info('off', '音频已自行恢复，取消排队中的自恢复任务');
+    }
 });
 audio.addEventListener('pause', () => {
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
     // 任何暂停路径（面板按钮/MediaSession/系统键）都落断点——这正是文档被回收前的最后一笔。
     // stop 会先同步清掉 curTrack，故其后触发的本事件不会误写（断点清除优先）。
     persistPosition(audio.currentTime || 0);
-    pSetState({ playing: false });
+    runAsync('暂停状态同步失败', () => pSetState({ playing: false }));
 });
 // 关键诊断：play() 可能先 resolve、随后由 error 事件异步失败（如 CDN 403/解码错），
 // 此处把 MediaError code、src、网络/就绪状态全部记下，专治“无法播放音源”查无对证
@@ -465,16 +702,23 @@ audio.addEventListener('error', () => {
         ' networkState=' + (NET_STATE[audio.networkState] != null ? NET_STATE[audio.networkState] : audio.networkState) +
         ' readyState=' + (READY_STATE[audio.readyState] != null ? READY_STATE[audio.readyState] : audio.readyState));
     BPLLog.flush();
+    if (!playbackAttemptActive && Date.now() >= suppressRecoveryUntil) scheduleRecovery('audio error', 800);
 });
 audio.addEventListener('stalled', () => {
     BPLLog.warn('off', 'audio stalled（取流停滞）：src=' + hostOf(audio.src) +
         ' networkState=' + (NET_STATE[audio.networkState] != null ? NET_STATE[audio.networkState] : audio.networkState));
+    if (!playbackAttemptActive && Date.now() >= suppressRecoveryUntil) scheduleRecovery('audio stalled', 8000);
 });
+if (typeof window !== 'undefined' && window.addEventListener) {
+    window.addEventListener('online', () => {
+        if (recoveryPending) scheduleRecovery('network online', 0);
+    });
+}
 
 store.get(['bpl_volume', 'bpl_mute']).then(r => {
     if (typeof r.bpl_volume === 'number') audio.volume = Math.max(0, Math.min(1, r.bpl_volume));
     if (typeof r.bpl_mute === 'boolean') audio.muted = r.bpl_mute;
-});
+}).catch(error => BPLLog.error('off', '恢复音量设置失败：' + String((error && error.message) || error)));
 
 let progTick = 0;
 setInterval(() => {
@@ -509,7 +753,7 @@ function onPlaylistsChanged() {
         if (audio.src && (!items.length || !currentExists)) {
             pStopPlayback();
         }
-    });
+    }).catch(error => BPLLog.error('off', '处理歌单变更失败：' + String((error && error.message) || error)));
 }
 // 无 chrome.storage 的环境没有 onChanged：改由上面的 'data' 广播驱动（background 每次改单都会广播）
 if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {
@@ -554,7 +798,8 @@ async function handleCmd(msg) {
     }
 }
 
-pGetState().then(st => broadcastState(st));
+pGetState().then(st => broadcastState(st))
+    .catch(error => BPLLog.error('off', '初始化播放状态失败：' + String((error && error.message) || error)));
 
 window.addEventListener('error', e => {
     BPLLog.error('off', 'offscreen 脚本错误：' + ((e && e.message) || e));

@@ -35,21 +35,6 @@
             <select id="plSelect" title="切换歌单"></select>
             <button id="plNew" class="pbtn" title="新建歌单">＋</button>
             <button id="plMenuBtn" class="pbtn" title="歌单操作">⋯</button>
-            <div id="plMenu" class="menu hidden">
-                <div data-act="rename">重命名歌单</div>
-                <div data-act="import">导入歌单 (JSON)</div>
-                <div class="sep"></div>
-                <div data-act="export-txt">导出为 TXT</div>
-                <div data-act="export-md">导出为 Markdown</div>
-                <div data-act="export-json">导出为 JSON</div>
-                <div class="sep"></div>
-                <div data-act="clear">清空歌单</div>
-                <div data-act="delete" class="danger">删除歌单</div>
-                <div class="sep"></div>
-                <div data-act="log">查看运行日志</div>
-                <div data-act="log-export">导出日志 (TXT)</div>
-                <div data-act="log-clear">清空日志</div>
-            </div>
         </div>
         <input type="file" id="importFile" accept=".json,application/json" style="display:none">
         <div class="selbar hidden" id="selBar">
@@ -63,6 +48,22 @@
             <div class="sel-menu hidden" id="selMenu"></div>
         </div>
         <div id="list" class="list"></div>
+    </div>
+
+    <div id="plMenu" class="menu hidden">
+        <div data-act="rename">重命名歌单</div>
+        <div data-act="import">导入歌单 (JSON)</div>
+        <div class="sep"></div>
+        <div data-act="export-txt">导出为 TXT</div>
+        <div data-act="export-md">导出为 Markdown</div>
+        <div data-act="export-json">导出为 JSON</div>
+        <div class="sep"></div>
+        <div data-act="clear">清空歌单</div>
+        <div data-act="delete" class="danger">删除歌单</div>
+        <div class="sep"></div>
+        <div data-act="log">查看运行日志</div>
+        <div data-act="log-export">导出日志 (TXT)</div>
+        <div data-act="log-clear">清空日志</div>
     </div>
 
     <div id="coverPop"><img id="coverPopImg" alt=""></div>

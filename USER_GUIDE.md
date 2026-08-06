@@ -8,7 +8,7 @@
 
 ## 安装
 
-1. 从 GitHub Releases 下载 `bilibili-music-player-v2.5.2.zip`，不要下载名称为 `Source code` 的自动源码包。
+1. 从 GitHub Releases 下载 `bilibili-music-player-v2.5.3.zip`，不要下载名称为 `Source code` 的自动源码包。
 2. 将 ZIP 解压到一个准备长期保留的目录。
 3. Chrome 打开 `chrome://extensions/`；Edge 打开 `edge://extensions/`。
 4. 开启“开发者模式”，点击“加载已解压的扩展程序”。

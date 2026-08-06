@@ -59,8 +59,14 @@ ok([glass, clear].every(theme => theme.vars['--bpl-list-bg'] === 'transparent' &
 const contentCode = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
 const sidepanelCode = fs.readFileSync(path.join(__dirname, '..', 'sidepanel.js'), 'utf8');
 const sidepanelCss = fs.readFileSync(path.join(__dirname, '..', 'sidepanel.css'), 'utf8');
+const sidepanelHtml = fs.readFileSync(path.join(__dirname, '..', 'sidepanel.html'), 'utf8');
 ok(/bplBridge:\s*'theme'/.test(contentCode) && /bplBridge === 'theme'/.test(sidepanelCode),
     '外壳直接同步主题到播放列表 iframe');
+const listwrapStart = sidepanelHtml.indexOf('<div class="listwrap">');
+const listwrapEnd = sidepanelHtml.indexOf('\n    </div>', listwrapStart);
+const playlistMenu = sidepanelHtml.indexOf('<div id="plMenu"');
+ok(listwrapStart >= 0 && listwrapEnd > listwrapStart && playlistMenu > listwrapEnd,
+    '歌单菜单是 listwrap 外的视口级浮层，不受播放器层叠上下文限制');
 ok(contentCode.includes("THEME_PICKER_ORDER = ['paper', 'gold', 'jade', 'starry'") &&
     contentCode.includes('.theme-picker.open .theme-swatches{max-width:112px') &&
     contentCode.includes('.theme-swatch{appearance:none;flex:none;width:16px;height:16px') &&
@@ -78,7 +84,7 @@ ok(contentCode.includes("THEME_PICKER_ORDER = ['paper', 'gold', 'jade', 'starry'
 ok(/function volumeIcon\(v, muted\)/.test(sidepanelCode) &&
     /muteBtn\.innerHTML = volumeIcon\(v, muted\)/.test(sidepanelCode) &&
     !/[🔇🔉🔊]/u.test(sidepanelCode) &&
-    /id="muteBtn"[^>]*><svg[^>]*stroke="currentColor"/.test(fs.readFileSync(path.join(__dirname, '..', 'sidepanel.html'), 'utf8')) &&
+    /id="muteBtn"[^>]*><svg[^>]*stroke="currentColor"/.test(sidepanelHtml) &&
     /\.vbtn\s*\{[\s\S]*?color: var\(--bpl-muted\)/.test(sidepanelCss),
     '音量图标使用 currentColor SVG 并随主题着色');
 

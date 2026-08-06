@@ -2,6 +2,14 @@
 
 本文件记录项目自首次公开发布以来的重要用户可见变化。公开前的内部迭代保留在 Git 提交历史中，不再作为正式版本逐项列出。
 
+## [2.5.3] - 2026-08-06
+
+### 修复
+
+- 修复面板高度较小时，歌单操作菜单向上展开后被播放器遮挡且无法交互的问题。
+- 将歌单操作菜单提升为视口级浮层，避免受播放列表层叠上下文及玻璃主题工具栏滤镜影响。
+- 增加菜单 DOM 层级回归检查，自动化测试增至 164 项。
+
 ## [2.5.2] - 2026-08-05
 
 ### 修复
@@ -28,5 +36,6 @@
 - 建立包含 146 项断言的自动化测试与 GitHub Actions CI。
 - 采用 GNU GPL v3.0 或更高版本开源。
 
+[2.5.3]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.5.3
 [2.5.2]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.5.2
 [2.5.1]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.5.1

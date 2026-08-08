@@ -19,22 +19,26 @@ if ((Split-Path $releaseDir -Leaf) -ne 'bilibili-music-player' -or
 if ($LASTEXITCODE -ne 0) { throw 'Syntax checks or tests failed' }
 
 $packageFiles = @(
-    'background.js',
-    'content.js',
+    'src/background/background.js',
+    'src/content/content.js',
     'LICENSE',
-    'logger.js',
+    'src/shared/logger.js',
     'manifest.json',
-    'offscreen-boot.js',
-    'offscreen.html',
-    'offscreen.js',
-    'rules.json',
-    'sidepanel.css',
-    'sidepanel.html',
-    'sidepanel.js',
-    'theme.js',
-    'USER_GUIDE.md'
+    'src/player/offscreen-boot.js',
+    'src/player/offscreen.html',
+    'src/player/offscreen.js',
+    'src/network/rules.json',
+    'src/rename/renamer.js',
+    'src/rename/rules.json',
+    'src/panel/sidepanel.css',
+    'src/panel/sidepanel.html',
+    'src/panel/sidepanel.js',
+    'src/shared/theme.js',
+    'docs/user-guide.md',
+    'assets/icons/icon16.png',
+    'assets/icons/icon48.png',
+    'assets/icons/icon128.png'
 )
-$iconFiles = @('icon16.png', 'icon48.png', 'icon128.png')
 
 $manifest = Get-Content (Join-Path $projectRoot 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 if (-not $manifest.version) { throw 'manifest.json has no version' }
@@ -44,16 +48,13 @@ New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
 if (Test-Path -LiteralPath $releaseDir) {
     Remove-Item -LiteralPath $releaseDir -Recurse -Force
 }
-New-Item -ItemType Directory -Force -Path (Join-Path $releaseDir 'icons') | Out-Null
-
 foreach ($file in $packageFiles) {
-    Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination (Join-Path $releaseDir $file)
-}
-foreach ($file in $iconFiles) {
-    Copy-Item -LiteralPath (Join-Path $projectRoot (Join-Path 'icons' $file)) -Destination (Join-Path $releaseDir (Join-Path 'icons' $file))
+    $destination = Join-Path $releaseDir $file
+    New-Item -ItemType Directory -Force -Path (Split-Path $destination -Parent) | Out-Null
+    Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination $destination
 }
 
-$packagedFiles = $packageFiles + ($iconFiles | ForEach-Object { Join-Path 'icons' $_ })
+$packagedFiles = $packageFiles
 foreach ($file in $packagedFiles) {
     $sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $projectRoot $file)).Hash
     $releaseHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir $file)).Hash

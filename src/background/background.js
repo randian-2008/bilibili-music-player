@@ -1,5 +1,6 @@
 // 日志：Service Worker 经 importScripts 载入共享 logger；测试/异常环境下用空实现兜底
-if (typeof importScripts === 'function') { try { importScripts('logger.js'); } catch (_) {} }
+if (typeof importScripts === 'function') { try { importScripts('../shared/logger.js'); } catch (_) {} }
+if (typeof importScripts === 'function') { try { importScripts('../rename/renamer.js'); } catch (_) {} }
 if (typeof BPLLog === 'undefined') {
     globalThis.BPLLog = { info() {}, log() {}, warn() {}, error() {}, flush() {}, recent() { return []; } };
 }
@@ -162,6 +163,7 @@ function addCollectionItem(items, seen, item) {
         bvid: bvid,
         cid: cid,
         title: String(item.title || bvid),
+        renameTitle: String(item.renameTitle || item.title || bvid),
         pic: normUrl(item.pic),
         owner: String(item.owner || ''),
         duration: Number(item.duration) || 0,
@@ -179,6 +181,12 @@ function collectionItemTitle(episodeTitle, part, nested, fallback) {
     if (episode && pagePart && episode !== pagePart) return episode + ' · ' + pagePart;
     return pagePart || episode || String(fallback || '未命名视频');
 }
+function collectionRenameTitle(episodeTitle, part, nested, fallback) {
+    const episode = String(episodeTitle || '').trim();
+    const pagePart = String(part || '').trim();
+    if (!episode || !pagePart || episode === pagePart) return pagePart || episode || String(fallback || '未命名视频');
+    return episode + (nested ? ' · ' : ' | ') + pagePart;
+}
 function mapCollection(data, bvid) {
     const items = [], seen = new Set();
     const season = data && data.ugc_season;
@@ -194,6 +202,7 @@ function mapCollection(data, bvid) {
                         bvid: episode.bvid,
                         cid: page.cid || episode.cid,
                         title: collectionItemTitle(episode.title, page.part, pages.length > 1, episode.bvid || bvid),
+                        renameTitle: collectionRenameTitle(episode.title, page.part, pages.length > 1, episode.bvid || bvid),
                         pic: arc.pic || episode.pic || season.cover,
                         owner: owner || '',
                         duration: page.duration || arc.duration || episode.duration,
@@ -402,7 +411,7 @@ async function migrate() {
         let legacyList = false;
         if (!lists) {
             const id = genId();
-            lists = [{ id, name: '默认歌单', items: r.bpl_list || [] }];
+            lists = [{ id, name: '默认播放列表', items: r.bpl_list || [] }];
             activeId = id;
             legacyList = true;
         }
@@ -445,13 +454,13 @@ async function ensureDefaultPlaylist() {
         return lists;
     }
     const id = genId();
-    const pls = [{ id, name: '默认歌单', items: [] }];
+    const pls = [{ id, name: '默认播放列表', items: [] }];
     await savePlaylists(pls);
     await setActiveId(id);
     return pls;
 }
 
-const OFFSCREEN_PATH = 'offscreen.html';
+const OFFSCREEN_PATH = 'src/player/offscreen.html';
 let creating = null;
 let offscreenPort = null;
 let offscreenReady = false;
@@ -631,7 +640,7 @@ function sendToOffscreen(msg) {
 }
 // 识别“offscreen 上下文损坏”的错误签名：chrome.runtime 在、chrome.storage 未绑定（多见于升级
 // installed:update 瞬间建出的半残文档），或上下文整体失效。这类错误重建一次即可恢复，区别于
-// 业务错误（如歌单为空，原样返回）与单纯无响应（走诊断路径）。
+// 业务错误（如播放列表为空，原样返回）与单纯无响应（走诊断路径）。
 function isFatalContextError(r) {
     return !!(r && r.ok === false && r.error &&
         /Cannot read properties of undefined|Extension context invalidated|上下文失效|chrome\.storage/.test(r.error));
@@ -811,37 +820,50 @@ async function handleBg(msg, sender, mutationLocked) {
             return await withPlaylistMutation(async () => {
                 const lists = await ensureDefaultPlaylist();
                 const rawItems = value.items;
+                let importItems = rawItems;
+                if (msg.smartRename && globalThis.BPLRenamer && typeof globalThis.BPLRenamer.renameItems === 'function') {
+                    try {
+                        const renameSource = rawItems.map(item => Object.assign({}, item, {
+                            title: String(item.renameTitle || item.title || item.bvid)
+                        }));
+                        importItems = await globalThis.BPLRenamer.renameItems(renameSource, {
+                            prefix: String(msg.renamePrefix || '')
+                        });
+                    } catch (renameError) {
+                        BPLLog.warn('bg', 'smart rename failed; using source titles: ' + String((renameError && renameError.message) || renameError));
+                    }
+                }
                 // `target` is reserved for the runtime message route (`target: 'bg'`).
                 // Older direct callers used it for the import mode, so keep that shape compatible.
                 const importTarget = msg.importTarget || msg.mode || (msg.target === 'new' ? 'new' : 'current');
+                const preparedItems = normalizeImportedItems(importItems);
                 if (importTarget === 'new') {
-                    const items = normalizeImportedItems(rawItems);
-                    if (!items.length) return { ok: false, error: '合集没有可导入的视频' };
+                    if (!preparedItems.length) return { ok: false, error: '合集没有可导入的视频' };
                     const id = genId();
                     const name = (msg.name && String(msg.name).trim()) || value.title || '导入的合集';
-                    lists.push({ id, name: name.slice(0, 100), items });
+                    lists.push({ id, name: name.slice(0, 100), items: preparedItems });
                     await savePlaylists(lists);
                     await setActiveId(id);
                     await broadcastData();
-                    return { ok: true, added: items.length, dup: 0, count: items.length, playlistId: id };
+                    return { ok: true, added: preparedItems.length, dup: 0, count: preparedItems.length, playlistId: id };
                 }
                 const targetId = msg.targetPlaylistId || await getActiveId();
                 const pl = findPl(lists, targetId);
                 if (!pl) return { ok: false, error: '目标播放列表不存在' };
                 const existing = new Set(pl.items.map(collectionItemKey));
                 let added = 0, dup = 0;
-                for (const item of rawItems) {
+                for (const item of preparedItems) {
                     const key = collectionItemKey(item);
                     if (existing.has(key)) { dup++; continue; }
                     existing.add(key);
-                    pl.items.push(Object.assign({ id: genId() }, item));
+                    pl.items.push(item);
                     added++;
                 }
                 if (added) {
                     await savePlaylists(lists);
                     await broadcastData();
                 }
-                return { ok: true, added: added, dup: dup, count: rawItems.length, playlistId: pl.id };
+                return { ok: true, added: added, dup: dup, count: preparedItems.length, playlistId: pl.id };
             });
         }
         case 'add': {
@@ -914,8 +936,8 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'player': {
             const payload = Object.assign({}, msg.payload || {});
-            // 浏览中的歌单(activeId)与正在播放的歌单(state.playlistId)可以不同。
-            // 显式点歌必须携带用户点击的歌单，否则 offscreen 会继续按旧歌单解释同一个索引。
+            // 浏览中的播放列表(activeId)与正在播放的播放列表(state.playlistId)可以不同。
+            // 显式点播必须携带用户点击的播放列表，否则 offscreen 会继续按旧播放列表解释同一个索引。
             if (payload.cmd === 'playIndex' && !payload.playlistId) payload.playlistId = await getActiveId();
             if (payload.cmd !== 'getStatus' && payload.cmd !== 'ping') BPLLog.info('bg', '收到 player 命令：' + payload.cmd);
             if (payload.cmd === 'getStatus' && !offscreenPort && !(await hasOffscreen())) {
@@ -1022,7 +1044,7 @@ async function handleBg(msg, sender, mutationLocked) {
         case 'createPlaylist': {
             const lists = await getPlaylists();
             const id = genId();
-            const name = (msg.name && String(msg.name).trim()) || ('新歌单' + (lists.length + 1));
+            const name = (msg.name && String(msg.name).trim()) || ('新播放列表' + (lists.length + 1));
             lists.push({ id, name: name.slice(0, 100), items: [] });
             await savePlaylists(lists);
             await setActiveId(id);
@@ -1066,9 +1088,9 @@ async function handleBg(msg, sender, mutationLocked) {
                 duration: Number(x.duration) || 0,
                 page: Number(x.page) || 1
             }));
-            if (!items.length) return { ok: false, error: '没有有效歌曲' };
+            if (!items.length) return { ok: false, error: '没有有效条目' };
             const id = genId();
-            const name = (msg.name && String(msg.name).trim()) || '导入的歌单';
+            const name = (msg.name && String(msg.name).trim()) || '导入的播放列表';
             lists.push({ id, name: name.slice(0, 100), items });
             await savePlaylists(lists);
             await setActiveId(id);

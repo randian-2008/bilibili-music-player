@@ -1,6 +1,7 @@
 const fs = require('fs');
 const vm = require('vm');
-const code = fs.readFileSync(require('path').join(__dirname, '..', 'background.js'), 'utf8');
+const code = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'background', 'background.js'), 'utf8');
+const renamerCode = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'rename', 'renamer.js'), 'utf8');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; console.log('  PASS: ' + msg); } else { fail++; console.log('  FAIL: ' + msg); } }
@@ -63,9 +64,14 @@ function makeCtx(opts) {
         fetch: (url) => {
             fetchCalls++;
             if (opts.fetchNever) return new Promise(() => {});
+            const isRulesRequest = String(url).indexOf('/rename/rules.json') >= 0;
+            const responseData = isRulesRequest ? (opts.renameRules || {}) : (opts.fetchResponder ? opts.fetchResponder(url) : resp);
+            const responseText = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
             return Promise.resolve({
                 ok: true,
-                json: () => Promise.resolve(opts.fetchResponder ? opts.fetchResponder(url) : resp)
+                json: () => Promise.resolve(typeof responseData === 'string' ? JSON.parse(responseData) : responseData),
+                text: () => Promise.resolve(responseText),
+                headers: { get: () => String(Buffer.byteLength(responseText, 'utf8')) }
             });
         },
         __setResp: r => { resp = r; },
@@ -89,7 +95,8 @@ function makeCtx(opts) {
                     }
                     return Promise.resolve(undefined);
                 },
-                getContexts: () => Promise.resolve(off.exists ? [{}] : [])
+                getContexts: () => Promise.resolve(off.exists ? [{}] : []),
+                getURL: value => 'chrome-extension://test/' + value
             },
             offscreen: {
                 hasDocument: () => Promise.resolve(off.exists),
@@ -128,6 +135,9 @@ function makeCtx(opts) {
         },
         __connectPort: () => { connected = true; connectHandlers.forEach(fn => fn(fakePort)); },
         __firePort: (msg) => { portHandlers.forEach(fn => fn(msg)); }
+    };
+    sandbox.importScripts = (...paths) => {
+        if (paths.some(value => String(value).indexOf('rename/renamer.js') >= 0)) vm.runInContext(renamerCode, sandbox);
     };
     vm.createContext(sandbox);
     vm.runInContext(code, sandbox);
@@ -209,7 +219,7 @@ function makeCtx(opts) {
 
     console.log('\n[background 存储模型迁移（稳定歌曲 ID / trackId）]');
     ctx = makeCtx();
-    ctx.__store.bpl_playlists = [{ id: 'legacy', name: '旧歌单', items: [
+    ctx.__store.bpl_playlists = [{ id: 'legacy', name: '旧播放列表', items: [
         { bvid: 'BV0', cid: 100, title: 'a' },
         { bvid: 'BV1', cid: 101, title: 'b' }
     ] }];
@@ -296,7 +306,7 @@ function makeCtx(opts) {
     ok(ctx.__store.bpl_state.trackId === 'item2' && ctx.__store.bpl_state.index === 3,
         '上拖后按 trackId 保持当前歌曲');
 
-    console.log('\n[background 歌单写入串行化]');
+    console.log('\n[background 播放列表写入串行化]');
     ctx = makeCtx();
     ctx.__store.bpl_playlists = [];
     ctx.__store.bpl_state = { playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' };
@@ -323,27 +333,76 @@ function makeCtx(opts) {
             { title: '番外', episodes: [{ bvid: 'BV3ITEM00003', cid: 301, title: '剧集三', arc: { pic: '//img/3.jpg', author: {} }, page: { page: 1, cid: 301, duration: 40, part: '剧集三' } }] }
         ] }
     }}) });
-    ctx.__store.bpl_playlists = [{ id: 'targetA', name: '当前歌单', items: [{ id: 'old', bvid: 'BV2ITEM00002', cid: 202, title: '已存在' }] }];
+    ctx.__store.bpl_playlists = [{ id: 'targetA', name: '当前播放列表', items: [{ id: 'old', bvid: 'BV2ITEM00002', cid: 202, title: '已存在' }] }];
     ctx.__store.bpl_active = 'targetA';
     let summary = await ctx.handleBg({ cmd: 'getCollection', bvid: 'BV1SEASON001' }, null);
     ok(summary.ok && summary.kind === 'season' && summary.count === 4 && summary.title === '测试合集' &&
-        summary.activePlaylistId === 'targetA' && summary.activePlaylistName === '当前歌单',
-        '合集摘要返回类型、数量和当前歌单');
+        summary.activePlaylistId === 'targetA' && summary.activePlaylistName === '当前播放列表',
+        '合集摘要返回类型、数量和当前播放列表');
     ok(ctx.__fetchCalls() === 1, '合集检测只请求一次 view API');
     let cached = await ctx.handleBg({ cmd: 'getCollection', bvid: 'BV1SEASON001' }, null);
     ok(cached.ok && cached.count === 4 && ctx.__fetchCalls() === 1, '同一 BVID 命中后台缓存');
     let imported = await ctx.handleBg({ target: 'bg', cmd: 'importCollection', bvid: 'BV1SEASON001', importTarget: 'current', targetPlaylistId: 'targetA' }, null);
     let targetItems = ctx.__store.bpl_playlists[0].items;
     ok(imported.ok && imported.added === 3 && imported.dup === 1 && targetItems.length === 4,
-        '导入当前歌单按 bvid+cid 去重并返回 added/dup');
+        '导入当前播放列表按 bvid+cid 去重并返回 added/dup');
     ok(targetItems[1].title === '剧集一' && targetItems[2].title === '剧集二' &&
         targetItems[3].title === '剧集三', '非嵌套合集条目只使用分P名，不添加分区或视频标题');
-    let newImported = await ctx.handleBg({ target: 'bg', cmd: 'importCollection', bvid: 'BV1SEASON001', importTarget: 'new', name: '新合集歌单' }, null);
+    ctx.__store.bpl_playlists.push({ id: 'smartTarget', name: '智能目标', items: [] });
+    const renamedCurrent = await ctx.handleBg({
+        target: 'bg', cmd: 'importCollection', bvid: 'BV1SEASON001', importTarget: 'current',
+        targetPlaylistId: 'smartTarget', smartRename: true, renamePrefix: '周杰伦'
+    }, null);
+    const smartTargetItems = ctx.__store.bpl_playlists.find(p => p.id === 'smartTarget').items;
+    ok(renamedCurrent.ok && renamedCurrent.added === 4 &&
+        smartTargetItems.length === 4 && smartTargetItems.every(item => item.title.indexOf('周杰伦 - ') === 0),
+        '智能重命名同时作用于当前播放列表导入并保留 bvid+cid 去重');
+    let newImported = await ctx.handleBg({ target: 'bg', cmd: 'importCollection', bvid: 'BV1SEASON001', importTarget: 'new', name: '新合集播放列表' }, null);
     const newPlaylist = ctx.__store.bpl_playlists.find(p => p.id === newImported.playlistId);
     ok(newImported.ok && newImported.added === 4 && ctx.__store.bpl_active === newImported.playlistId &&
         newPlaylist && newPlaylist.items.length === 4 && newPlaylist.items[1].title === '剧集二' &&
         newPlaylist.items[2].title === '剧集二 · 第二部分',
         '合集内嵌多P仅在分P名前添加所属视频标题，并避免重复前缀');
+
+    let renamedImport = await ctx.handleBg({
+        target: 'bg', cmd: 'importCollection', bvid: 'BV1SEASON001', importTarget: 'new',
+        name: '智能重命名合集', smartRename: true, renamePrefix: '周杰伦'
+    }, null);
+    const renamedPlaylist = ctx.__store.bpl_playlists.find(p => p.id === renamedImport.playlistId);
+    ok(renamedImport.ok && renamedPlaylist && renamedPlaylist.items.length === 4 &&
+        renamedPlaylist.items.every(item => item.title.indexOf('周杰伦 - ') === 0) &&
+        renamedPlaylist.items.every(item => !Object.prototype.hasOwnProperty.call(item, 'originalTitle')),
+        '智能重命名同时作用于新播放列表导入，且不保存原始标题');
+
+    ctx = makeCtx({ fetchResponder: () => ({ code: 0, data: {
+        bvid: 'BV1OKSEASON1', title: '含占位分P名的合集',
+        ugc_season: { title: '含占位分P名的合集', sections: [{ episodes: [
+            { bvid: 'BV1OKITEM001', title: '原视频一', pages: [
+                { page: 1, cid: 501, duration: 10, part: '无法拒绝的条件 BGM ok' }
+            ] },
+            { bvid: 'BV1OKITEM002', title: '原视频二', pages: [
+                { page: 1, cid: 502, duration: 11, part: '无法拒绝的条件 ok' }
+            ] },
+            { bvid: 'BV1OKITEM003', title: '原视频三', pages: [
+                { page: 1, cid: 503, duration: 12, part: '猫没有主人ok' }
+            ] },
+            { bvid: 'BV1OKITEM004', title: '应回退的标题', pages: [
+                { page: 1, cid: 504, duration: 13, part: 'ok' }
+            ] }
+        ] }] }
+    }}) });
+    ctx.__store.bpl_playlists = [{ id: 'okTarget', name: '占位测试', items: [] }];
+    ctx.__store.bpl_active = 'okTarget';
+    const okImport = await ctx.handleBg({
+        target: 'bg', cmd: 'importCollection', bvid: 'BV1OKSEASON1', importTarget: 'current',
+        targetPlaylistId: 'okTarget', smartRename: true
+    }, null);
+    const okItems = ctx.__store.bpl_playlists[0].items;
+    ok(okImport.ok && okItems.map(item => item.title).join('|') ===
+        '无法拒绝的条件|无法拒绝的条件|猫没有主人|应回退的标题' &&
+        okItems.every(item => !Object.prototype.hasOwnProperty.call(item, 'renameTitle')),
+        '真实合集映射链路使用临时标题上下文清理重复短后缀，且不把辅助字段写入播放列表 (' +
+        okItems.map(item => item.title).join('|') + ')');
 
     ctx = makeCtx({ fetchResponder: () => ({ code: 0, data: {
         bvid: 'BV1PAGES0001', title: '多P视频', pic: 'http://img/pages.jpg', owner: { name: '作者' },
@@ -360,7 +419,7 @@ function makeCtx(opts) {
     ok(none.ok === false && none.notCollection === true && /不属于合集/.test(none.error) && ctx.__fetchCalls() === 1,
         '普通单视频返回可缓存的非合集结果，不显示合集入口');
 
-    console.log('\n[background 新建歌单点播路由 / 残缺条目修复]');
+    console.log('\n[background 新建播放列表点播路由 / 残缺条目修复]');
     ctx = makeCtx({ offscreenResponder: msg => ({ ok: true, echoed: msg.cmd }) });
     ctx.__store.bpl_playlists = [
         { id: 'default', name: '默认', items: [{ id: 'old0', bvid: 'BVOLD', cid: 10, title: '旧歌', pic: '', page: 1 }] },
@@ -371,7 +430,7 @@ function makeCtx(opts) {
     r = await ctx.handleBg({ cmd: 'player', payload: { cmd: 'playIndex', index: 0 } }, null);
     const routedPlay = ctx.__portSent.find(m => m.cmd === 'playIndex');
     ok(r.ok === true && routedPlay && routedPlay.playlistId === 'custom',
-        'playIndex 自动携带活动歌单 ID，不再按默认歌单解释索引');
+        'playIndex 自动携带活动播放列表 ID，不再按默认播放列表解释索引');
 
     ctx = makeCtx({ fetchResponder: url => {
         if (url.includes('/x/web-interface/view')) return {
@@ -447,8 +506,8 @@ function makeCtx(opts) {
     ok(r.ok === false && /音频模块通信失败/.test(r.error), 'offscreen 无响应返回错误');
     ok(ctx.__off.closeCalls === 1, '单次调用内有界重建一次（closeCalls=' + ctx.__off.closeCalls + '）');
 
-    // 业务错误（如歌单为空）经 Port 原样返回、不重试
-    ctx = makeCtx({ offscreenResponder: (msg) => ({ ok: false, error: '当前播放的歌单为空' }) });
+    // 业务错误（如播放列表为空）经 Port 原样返回、不重试
+    ctx = makeCtx({ offscreenResponder: (msg) => ({ ok: false, error: '当前播放列表为空' }) });
     r = await ctx.sendToOffscreen({ cmd: 'playIndex', index: 9 });
     ok(r.ok === false && /空/.test(r.error), '业务错误原样透传、不当通信失败重试 (' + r.error + ')');
 

@@ -218,7 +218,7 @@ function runRequest(msg) {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg) return;
-    // 歌单数据变更：background 每次改歌单都会广播 {target:'all', type:'data'}。无 chrome.storage
+    // 播放列表数据变更：background 每次修改播放列表都会广播 {target:'all', type:'data'}。无 chrome.storage
     // 的环境（此 Edge 的 offscreen）没有 storage.onChanged，靠这条广播刷新洗牌序/空单停播，
     // 等效于下方 storage.onChanged 分支（正常环境两者都触发，onPlaylistsChanged 幂等）。
     if (msg.type === 'data' && Array.isArray(msg.playlists)) { onPlaylistsChanged(); return; }
@@ -460,7 +460,7 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
     if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
     const targetPlaylistId = playlistId || st.playlistId;
     const items = await pGetItems(targetPlaylistId);
-    if (!items.length) return { ok: false, error: '当前播放的歌单为空' };
+    if (!items.length) return { ok: false, error: '当前播放列表为空' };
     if (i < 0 || i >= items.length) return { ok: false, error: '播放索引越界 (' + i + '/' + items.length + ')' };
     if (pIsShuffle(st.mode) && !keepOrder) pBuildFrom(items.length, i);
     const it = items[i];
@@ -527,7 +527,7 @@ async function pStopPlayback() {
 async function pAdvance() {
     const items = await pGetItems();
     const st = await pGetState();
-    if (!items.length) return { ok: false, error: '当前播放的歌单为空' };
+    if (!items.length) return { ok: false, error: '当前播放列表为空' };
     const mode = st.mode;
     if (pIsShuffle(mode)) {
         if (shuffleOrder.length !== items.length) { pBuildAfter(items.length, st.index); return await pPlayIndex(shuffleOrder[shufflePos], true); }
@@ -544,7 +544,7 @@ async function pNext() { return await pAdvance(); }
 async function pPrev() {
     const items = await pGetItems();
     const st = await pGetState();
-    if (!items.length) return { ok: false, error: '当前播放的歌单为空' };
+    if (!items.length) return { ok: false, error: '当前播放列表为空' };
     if (audio.currentTime > 3) { audio.currentTime = 0; return { ok: true }; }
     if (pIsShuffle(st.mode) && shuffleOrder.length === items.length && shufflePos > 0) {
         shufflePos--;
@@ -753,7 +753,7 @@ function onPlaylistsChanged() {
         if (audio.src && (!items.length || !currentExists)) {
             pStopPlayback();
         }
-    }).catch(error => BPLLog.error('off', '处理歌单变更失败：' + String((error && error.message) || error)));
+    }).catch(error => BPLLog.error('off', '处理播放列表变更失败：' + String((error && error.message) || error)));
 }
 // 无 chrome.storage 的环境没有 onChanged：改由上面的 'data' 广播驱动（background 每次改单都会广播）
 if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged) {

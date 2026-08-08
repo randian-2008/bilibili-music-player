@@ -22,7 +22,7 @@ npm run package:windows
 
 ## 变更原则
 
-- 保持 `background.js`、`offscreen.js`、`content.js` 与 `sidepanel.*` 的职责边界。整体架构见 [`docs/architecture.md`](docs/architecture.md)。
+- 保持 `src/background/background.js`、`src/player/offscreen.js`、`src/content/content.js` 与 `src/panel/sidepanel.*` 的职责边界。整体架构见 [`docs/architecture.md`](docs/architecture.md)。
 - 调整播放、存储、桥接消息或主题语义变量时，更新相应的 `tests/test-*.js`。
 - UI 改动请同时检查停止态、播放态、窄面板和可调整尺寸后的长列表；涉及外观时附截图会提高审查效率。
 - 不要在代码、Issue、PR 或测试样例中提交 Cookie、授权信息、个人播放链接或完整诊断日志。

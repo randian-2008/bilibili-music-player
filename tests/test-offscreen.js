@@ -1,6 +1,6 @@
 const fs = require('fs');
 const vm = require('vm');
-const code = fs.readFileSync(require('path').join(__dirname, '..', 'offscreen.js'), 'utf8');
+const code = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'player', 'offscreen.js'), 'utf8');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; console.log('  PASS: ' + msg); } else { fail++; console.log('  FAIL: ' + msg); } }
@@ -162,7 +162,7 @@ async function testPlayIndex() {
     console.log('\n[offscreen pPlayIndex]');
     let ctx = makeCtx({ store: { bpl_playlists: [{ id: 'pl1', name: 'p', items: [] }], bpl_state: { playlistId: 'pl1', trackId: null, index: 0, playing: false, mode: 'loop' } } });
     let r = await ctx.pPlayIndex(0);
-    ok(r.ok === false && /空/.test(r.error), '空歌单 (' + r.error + ')');
+    ok(r.ok === false && /空/.test(r.error), '空播放列表 (' + r.error + ')');
 
     ctx = makeCtx({ store: setupPlaylist(2) });
     r = await ctx.pPlayIndex(99);
@@ -266,7 +266,7 @@ async function testHandleCmd() {
     ok(r.ok === true && (await getState(ctx)).index === 1, 'playIndex 命令');
 
     const customStore = setupPlaylist(1);
-    customStore.bpl_playlists.push({ id: 'pl2', name: '新歌单', items: [
+    customStore.bpl_playlists.push({ id: 'pl2', name: '新播放列表', items: [
         { id: 'custom0', bvid: 'BVCUSTOM', cid: 909, title: 'custom', pic: '', owner: '', duration: 10, page: 1 }
     ] });
     customStore.bpl_active = 'pl2';
@@ -276,7 +276,7 @@ async function testHandleCmd() {
     const resolveReq = customCtx.__sent.find(m => m && m.cmd === 'resolveAudio');
     ok(r.ok === true && customState.playlistId === 'pl2' && customState.trackId === 'custom0' &&
         resolveReq && resolveReq.resolveAudio.bvid === 'BVCUSTOM' && resolveReq.resolveAudio.playlistId === 'pl2',
-        'playIndex 按显式歌单 ID 取曲并切换播放身份');
+        'playIndex 按显式播放列表 ID 取曲并切换播放身份');
     r = await ctx.handleCmd({ cmd: 'setVolume', value: 0.5 });
     ok(r.ok === true && ctx.__audio.volume === 0.5 && ctx.__store.bpl_volume === 0.5, 'setVolume 生效并持久化');
     r = await ctx.handleCmd({ cmd: 'stop' });
@@ -319,7 +319,7 @@ async function testNoStorage() {
     let ctx = makeCtx({ store: setupPlaylist(2), noStorage: true });
     ok(ctx.chrome.storage === undefined, '变体前提：chrome.storage 缺失（chrome.runtime 仍在）');
     let r = await ctx.pPlayIndex(0);
-    ok(r.ok === true && ctx.__audio.src === 'https://cdn/audio.m4s', '无 storage 也能完整播放（经代理取歌单/状态）');
+    ok(r.ok === true && ctx.__audio.src === 'https://cdn/audio.m4s', '无 storage 也能完整播放（经代理取播放列表/状态）');
     let st = await ctx.pGetState();
     ok(st.trackId === 'item0' && st.index === 0 && st.playing === true, '状态经代理持久化（trackId/index 写回 bg）');
     ok(ctx.__store.bpl_state && ctx.__store.bpl_state.playing === true, '写入确实落到（模拟的）bg 存储');
@@ -328,7 +328,7 @@ async function testNoStorage() {
     r = await ctx.handleCmd({ cmd: 'playIndex', index: 2 });
     ok(r.ok === true && (await ctx.pGetState()).index === 2, 'handleCmd playIndex 经代理闭环');
 
-    // 无 storage.onChanged：data 广播驱动歌单变更；即使歌单非空，当前 trackId 被删也必须停播
+    // 无 storage.onChanged：data 广播驱动播放列表变更；即使播放列表非空，当前 trackId 被删也必须停播
     ctx.__store.bpl_playlists[0].items = ctx.__store.bpl_playlists[0].items.slice(0, 2);
     ctx.__driveMsg({ target: 'all', type: 'data', playlists: ctx.__store.bpl_playlists });
     await ticks(3);
@@ -361,7 +361,7 @@ async function testResume() {
         '再按播放从断点 42s 继续（不是从头）(at=' + ctx2.__audio.currentTime + 's)');
     ok((await ctx2.pGetState()).playing === true, '续播后状态为播放中');
 
-    // ③ 断点身份不符（歌单变动/换了歌）→ 从头播，不盲跳
+    // ③ 断点身份不符（播放列表变动/换了内容）→ 从头播，不盲跳
     ctx = makeCtx({ store: setupPlaylist(2) });
     ctx.__store.bpl_position = { trackId: 'other', bvid: 'BV1', cid: 101, position: 88 };
     r = await ctx.pToggle();

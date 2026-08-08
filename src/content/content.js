@@ -11,7 +11,7 @@
 
     const HOST_ID = 'bpl-ext-host';
     const STORE_KEY = 'bpl_panel';
-    const PANEL_URL = chrome.runtime.getURL('sidepanel.html');
+    const PANEL_URL = chrome.runtime.getURL('src/panel/sidepanel.html');
     // 扩展自身源（如 chrome-extension://abc），用于桥接来源白名单；不用 new URL 以兼容更多环境
     const EXT_ORIGIN = chrome.runtime.getURL('').replace(/\/+$/, '');
     const Z = 2147483646;
@@ -21,7 +21,8 @@
 
     let shadow, hostEl, mini, miniPlay, panel, pframe, addBtn, addTxt, collectionBtn, collectionTxt,
         collectionDialog, collectionDialogTitle, collectionDialogCount, collectionTargetName,
-        collectionNameInput, collectionStatus, collectionConfirmBtn, resizeGrip, themePicker;
+        collectionNameInput, collectionRenameCheck, collectionRenamePrefixInput,
+        collectionStatus, collectionConfirmBtn, collectionCancelBtn, resizeGrip, themePicker;
     let panelOpen = false;
     let frameLoaded = false;
     let built = false;
@@ -94,7 +95,7 @@
     function formatCollectionError(error) {
         const text = String((error && error.message) || error || '导入失败，请稍后重试');
         if (/quota|QUOTA_BYTES|storage.*(full|limit)|存储.*(空间|上限)/i.test(text)) {
-            return '扩展存储空间不足，请清理部分歌单后重试';
+            return '扩展存储空间不足，请清理部分播放列表后重试';
         }
         if (/timeout|超时/i.test(text)) return '网络响应超时，请稍后重试';
         if (/failed to fetch|network|网络/i.test(text)) return '网络请求失败，请检查网络后重试';
@@ -291,6 +292,11 @@
         'border-radius:6px;background:var(--bpl-control);color:var(--bpl-text);font:12px system-ui,"PingFang SC","Microsoft YaHei",sans-serif;outline:none}' +
         '.collection-new-name:focus{border-color:var(--bpl-accent)}' +
         '.collection-dialog[data-mode="current"] .collection-new-name{display:none}' +
+        '.collection-rename{display:flex;align-items:center;gap:7px;margin:2px 0 7px;color:var(--bpl-text);font-size:12px;line-height:1.4;cursor:pointer}' +
+        '.collection-rename-check{accent-color:var(--bpl-accent);margin:0}' +
+        '.collection-rename-prefix{width:100%;height:30px;margin:0 0 9px;padding:0 9px;border:1px solid var(--bpl-border-strong);border-radius:6px;background:var(--bpl-control);color:var(--bpl-text);font:12px system-ui,"PingFang SC","Microsoft YaHei",sans-serif;outline:none}' +
+        '.collection-rename-prefix:focus{border-color:var(--bpl-accent)}' +
+        '.collection-rename-prefix:disabled{cursor:not-allowed;opacity:.55}' +
         '.collection-status{min-height:18px;margin:0 0 9px;color:var(--bpl-faint);font-size:12px;line-height:1.45;overflow-wrap:anywhere}' +
         '.collection-status.error{color:var(--bpl-danger,var(--bpl-accent))}' +
         '.collection-status.success{color:var(--bpl-accent)}' +
@@ -401,8 +407,8 @@
             '<div class="phead">' +
             '<span class="gripbar" title="拖动面板">⠿</span>' +
             themeMarkup +
-            '<button class="pbtn add" title="把当前B站视频加入歌单" style="display:none"><span class="addtxt">＋加入</span></button>' +
-            '<button class="pbtn collection-add" title="把当前合集或多P视频全部加入歌单" style="display:none"><span class="collectiontxt">全部加入</span></button>' +
+            '<button class="pbtn add" title="把当前B站视频加入播放列表" style="display:none"><span class="addtxt">＋加入</span></button>' +
+            '<button class="pbtn collection-add" title="把当前合集或多P视频全部加入播放列表" style="display:none"><span class="collectiontxt">全部加入</span></button>' +
             '</div>' +
             '<div class="pbody"><iframe class="pframe" title="playlist" allow="autoplay"></iframe></div>' +
             '<div class="resize-grip" title="调整面板大小"></div>' +
@@ -413,11 +419,13 @@
             '<p class="collection-title"></p>' +
             '<p class="collection-count"></p>' +
             '<div class="collection-targets" role="radiogroup" aria-label="导入目标">' +
-            '<button class="collection-choice selected" type="button" data-collection-target="current" role="radio" aria-checked="true">当前歌单</button>' +
-            '<button class="collection-choice" type="button" data-collection-target="new" role="radio" aria-checked="false">新建歌单</button>' +
+            '<button class="collection-choice selected" type="button" data-collection-target="current" role="radio" aria-checked="true">当前播放列表</button>' +
+            '<button class="collection-choice" type="button" data-collection-target="new" role="radio" aria-checked="false">新建播放列表</button>' +
             '</div>' +
             '<p class="collection-target-name"></p>' +
-            '<input class="collection-new-name" maxlength="100" aria-label="新歌单名称" placeholder="新歌单名称">' +
+            '<input class="collection-new-name" maxlength="100" aria-label="新播放列表名称" placeholder="新播放列表名称">' +
+            '<label class="collection-rename"><input class="collection-rename-check" type="checkbox">智能重命名</label>' +
+            '<input class="collection-rename-prefix" maxlength="80" aria-label="统一前缀（可选）" placeholder="统一前缀（可选）" disabled>' +
             '<p class="collection-status" role="status" aria-live="polite"></p>' +
             '<div class="collection-actions">' +
             '<button class="collection-action cancel" type="button">取消</button>' +
@@ -437,8 +445,11 @@
         collectionDialogCount = shadow.querySelector('.collection-count');
         collectionTargetName = shadow.querySelector('.collection-target-name');
         collectionNameInput = shadow.querySelector('.collection-new-name');
+        collectionRenameCheck = shadow.querySelector('.collection-rename-check');
+        collectionRenamePrefixInput = shadow.querySelector('.collection-rename-prefix');
         collectionStatus = shadow.querySelector('.collection-status');
         collectionConfirmBtn = shadow.querySelector('.collection-action.confirm');
+        collectionCancelBtn = shadow.querySelector('.collection-action.cancel');
         resizeGrip = shadow.querySelector('.resize-grip');
         themePicker = shadow.querySelector('.theme-picker');
 
@@ -452,6 +463,7 @@
         addBtn.addEventListener('click', addCurrent);
         collectionBtn.addEventListener('click', openCollectionDialog);
         collectionDialog.addEventListener('click', handleCollectionDialogClick);
+        collectionRenameCheck.addEventListener('change', syncRenameControls);
         makeDraggable(panel, shadow.querySelector('.phead'));
         makeResizable(panel, resizeGrip);
 
@@ -683,11 +695,17 @@
         if (collectionDialogTitle) collectionDialogTitle.textContent = '《' + String(result.title || bvid) + '》';
         if (collectionDialogCount) collectionDialogCount.textContent = '共 ' + Number(result.count || 0) + ' 个视频';
         if (collectionNameInput) collectionNameInput.value = String(result.title || '').slice(0, 100);
+        if (collectionRenameCheck) collectionRenameCheck.checked = false;
+        if (collectionRenamePrefixInput) {
+            collectionRenamePrefixInput.value = '';
+            collectionRenamePrefixInput.disabled = true;
+        }
         if (collectionStatus) {
             collectionStatus.textContent = '';
             collectionStatus.className = 'collection-status';
         }
         if (collectionConfirmBtn) collectionConfirmBtn.textContent = '确认导入';
+        if (collectionCancelBtn) collectionCancelBtn.hidden = false;
         if (collectionDialog) delete collectionDialog.dataset.complete;
         setCollectionDialogMode(collectionDialogMode);
         syncCollectionDialogGeometry();
@@ -706,8 +724,8 @@
         });
         if (collectionTargetName) {
             collectionTargetName.textContent = collectionDialogMode === 'new'
-                ? '将创建新歌单并自动切换到该歌单'
-                : '目标：' + String(collectionSummaryState && collectionSummaryState.activePlaylistName || '当前歌单');
+                ? '将创建新播放列表并自动切换到该播放列表'
+                : '目标：' + String(collectionSummaryState && collectionSummaryState.activePlaylistName || '当前播放列表');
         }
         if (collectionDialogMode === 'new' && collectionNameInput) collectionNameInput.focus();
     }
@@ -726,9 +744,14 @@
 
     function setCollectionControlsDisabled(disabled) {
         if (!collectionDialog) return;
-        collectionDialog.querySelectorAll('.collection-choice,.collection-action,.collection-new-name').forEach(control => {
+        collectionDialog.querySelectorAll('.collection-choice,.collection-action,.collection-new-name,.collection-rename-check,.collection-rename-prefix').forEach(control => {
             control.disabled = !!disabled;
         });
+        if (!disabled) syncRenameControls();
+    }
+
+    function syncRenameControls() {
+        if (collectionRenamePrefixInput) collectionRenamePrefixInput.disabled = !collectionRenameCheck || !collectionRenameCheck.checked;
     }
 
     function closeCollectionDialog() {
@@ -741,6 +764,7 @@
         delete collectionDialog.dataset.complete;
         setCollectionControlsDisabled(false);
         if (collectionConfirmBtn) collectionConfirmBtn.textContent = '确认导入';
+        if (collectionCancelBtn) collectionCancelBtn.hidden = false;
     }
 
     function handleCollectionDialogClick(event) {
@@ -768,7 +792,7 @@
         setCollectionControlsDisabled(true);
         if (collectionStatus) {
             collectionStatus.className = 'collection-status';
-            collectionStatus.textContent = collectionDialogMode === 'new' ? '正在创建歌单并导入…' : '正在确认目标歌单…';
+            collectionStatus.textContent = collectionDialogMode === 'new' ? '正在创建播放列表并导入…' : '正在确认目标播放列表…';
         }
 
         let latestSummary = collectionSummaryState;
@@ -780,16 +804,18 @@
                 return;
             }
             collectionSummaryState = latestSummary;
-            if (collectionTargetName) collectionTargetName.textContent = '目标：' + String(latestSummary.activePlaylistName || '当前歌单');
+            if (collectionTargetName) collectionTargetName.textContent = '目标：' + String(latestSummary.activePlaylistName || '当前播放列表');
         }
 
         const payload = buildCollectionImportPayload(
             bvid,
             collectionDialogMode,
             latestSummary,
-            collectionNameInput && collectionNameInput.value
+            collectionNameInput && collectionNameInput.value,
+            collectionRenameCheck && collectionRenameCheck.checked,
+            collectionRenamePrefixInput && collectionRenamePrefixInput.value
         );
-        if (collectionStatus) collectionStatus.textContent = collectionDialogMode === 'new' ? '正在导入合集…' : '正在导入到当前歌单…';
+        if (collectionStatus) collectionStatus.textContent = collectionDialogMode === 'new' ? '正在导入合集…' : '正在导入到当前播放列表…';
         const result = await sendBgRequest(payload, 30000);
         if (token !== collectionActionToken || bvid !== getCurrentBvid()) return;
         if (!result || !result.ok) {
@@ -803,30 +829,30 @@
             const added = Number(result.added) || 0;
             const dup = Number(result.dup) || 0;
             collectionStatus.className = 'collection-status success';
-            if (collectionDialogMode === 'new') collectionStatus.textContent = '已创建歌单并导入 ' + added + ' 个视频';
-            else if (!added && dup) collectionStatus.textContent = '全部 ' + dup + ' 个视频均已在当前歌单中';
+            if (collectionDialogMode === 'new') collectionStatus.textContent = '已创建播放列表并导入 ' + added + ' 个视频';
+            else if (!added && dup) collectionStatus.textContent = '全部 ' + dup + ' 个视频均已在当前播放列表中';
             else if (dup) collectionStatus.textContent = '已加入 ' + added + ' 个视频，跳过 ' + dup + ' 个重复项';
             else collectionStatus.textContent = '已加入 ' + added + ' 个视频';
         }
         if (collectionDialog) collectionDialog.dataset.complete = 'true';
         if (collectionConfirmBtn) {
             collectionConfirmBtn.disabled = false;
-            collectionConfirmBtn.textContent = '完成';
+            collectionConfirmBtn.textContent = '确认';
         }
-        const cancel = collectionDialog && collectionDialog.querySelector('.collection-action.cancel');
-        if (cancel) cancel.disabled = false;
+        if (collectionCancelBtn) collectionCancelBtn.hidden = true;
     }
 
     function finishCollectionImportError(error) {
         collectionActionBusy = false;
         setCollectionControlsDisabled(false);
+        if (collectionCancelBtn) collectionCancelBtn.hidden = false;
         if (collectionStatus) {
             collectionStatus.className = 'collection-status error';
             collectionStatus.textContent = formatCollectionError(error);
         }
     }
 
-    function buildCollectionImportPayload(bvid, mode, summary, name) {
+    function buildCollectionImportPayload(bvid, mode, summary, name, smartRename, renamePrefix) {
         const payload = {
             target: 'bg',
             cmd: 'importCollection',
@@ -837,6 +863,10 @@
             payload.targetPlaylistId = summary.activePlaylistId;
         } else if (payload.importTarget === 'new') {
             payload.name = String(name || summary && summary.title || '').trim().slice(0, 100);
+        }
+        if (smartRename) {
+            payload.smartRename = true;
+            payload.renamePrefix = String(renamePrefix || '').trim().slice(0, 80);
         }
         return payload;
     }
@@ -974,7 +1004,7 @@
 
     // 桥接来源决策（抽成纯函数便于单测）：
     //   'player'        播放命令：危害仅为控制播放，任意非网页源放行（兼容个别环境扩展 iframe 源被序列化为 'null'）
-    //   'forward'       通用命令（歌单增删改/openTab 等）：仅扩展自身源放行
+    //   'forward'       通用命令（播放列表增删改/openTab 等）：仅扩展自身源放行
     //   'reject-http'   网页源（http/https，浏览器设定、不可伪造）一律拒绝
     //   'reject-origin' 非扩展源发起的通用命令拒绝——堵住“只拒 http(s)+任意透传”的越权面
     function bridgeDecision(origin, cmd) {

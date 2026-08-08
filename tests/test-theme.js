@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
-const code = fs.readFileSync(path.join(__dirname, '..', 'theme.js'), 'utf8');
+const code = fs.readFileSync(path.join(__dirname, '..', 'src', 'shared', 'theme.js'), 'utf8');
 const sandbox = {};
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox);
@@ -56,17 +56,17 @@ ok([glass, clear].every(theme => theme.vars['--bpl-list-bg'] === 'transparent' &
     /^#[0-9a-f]{6}$/i.test(theme.vars['--bpl-swatch-border'])),
     '两套玻璃主题提供透明列表与浅色背景可见的胶囊图标');
 
-const contentCode = fs.readFileSync(path.join(__dirname, '..', 'content.js'), 'utf8');
-const sidepanelCode = fs.readFileSync(path.join(__dirname, '..', 'sidepanel.js'), 'utf8');
-const sidepanelCss = fs.readFileSync(path.join(__dirname, '..', 'sidepanel.css'), 'utf8');
-const sidepanelHtml = fs.readFileSync(path.join(__dirname, '..', 'sidepanel.html'), 'utf8');
+const contentCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'content', 'content.js'), 'utf8');
+const sidepanelCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'panel', 'sidepanel.js'), 'utf8');
+const sidepanelCss = fs.readFileSync(path.join(__dirname, '..', 'src', 'panel', 'sidepanel.css'), 'utf8');
+const sidepanelHtml = fs.readFileSync(path.join(__dirname, '..', 'src', 'panel', 'sidepanel.html'), 'utf8');
 ok(/bplBridge:\s*'theme'/.test(contentCode) && /bplBridge === 'theme'/.test(sidepanelCode),
     '外壳直接同步主题到播放列表 iframe');
 const listwrapStart = sidepanelHtml.indexOf('<div class="listwrap">');
 const listwrapEnd = sidepanelHtml.indexOf('\n    </div>', listwrapStart);
 const playlistMenu = sidepanelHtml.indexOf('<div id="plMenu"');
 ok(listwrapStart >= 0 && listwrapEnd > listwrapStart && playlistMenu > listwrapEnd,
-    '歌单菜单是 listwrap 外的视口级浮层，不受播放器层叠上下文限制');
+    '播放列表菜单是 listwrap 外的视口级浮层，不受播放器层叠上下文限制');
 ok(contentCode.includes("THEME_PICKER_ORDER = ['paper', 'gold', 'jade', 'starry'") &&
     contentCode.includes('.theme-picker.open .theme-swatches{max-width:112px') &&
     contentCode.includes('.theme-swatch{appearance:none;flex:none;width:16px;height:16px') &&
@@ -87,6 +87,13 @@ ok(/function volumeIcon\(v, muted\)/.test(sidepanelCode) &&
     /id="muteBtn"[^>]*><svg[^>]*stroke="currentColor"/.test(sidepanelHtml) &&
     /\.vbtn\s*\{[\s\S]*?color: var\(--bpl-muted\)/.test(sidepanelCss),
     '音量图标使用 currentColor SVG 并随主题着色');
+ok((sidepanelHtml.match(/data-locate-playing/g) || []).length === 2 &&
+    /async function locatePlayingItem\(\)/.test(sidepanelCode) &&
+    /send\('setActive', \{ id: pl\.id \}\)/.test(sidepanelCode) &&
+    /item\.id === state\.trackId/.test(sidepanelCode) &&
+    /scrollIntoView\(\{ block: 'center', behavior: 'smooth' \}\)/.test(sidepanelCode) &&
+    /\.item\.located\s*\{ animation: locateItem/.test(sidepanelCss),
+    '点击当前封面或标题可切换到所属播放列表，并按 trackId 定位和高亮当前条目');
 
 function luminance(hex) {
     const rgb = hex.match(/[0-9a-f]{2}/gi).map(value => parseInt(value, 16) / 255)

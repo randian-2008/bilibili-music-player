@@ -27,6 +27,7 @@ let duration = 0;
 let drag = null;
 let lastDrop = 0;
 let failedNowPlayingCover = '';
+let locateHighlightTimer = null;
 
 function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -201,7 +202,7 @@ function render() {
         ? playlists.map(p =>
             '<option value="' + esc(p.id) + '"' + (p.id === activeId ? ' selected' : '') + '>' +
             esc(p.name) + ' (' + p.items.length + ')</option>').join('')
-        : '<option>（无歌单）</option>';
+        : '<option>（无播放列表）</option>';
 
     const mode = MODES[modeIndex(state.mode)];
     const mb = $('#modeBtn');
@@ -213,6 +214,10 @@ function render() {
     const it = playingItem();
     document.body.classList.toggle('has-track', !!it);
     $('#curTitle').textContent = (it && it.title) || '未播放';
+    document.querySelectorAll('[data-locate-playing]').forEach(el => {
+        el.tabIndex = it ? 0 : -1;
+        el.setAttribute('aria-disabled', it ? 'false' : 'true');
+    });
     const pic = (it && it.pic) ? httpsUrl(it.pic) : '';
     paintNowPlayingCover(pic);
     $('#npBg').style.backgroundImage = pic ? 'url("' + pic.replace(/"/g, '') + '")' : '';
@@ -222,7 +227,7 @@ function render() {
     const box = $('#list');
     const showPlaying = activeId === state.playlistId;
     if (!items.length) {
-        box.innerHTML = '<div class="empty">这个歌单是空的<br>去B站视频页点「加入听歌列表」</div>';
+        box.innerHTML = '<div class="empty">这个播放列表是空的<br>去B站视频页点「＋加入」</div>';
     } else {
         box.innerHTML = items.map((s, i) => {
             const isPlaying = showPlaying && !!state.trackId && s.id === state.trackId;
@@ -274,6 +279,43 @@ function applyMarquee(wrap) {
 $('#npCover').addEventListener('error', e => {
     failedNowPlayingCover = e.currentTarget.getAttribute('src') || '';
     paintNowPlayingCover(failedNowPlayingCover);
+});
+
+function scrollToPlayingItem() {
+    const pl = activePlaylist();
+    if (!pl || pl.id !== state.playlistId || !state.trackId) return;
+    const index = pl.items.findIndex(item => item.id === state.trackId);
+    if (index < 0) return;
+    const target = $('#list').querySelector('.item[data-i="' + index + '"]');
+    if (!target) return;
+    target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    target.classList.remove('located');
+    void target.offsetWidth;
+    target.classList.add('located');
+    if (locateHighlightTimer) clearTimeout(locateHighlightTimer);
+    locateHighlightTimer = setTimeout(() => target.classList.remove('located'), 1200);
+}
+
+async function locatePlayingItem() {
+    const pl = playingPlaylist();
+    if (!pl || !state.trackId || !pl.items.some(item => item.id === state.trackId)) return;
+    if (activeId !== pl.id) {
+        if (selMode) exitSelMode();
+        const result = await send('setActive', { id: pl.id });
+        if (!result || result.ok === false) return;
+        activeId = pl.id;
+        render();
+    }
+    requestAnimationFrame(scrollToPlayingItem);
+}
+
+document.querySelectorAll('[data-locate-playing]').forEach(el => {
+    el.addEventListener('click', locatePlayingItem);
+    el.addEventListener('keydown', event => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        locatePlayingItem();
+    });
 });
 
 const PLAY_D = 'M8 5v14l11-7z';
@@ -357,7 +399,7 @@ function downloadText(name, content, mime) {
     setTimeout(() => URL.revokeObjectURL(u), 1000);
 }
 function buildTxt(pl) {
-    const lines = ['歌单：' + pl.name, '================================'];
+    const lines = ['播放列表：' + pl.name, '================================'];
     pl.items.forEach((s, i) => {
         lines.push((i + 1) + '. ' + s.title);
         if (s.owner) lines.push('   UP主：' + s.owner);
@@ -391,8 +433,8 @@ function buildJson(pl) {
 }
 function exportAs(format) {
     const pl = activePlaylist();
-    if (!pl || !pl.items.length) { alert('当前歌单是空的'); return; }
-    const base = pl.name || '歌单';
+    if (!pl || !pl.items.length) { alert('当前播放列表是空的'); return; }
+    const base = pl.name || '播放列表';
     if (format === 'txt') downloadText(base + '.txt', buildTxt(pl), 'text/plain;charset=utf-8');
     else if (format === 'md') downloadText(base + '.md', buildMd(pl), 'text/markdown;charset=utf-8');
     else if (format === 'json') downloadText(base + '.json', buildJson(pl), 'application/json;charset=utf-8');
@@ -407,9 +449,9 @@ function handleImportFile(f) {
             let name = '', items = [];
             if (Array.isArray(data)) items = data;
             else if (data && Array.isArray(data.items)) { name = data.name || ''; items = data.items; }
-            else { alert('不是有效的歌单 JSON'); return; }
+            else { alert('不是有效的播放列表 JSON'); return; }
             items = items.filter(x => x && x.bvid);
-            if (!items.length) { alert('JSON 里没有有效歌曲（需要包含 bvid）'); return; }
+            if (!items.length) { alert('JSON 里没有有效条目（需要包含 bvid）'); return; }
             send('importPlaylist', { name: name || f.name.replace(/\.json$/i, ''), items });
         } catch (err) {
             alert('JSON 解析失败：' + err.message);
@@ -420,7 +462,7 @@ function handleImportFile(f) {
 
 $('#plSelect').addEventListener('change', e => send('setActive', { id: e.target.value }));
 $('#plNew').addEventListener('click', () => {
-    const name = prompt('新建歌单，名字：', '新歌单');
+    const name = prompt('新建播放列表，名称：', '新播放列表');
     if (name != null && name.trim()) send('createPlaylist', { name: name.trim() });
 });
 
@@ -472,7 +514,7 @@ menu.addEventListener('click', e => {
     if (act === 'log-clear') { chrome.storage.local.set({ bpl_log: [] }); logCache = []; renderLog(); return; }
     if (!pl) return;
     if (act === 'rename') {
-        const name = prompt('重命名歌单：', pl.name);
+        const name = prompt('重命名播放列表：', pl.name);
         if (name && name.trim()) send('renamePlaylist', { id: pl.id, name: name.trim() });
     } else if (act === 'export-txt') {
         exportAs('txt');
@@ -481,9 +523,9 @@ menu.addEventListener('click', e => {
     } else if (act === 'export-json') {
         exportAs('json');
     } else if (act === 'clear') {
-        if (pl.items.length && confirm('清空歌单「' + pl.name + '」？')) send('clear');
+        if (pl.items.length && confirm('清空播放列表「' + pl.name + '」？')) send('clear');
     } else if (act === 'delete') {
-        if (confirm('删除歌单「' + pl.name + '」及其所有歌曲？')) send('deletePlaylist', { id: pl.id });
+        if (confirm('删除播放列表「' + pl.name + '」及其所有条目？')) send('deletePlaylist', { id: pl.id });
     }
 });
 fileInput.addEventListener('change', () => {
@@ -563,7 +605,7 @@ function refreshSelUI() {
         if (chk) chk.classList.toggle('checked', on);
     });
     $('#selBar').classList.toggle('hidden', !selMode);
-    $('#selCount').textContent = '已选 ' + selected.size + ' 首';
+    $('#selCount').textContent = '已选 ' + selected.size + ' 项';
 }
 
 let lpTimer = null, lpStart = null, lpSupp = false;
@@ -736,7 +778,7 @@ function openSelMenu(action) {
     const others = playlists.filter(p => p.id !== activeId);
     $('#selMenu').innerHTML = others.length
         ? others.map(p => '<div data-plid="' + esc(p.id) + '">' + esc(p.name) + '</div>').join('')
-        : '<div class="sel-none">（无其他歌单）</div>';
+        : '<div class="sel-none">（无其他播放列表）</div>';
     $('#selMenu').classList.remove('hidden');
 }
 function selIndices() { return [...selected].sort((a, b) => a - b); }
@@ -745,7 +787,7 @@ $('#selCopyBtn').addEventListener('click', () => openSelMenu('copy'));
 $('#selDelBtn').addEventListener('click', () => {
     const indices = selIndices();
     if (!indices.length) return;
-    if (confirm('删除选中的 ' + indices.length + ' 首歌曲？')) {
+    if (confirm('删除选中的 ' + indices.length + ' 个条目？')) {
         send('batchRemove', { indices: indices }).then(() => { exitSelMode(); refresh(); });
     }
 });

@@ -1,6 +1,6 @@
 const fs = require('fs');
 const vm = require('vm');
-const code = fs.readFileSync(require('path').join(__dirname, '..', 'logger.js'), 'utf8');
+const code = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'shared', 'logger.js'), 'utf8');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; console.log('  PASS: ' + msg); } else { fail++; console.log('  FAIL: ' + msg); } }

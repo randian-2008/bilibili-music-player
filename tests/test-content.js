@@ -1,6 +1,6 @@
 const fs = require('fs');
 const vm = require('vm');
-const code = fs.readFileSync(require('path').join(__dirname, '..', 'content.js'), 'utf8');
+const code = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'content', 'content.js'), 'utf8');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; console.log('  PASS: ' + msg); } else { fail++; console.log('  FAIL: ' + msg); } }
@@ -97,7 +97,7 @@ function makeCtx(opts) {
     r = await ctx.__api().handlePlayerCmd({ cmd: 'playIndex', index: 1 });
     ok(r.ok === false && /通信失败/.test(r.error), 'offscreen 通信失败原样返回、无兜底接管 (' + r.error + ')');
     // 业务错误：原样透传给用户
-    ctx = makeCtx({ playerResponder: () => ({ ok: false, error: '当前播放的歌单为空' }) });
+    ctx = makeCtx({ playerResponder: () => ({ ok: false, error: '当前播放列表为空' }) });
     r = await ctx.__api().handlePlayerCmd({ cmd: 'playIndex', index: 0 });
     ok(r.ok === false && /空/.test(r.error), '业务错误原样透传 (' + r.error + ')');
 
@@ -156,11 +156,17 @@ function makeCtx(opts) {
     );
     ok(importPayload.targetPlaylistId === 'latest' && importPayload.target === 'bg' &&
         importPayload.importTarget === 'current',
-        '确认导入使用后台路由和二次刷新后的当前歌单 ID');
-    const newPayload = ctx.__api().buildCollectionImportPayload(bvidB, 'new', { title: '默认标题' }, '自定义歌单');
+        '确认导入使用后台路由和二次刷新后的当前播放列表 ID');
+    const newPayload = ctx.__api().buildCollectionImportPayload(bvidB, 'new', { title: '默认标题' }, '自定义播放列表');
     ok(newPayload.target === 'bg' && newPayload.importTarget === 'new' &&
-        newPayload.name === '自定义歌单' && !newPayload.targetPlaylistId,
-        '新歌单导入不携带旧的当前歌单 ID');
+        newPayload.name === '自定义播放列表' && !newPayload.targetPlaylistId,
+        '新播放列表导入不携带旧的当前播放列表 ID');
+    const renamePayload = ctx.__api().buildCollectionImportPayload(
+        bvidB, 'current', { activePlaylistId: 'latest', title: '合集' }, '', true, '周杰伦'
+    );
+    ok(renamePayload.smartRename === true && renamePayload.renamePrefix === '周杰伦' &&
+        renamePayload.targetPlaylistId === 'latest',
+        '智能重命名选项和统一前缀会随合集导入请求传递');
     ok(/存储空间不足/.test(ctx.__api().formatCollectionError('QUOTA_BYTES quota exceeded')) &&
         /网络请求失败/.test(ctx.__api().formatCollectionError('Failed to fetch')),
         '存储配额和网络错误转换为可操作提示');
@@ -180,6 +186,12 @@ function makeCtx(opts) {
 
     ok(/'<div class="resize-grip"[^\n]*<\/div>' \+\s*'<\/div>' \+\s*'<div class="collection-dialog"/.test(code),
         '合集确认弹层是 .panel 的 Shadow DOM 同级节点');
+    ok(code.includes('collection-rename-check') && code.includes('collection-rename-prefix'),
+        '合集确认弹窗提供智能重命名和统一前缀控件');
+    ok(code.includes('collectionCancelBtn.hidden = true') &&
+        code.includes("collectionConfirmBtn.textContent = '确认'") &&
+        code.includes('collectionCancelBtn.hidden = false'),
+        '合集导入完成态隐藏取消按钮、仅保留确认按钮，并能在下次打开时恢复');
 
     console.log('\n[content.js 失效上下文自愈（v2.2.7：升级残留标签页）]');
     // 现场日志实锤：升级前开着的标签页里 runtime 调用全抛 "Extension context invalidated"，

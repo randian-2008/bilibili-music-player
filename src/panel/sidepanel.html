@@ -10,8 +10,8 @@
     <div class="player">
         <div class="np-bg" id="npBg"></div>
         <div class="np">
-            <div class="cover-wrap"><img class="cover" id="npCover" alt="" referrerpolicy="no-referrer"></div>
-            <div class="np-title t"><div class="track"><span class="txt" id="curTitle">未播放</span></div></div>
+            <div class="cover-wrap" data-locate-playing role="button" tabindex="-1" aria-disabled="true" title="定位到当前条目"><img class="cover" id="npCover" alt="" referrerpolicy="no-referrer"></div>
+            <div class="np-title t" data-locate-playing role="button" tabindex="-1" aria-disabled="true" title="定位到当前条目"><div class="track"><span class="txt" id="curTitle">未播放</span></div></div>
             <div class="np-ctrl">
                 <button id="prevBtn" class="cbtn" title="上一首"><svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg></button>
                 <button id="playBtn" class="cbtn main" title="播放/暂停"><svg viewBox="0 0 24 24" width="14" height="14"><path fill="currentColor" d="M8 5v14l11-7z"/></svg></button>
@@ -32,15 +32,15 @@
 
     <div class="listwrap">
         <div class="pl-bar">
-            <select id="plSelect" title="切换歌单"></select>
-            <button id="plNew" class="pbtn" title="新建歌单">＋</button>
-            <button id="plMenuBtn" class="pbtn" title="歌单操作">⋯</button>
+            <select id="plSelect" title="切换播放列表"></select>
+            <button id="plNew" class="pbtn" title="新建播放列表">＋</button>
+            <button id="plMenuBtn" class="pbtn" title="播放列表操作">⋯</button>
         </div>
         <input type="file" id="importFile" accept=".json,application/json" style="display:none">
         <div class="selbar hidden" id="selBar">
-            <span class="sel-count" id="selCount">已选 0 首</span>
+            <span class="sel-count" id="selCount">已选 0 项</span>
             <div class="sel-acts">
-                <button class="selbtn" id="selMoveBtn">移动至▾</button>
+                <button class="selbtn" id="selMoveBtn">移动到▾</button>
                 <button class="selbtn" id="selCopyBtn">复制到▾</button>
                 <button class="selbtn danger" id="selDelBtn">删除</button>
                 <button class="selbtn" id="selCancelBtn">取消</button>
@@ -51,15 +51,15 @@
     </div>
 
     <div id="plMenu" class="menu hidden">
-        <div data-act="rename">重命名歌单</div>
-        <div data-act="import">导入歌单 (JSON)</div>
+        <div data-act="rename">重命名播放列表</div>
+        <div data-act="import">导入播放列表 (JSON)</div>
         <div class="sep"></div>
         <div data-act="export-txt">导出为 TXT</div>
         <div data-act="export-md">导出为 Markdown</div>
         <div data-act="export-json">导出为 JSON</div>
         <div class="sep"></div>
-        <div data-act="clear">清空歌单</div>
-        <div data-act="delete" class="danger">删除歌单</div>
+        <div data-act="clear">清空播放列表</div>
+        <div data-act="delete" class="danger">删除播放列表</div>
         <div class="sep"></div>
         <div data-act="log">查看运行日志</div>
         <div data-act="log-export">导出日志 (TXT)</div>
@@ -68,8 +68,8 @@
 
     <div id="coverPop"><img id="coverPopImg" alt=""></div>
     <div id="diag" class="diag hidden"></div>
-    <script src="theme.js"></script>
-    <script src="logger.js"></script>
+    <script src="../shared/theme.js"></script>
+    <script src="../shared/logger.js"></script>
     <script src="sidepanel.js"></script>
 </body>
 </html>

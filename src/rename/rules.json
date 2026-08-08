@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "filters": [
+    {
+      "id": "strip-bracket-prefix",
+      "name": "Remove a bracketed prefix",
+      "enabled": false,
+      "scope": "segment",
+      "pattern": "^(?:\\[[^\\]]+\\]|【[^】]+】)\\s*",
+      "flags": "",
+      "replace": ""
+    },
+    {
+      "id": "strip-comment-tail",
+      "name": "Remove a long comma-separated comment",
+      "enabled": false,
+      "scope": "segment",
+      "pattern": "[，,].{8,}$",
+      "flags": "",
+      "replace": ""
+    },
+    {
+      "id": "normalize-feat-marker",
+      "name": "Normalize a feature marker",
+      "enabled": false,
+      "scope": "title",
+      "pattern": "\\s+(?:feat\\.?|ft\\.?)\\s+",
+      "flags": "gi",
+      "replace": " feat "
+    }
+  ]
+}

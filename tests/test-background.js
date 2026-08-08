@@ -308,6 +308,58 @@ function makeCtx(opts) {
         ctx.__store.bpl_playlists.some(p => p.name === '并发 A') && ctx.__store.bpl_playlists.some(p => p.name === '并发 B'),
         '并发修改依次提交，不发生最后写入覆盖');
 
+    console.log('\n[background 合集解析与导入]');
+    ctx = makeCtx({ fetchResponder: url => ({ code: 0, data: {
+        bvid: 'BV1SEASON001', title: '当前集', pic: '//img/season.jpg',
+        ugc_season: { title: '测试合集', cover: '//img/cover.jpg', season_type: 1, sections: [
+            { title: '正片', episodes: [
+                { bvid: 'BV1ITEM00001', cid: 101, title: '剧集一', arc: { pic: '//img/1.jpg', author: { name: 'UP' } }, page: { page: 1, cid: 101, duration: 10, part: '剧集一' } },
+                { bvid: 'BV2ITEM00002', cid: 201, title: '剧集二', arc: { pic: '//img/2.jpg', author: { name: 'UP' } }, pages: [
+                    { page: 1, cid: 201, duration: 20, part: '剧集二' },
+                    { page: 2, cid: 202, duration: 30, part: '第二部分' },
+                    { page: 2, cid: 202, duration: 30, part: '第二部分（重复引用）' }
+                ] }
+            ] },
+            { title: '番外', episodes: [{ bvid: 'BV3ITEM00003', cid: 301, title: '剧集三', arc: { pic: '//img/3.jpg', author: {} }, page: { page: 1, cid: 301, duration: 40, part: '剧集三' } }] }
+        ] }
+    }}) });
+    ctx.__store.bpl_playlists = [{ id: 'targetA', name: '当前歌单', items: [{ id: 'old', bvid: 'BV2ITEM00002', cid: 202, title: '已存在' }] }];
+    ctx.__store.bpl_active = 'targetA';
+    let summary = await ctx.handleBg({ cmd: 'getCollection', bvid: 'BV1SEASON001' }, null);
+    ok(summary.ok && summary.kind === 'season' && summary.count === 4 && summary.title === '测试合集' &&
+        summary.activePlaylistId === 'targetA' && summary.activePlaylistName === '当前歌单',
+        '合集摘要返回类型、数量和当前歌单');
+    ok(ctx.__fetchCalls() === 1, '合集检测只请求一次 view API');
+    let cached = await ctx.handleBg({ cmd: 'getCollection', bvid: 'BV1SEASON001' }, null);
+    ok(cached.ok && cached.count === 4 && ctx.__fetchCalls() === 1, '同一 BVID 命中后台缓存');
+    let imported = await ctx.handleBg({ target: 'bg', cmd: 'importCollection', bvid: 'BV1SEASON001', importTarget: 'current', targetPlaylistId: 'targetA' }, null);
+    let targetItems = ctx.__store.bpl_playlists[0].items;
+    ok(imported.ok && imported.added === 3 && imported.dup === 1 && targetItems.length === 4,
+        '导入当前歌单按 bvid+cid 去重并返回 added/dup');
+    ok(targetItems[1].title === '剧集一' && targetItems[2].title === '剧集二' &&
+        targetItems[3].title === '剧集三', '非嵌套合集条目只使用分P名，不添加分区或视频标题');
+    let newImported = await ctx.handleBg({ target: 'bg', cmd: 'importCollection', bvid: 'BV1SEASON001', importTarget: 'new', name: '新合集歌单' }, null);
+    const newPlaylist = ctx.__store.bpl_playlists.find(p => p.id === newImported.playlistId);
+    ok(newImported.ok && newImported.added === 4 && ctx.__store.bpl_active === newImported.playlistId &&
+        newPlaylist && newPlaylist.items.length === 4 && newPlaylist.items[1].title === '剧集二' &&
+        newPlaylist.items[2].title === '剧集二 · 第二部分',
+        '合集内嵌多P仅在分P名前添加所属视频标题，并避免重复前缀');
+
+    ctx = makeCtx({ fetchResponder: () => ({ code: 0, data: {
+        bvid: 'BV1PAGES0001', title: '多P视频', pic: 'http://img/pages.jpg', owner: { name: '作者' },
+        pages: [{ page: 1, cid: 11, duration: 5, part: '多P视频' }, { page: 2, cid: 12, duration: 6, part: '第二P' }]
+    }}) });
+    ctx.__store.bpl_playlists = [{ id: 'p', name: 'P', items: [] }]; ctx.__store.bpl_active = 'p';
+    summary = await ctx.handleBg({ cmd: 'getCollection', bvid: 'BV1PAGES0001' }, null);
+    ok(summary.ok && summary.kind === 'pages' && summary.count === 2, '普通多P视频识别为 pages');
+    let pageImport = await ctx.handleBg({ target: 'bg', cmd: 'importCollection', bvid: 'BV1PAGES0001', importTarget: 'current', targetPlaylistId: 'p' }, null);
+    ok(pageImport.ok && ctx.__store.bpl_playlists[0].items.map(item => item.title).join(',') === '多P视频,第二P',
+        '普通多P条目只使用分P名，不添加视频标题前缀');
+    ctx = makeCtx({ fetchResponder: () => ({ code: 0, data: { bvid: 'BV1NONE00001', title: '普通视频', pages: [{ page: 1, cid: 1 }] } }) });
+    let none = await ctx.handleBg({ cmd: 'getCollection', bvid: 'BV1NONE00001' }, null);
+    ok(none.ok === false && none.notCollection === true && /不属于合集/.test(none.error) && ctx.__fetchCalls() === 1,
+        '普通单视频返回可缓存的非合集结果，不显示合集入口');
+
     console.log('\n[background 新建歌单点播路由 / 残缺条目修复]');
     ctx = makeCtx({ offscreenResponder: msg => ({ ok: true, echoed: msg.cmd }) });
     ctx.__store.bpl_playlists = [

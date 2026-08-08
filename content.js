@@ -19,11 +19,24 @@
     const THEME_KEY = THEME_API ? THEME_API.STORAGE_KEY : 'bpl_theme';
     const THEME_PICKER_ORDER = ['paper', 'gold', 'jade', 'starry', 'glass', 'clear'];
 
-    let shadow, hostEl, mini, miniPlay, panel, pframe, addBtn, addTxt, resizeGrip, themePicker;
+    let shadow, hostEl, mini, miniPlay, panel, pframe, addBtn, addTxt, collectionBtn, collectionTxt,
+        collectionDialog, collectionDialogTitle, collectionDialogCount, collectionTargetName,
+        collectionNameInput, collectionStatus, collectionConfirmBtn, resizeGrip, themePicker;
     let panelOpen = false;
     let frameLoaded = false;
     let built = false;
     let posX = null, posY = null, panelWidth = null, panelHeight = null;
+    let collectionProbeBvid = '';
+    let collectionProbeAt = 0;
+    let collectionProbeInFlight = false;
+    let collectionProbePromise = null;
+    let collectionProbeToken = 0;
+    let collectionSummaryState = null;
+    let collectionDialogBvid = '';
+    let collectionDialogMode = 'current';
+    let collectionActionBusy = false;
+    let collectionActionToken = 0;
+    const COLLECTION_PROBE_RETRY_MS = 30000;
 
     const PANEL_MARGIN = 4;
     const PANEL_MIN_WIDTH = 300;
@@ -42,6 +55,50 @@
 
     function isBiliVideo() {
         return /(^|\.)bilibili\.com$/.test(location.hostname) && /^\/video\//.test(location.pathname);
+    }
+
+    function getCurrentBvid() {
+        if (!isBiliVideo()) return '';
+        const match = String(location.pathname || '').match(/^\/video\/(BV[0-9A-Za-z]{10,})(?:\/|$)/);
+        return match ? match[1] : '';
+    }
+
+    function sendBgRequest(payload, timeout) {
+        return new Promise(resolve => {
+            let settled = false;
+            let timer = null;
+            const finish = value => {
+                if (settled) return;
+                settled = true;
+                if (timer) clearTimeout(timer);
+                resolve(value);
+            };
+            timer = setTimeout(() => finish({ ok: false, error: '后台响应超时，请稍后重试' }), timeout || 15000);
+            try {
+                chrome.runtime.sendMessage(payload, response => {
+                    const lastError = chrome.runtime && chrome.runtime.lastError;
+                    if (lastError) {
+                        reviveIfDead(lastError);
+                        finish({ ok: false, error: String(lastError.message || lastError) });
+                        return;
+                    }
+                    finish(response || { ok: false, error: '后台无响应，请稍后重试' });
+                });
+            } catch (error) {
+                reviveIfDead(error);
+                finish({ ok: false, error: String((error && error.message) || error) });
+            }
+        });
+    }
+
+    function formatCollectionError(error) {
+        const text = String((error && error.message) || error || '导入失败，请稍后重试');
+        if (/quota|QUOTA_BYTES|storage.*(full|limit)|存储.*(空间|上限)/i.test(text)) {
+            return '扩展存储空间不足，请清理部分歌单后重试';
+        }
+        if (/timeout|超时/i.test(text)) return '网络响应超时，请稍后重试';
+        if (/failed to fetch|network|网络/i.test(text)) return '网络请求失败，请检查网络后重试';
+        return text.replace(/^Error:\s*/, '');
     }
 
     // ===================== 音频播放（offscreen 唯一宿主，命令一律经后台转发，无兜底） =====================
@@ -180,6 +237,9 @@
         '.pbtn:active{transform:translateY(1px);box-shadow:var(--bpl-control-active-shadow)}' +
         '.pbtn.add{color:var(--bpl-accent);font-size:13px;width:auto;padding:0 9px;font-weight:600}' +
         '.pbtn.add:hover{background:var(--bpl-accent-soft)}' +
+        '.pbtn.collection-add{font-size:12px;width:auto;padding:0 8px;color:var(--bpl-on-accent);' +
+        'background:var(--bpl-accent);border-color:var(--bpl-accent);font-weight:650}' +
+        '.pbtn.collection-add:hover{background:var(--bpl-accent-hover);border-color:var(--bpl-accent-hover)}' +
         '.theme-picker{flex:none;display:flex;align-items:center;gap:4px}' +
         '.theme-swatches{display:flex;align-items:center;gap:3px;max-width:0;opacity:0;overflow:hidden;' +
         'pointer-events:none;transition:max-width .22s ease,opacity .16s ease}' +
@@ -208,7 +268,37 @@
         '.resize-grip::before,.resize-grip::after{content:"";position:absolute;height:1px;border-radius:.5px;' +
         'background:currentColor;transform:rotate(-45deg);transform-origin:center}' +
         '.resize-grip::before{right:2px;bottom:7px;width:12px}' +
-        '.resize-grip::after{right:2px;bottom:4px;width:6px}';
+        '.resize-grip::after{right:2px;bottom:4px;width:6px}' +
+
+        '.collection-dialog{position:fixed;z-index:' + (Z + 1) + ';right:20px;bottom:146px;width:340px;height:540px;' +
+        'display:flex;align-items:center;justify-content:center;padding:12px;border-radius:12px;' +
+        'background:rgba(0,0,0,.28);opacity:0;visibility:hidden;pointer-events:none;' +
+        'transition:opacity .16s ease,visibility 0s linear .16s}' +
+        '.collection-dialog.open{opacity:1;visibility:visible;pointer-events:auto;transition:opacity .16s ease}' +
+        '.collection-sheet{width:min(300px,100%);max-height:100%;overflow:auto;padding:16px;border-radius:8px;' +
+        'background:var(--bpl-panel-bg,var(--bpl-raised));border:1px solid var(--bpl-border-strong);color:var(--bpl-text);' +
+        '-webkit-backdrop-filter:blur(18px) saturate(1.25);backdrop-filter:blur(18px) saturate(1.25);' +
+        'box-shadow:0 14px 36px var(--bpl-shadow-strong),inset 0 1px 0 var(--bpl-surface-highlight)}' +
+        '.collection-heading{margin:0;font-size:16px;line-height:1.35;font-weight:700;letter-spacing:0}' +
+        '.collection-title{margin:8px 0 2px;font-size:13px;line-height:1.45;overflow-wrap:anywhere}' +
+        '.collection-count{margin:0 0 12px;color:var(--bpl-faint);font-size:12px;line-height:1.4}' +
+        '.collection-targets{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:9px}' +
+        '.collection-choice{height:30px;border:1px solid var(--bpl-border-strong);border-radius:6px;' +
+        'background:var(--bpl-control);color:var(--bpl-text);font-size:12px;cursor:pointer;box-shadow:var(--bpl-control-shadow)}' +
+        '.collection-choice.selected{color:var(--bpl-on-accent);background:var(--bpl-accent);border-color:var(--bpl-accent)}' +
+        '.collection-target-name{min-height:18px;margin:0 0 9px;color:var(--bpl-faint);font-size:12px;line-height:1.45;overflow-wrap:anywhere}' +
+        '.collection-new-name{width:100%;height:30px;margin:0 0 9px;padding:0 9px;border:1px solid var(--bpl-border-strong);' +
+        'border-radius:6px;background:var(--bpl-control);color:var(--bpl-text);font:12px system-ui,"PingFang SC","Microsoft YaHei",sans-serif;outline:none}' +
+        '.collection-new-name:focus{border-color:var(--bpl-accent)}' +
+        '.collection-dialog[data-mode="current"] .collection-new-name{display:none}' +
+        '.collection-status{min-height:18px;margin:0 0 9px;color:var(--bpl-faint);font-size:12px;line-height:1.45;overflow-wrap:anywhere}' +
+        '.collection-status.error{color:var(--bpl-danger,var(--bpl-accent))}' +
+        '.collection-status.success{color:var(--bpl-accent)}' +
+        '.collection-actions{display:flex;justify-content:flex-end;gap:7px}' +
+        '.collection-action{height:30px;padding:0 12px;border:1px solid var(--bpl-border-strong);border-radius:6px;' +
+        'background:var(--bpl-control);color:var(--bpl-text);font-size:12px;cursor:pointer;box-shadow:var(--bpl-control-shadow)}' +
+        '.collection-action.primary{background:var(--bpl-accent);border-color:var(--bpl-accent);color:var(--bpl-on-accent);font-weight:650}' +
+        '.collection-action:disabled,.collection-choice:disabled{cursor:wait;opacity:.6}';
 
     function orderedThemes() {
         if (!THEME_API) return [];
@@ -312,10 +402,27 @@
             '<span class="gripbar" title="拖动面板">⠿</span>' +
             themeMarkup +
             '<button class="pbtn add" title="把当前B站视频加入歌单" style="display:none"><span class="addtxt">＋加入</span></button>' +
+            '<button class="pbtn collection-add" title="把当前合集或多P视频全部加入歌单" style="display:none"><span class="collectiontxt">全部加入</span></button>' +
             '</div>' +
             '<div class="pbody"><iframe class="pframe" title="playlist" allow="autoplay"></iframe></div>' +
             '<div class="resize-grip" title="调整面板大小"></div>' +
-            '</div>';
+            '</div>' +
+            '<div class="collection-dialog" data-mode="current" role="dialog" aria-modal="true" aria-hidden="true" aria-labelledby="bpl-collection-heading">' +
+            '<div class="collection-sheet">' +
+            '<h2 class="collection-heading" id="bpl-collection-heading">导入合集</h2>' +
+            '<p class="collection-title"></p>' +
+            '<p class="collection-count"></p>' +
+            '<div class="collection-targets" role="radiogroup" aria-label="导入目标">' +
+            '<button class="collection-choice selected" type="button" data-collection-target="current" role="radio" aria-checked="true">当前歌单</button>' +
+            '<button class="collection-choice" type="button" data-collection-target="new" role="radio" aria-checked="false">新建歌单</button>' +
+            '</div>' +
+            '<p class="collection-target-name"></p>' +
+            '<input class="collection-new-name" maxlength="100" aria-label="新歌单名称" placeholder="新歌单名称">' +
+            '<p class="collection-status" role="status" aria-live="polite"></p>' +
+            '<div class="collection-actions">' +
+            '<button class="collection-action cancel" type="button">取消</button>' +
+            '<button class="collection-action primary confirm" type="button">确认导入</button>' +
+            '</div></div></div>';
 
         mini = shadow.querySelector('.mini');
         miniPlay = shadow.querySelector('.m-play');
@@ -323,6 +430,15 @@
         pframe = shadow.querySelector('.pframe');
         addBtn = shadow.querySelector('.add');
         addTxt = shadow.querySelector('.addtxt');
+        collectionBtn = shadow.querySelector('.collection-add');
+        collectionTxt = shadow.querySelector('.collectiontxt');
+        collectionDialog = shadow.querySelector('.collection-dialog');
+        collectionDialogTitle = shadow.querySelector('.collection-title');
+        collectionDialogCount = shadow.querySelector('.collection-count');
+        collectionTargetName = shadow.querySelector('.collection-target-name');
+        collectionNameInput = shadow.querySelector('.collection-new-name');
+        collectionStatus = shadow.querySelector('.collection-status');
+        collectionConfirmBtn = shadow.querySelector('.collection-action.confirm');
         resizeGrip = shadow.querySelector('.resize-grip');
         themePicker = shadow.querySelector('.theme-picker');
 
@@ -334,6 +450,8 @@
         makeMiniDraggable();
         initThemePicker();
         addBtn.addEventListener('click', addCurrent);
+        collectionBtn.addEventListener('click', openCollectionDialog);
+        collectionDialog.addEventListener('click', handleCollectionDialogClick);
         makeDraggable(panel, shadow.querySelector('.phead'));
         makeResizable(panel, resizeGrip);
 
@@ -395,6 +513,11 @@
             if (hostEl && hostEl.contains(e.target)) return;
             toggle(false);
         }, true);
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape' && collectionDialog && collectionDialog.classList.contains('open')) {
+                closeCollectionDialog();
+            }
+        }, true);
 
         chrome.storage.local.get('bpl_mini').then(r => {
             const p = (r && r.bpl_mini) || {};
@@ -440,11 +563,15 @@
         panel.style.height = g.height + 'px';
         posX = g.x; posY = g.y;
         panelWidth = g.width; panelHeight = g.height;
+        syncCollectionDialogGeometry();
     }
 
     let viewportPersistTimer = null;
     function keepPanelInViewport() {
-        if (!panel || !panel.classList.contains('sized')) return;
+        if (!panel || !panel.classList.contains('sized')) {
+            syncCollectionDialogGeometry();
+            return;
+        }
         applyPanelGeometry(clampPanelGeometry(
             posX, posY, panelWidth, panelHeight, window.innerWidth, window.innerHeight
         ));
@@ -470,12 +597,248 @@
     function toggle(open) {
         panelOpen = (open == null) ? !panelOpen : !!open;
         panel.classList.toggle('open', panelOpen);
-        if (!panelOpen) setThemePickerOpen(false);
+        if (!panelOpen) {
+            setThemePickerOpen(false);
+            closeCollectionDialog();
+        }
         if (panelOpen) { ensureFrame(); updateAddBtn(); }
     }
 
     function updateAddBtn() {
-        if (addBtn) addBtn.style.display = isBiliVideo() ? '' : 'none';
+        const bvid = getCurrentBvid();
+        if (addBtn) addBtn.style.display = bvid ? '' : 'none';
+        syncCollectionPage(bvid);
+        if (panelOpen && bvid) probeCollection(false);
+    }
+
+    function syncCollectionPage(bvid) {
+        bvid = String(bvid || '');
+        if (bvid === collectionProbeBvid) return;
+        collectionProbeToken++;
+        collectionProbeBvid = bvid;
+        collectionProbeAt = 0;
+        collectionProbeInFlight = false;
+        collectionProbePromise = null;
+        collectionSummaryState = null;
+        if (collectionBtn) {
+            collectionBtn.style.display = 'none';
+            collectionBtn.disabled = false;
+        }
+        if (collectionTxt) collectionTxt.textContent = '全部加入';
+        closeCollectionDialog();
+    }
+
+    function collectionRequestIsCurrent(bvid, token) {
+        return token === collectionProbeToken && bvid === collectionProbeBvid && bvid === getCurrentBvid();
+    }
+
+    function probeCollection(force) {
+        const bvid = getCurrentBvid();
+        syncCollectionPage(bvid);
+        if (!bvid) return Promise.resolve({ ok: false, unavailable: true });
+        if (collectionProbeInFlight && collectionProbePromise) return collectionProbePromise;
+        const now = Date.now();
+        if (!force && collectionSummaryState) return Promise.resolve(collectionSummaryState);
+        if (!force && collectionProbeAt && now - collectionProbeAt < COLLECTION_PROBE_RETRY_MS) {
+            return Promise.resolve({ ok: false, cooldown: true });
+        }
+
+        const token = ++collectionProbeToken;
+        collectionProbeAt = now;
+        collectionProbeInFlight = true;
+        const task = sendBgRequest({ target: 'bg', cmd: 'getCollection', bvid: bvid }, 15000).then(result => {
+            if (!collectionRequestIsCurrent(bvid, token)) return { ok: false, stale: true };
+            collectionProbeInFlight = false;
+            collectionProbePromise = null;
+            if (result && result.ok && Number(result.count) > 0) {
+                collectionSummaryState = result;
+                if (collectionBtn) {
+                    collectionBtn.style.display = '';
+                    collectionBtn.title = '导入《' + String(result.title || bvid) + '》的全部 ' + result.count + ' 个视频';
+                }
+                return result;
+            }
+            collectionSummaryState = null;
+            if (collectionBtn) collectionBtn.style.display = 'none';
+            if (result && result.notCollection) collectionProbeAt = Number.POSITIVE_INFINITY;
+            return result || { ok: false, error: '无法获取合集信息' };
+        });
+        collectionProbePromise = task;
+        return task;
+    }
+
+    async function openCollectionDialog() {
+        const bvid = getCurrentBvid();
+        if (!bvid || collectionActionBusy) return;
+        if (collectionBtn) collectionBtn.disabled = true;
+        if (collectionTxt) collectionTxt.textContent = '读取中…';
+        const result = await probeCollection(true);
+        if (collectionBtn) collectionBtn.disabled = false;
+        if (collectionTxt) collectionTxt.textContent = '全部加入';
+        if (!result || !result.ok || getCurrentBvid() !== bvid) return;
+
+        collectionDialogBvid = bvid;
+        collectionSummaryState = result;
+        collectionDialogMode = result.activePlaylistId ? 'current' : 'new';
+        if (collectionDialogTitle) collectionDialogTitle.textContent = '《' + String(result.title || bvid) + '》';
+        if (collectionDialogCount) collectionDialogCount.textContent = '共 ' + Number(result.count || 0) + ' 个视频';
+        if (collectionNameInput) collectionNameInput.value = String(result.title || '').slice(0, 100);
+        if (collectionStatus) {
+            collectionStatus.textContent = '';
+            collectionStatus.className = 'collection-status';
+        }
+        if (collectionConfirmBtn) collectionConfirmBtn.textContent = '确认导入';
+        if (collectionDialog) delete collectionDialog.dataset.complete;
+        setCollectionDialogMode(collectionDialogMode);
+        syncCollectionDialogGeometry();
+        collectionDialog.classList.add('open');
+        collectionDialog.setAttribute('aria-hidden', 'false');
+    }
+
+    function setCollectionDialogMode(mode) {
+        collectionDialogMode = mode === 'new' ? 'new' : 'current';
+        if (!collectionDialog) return;
+        collectionDialog.dataset.mode = collectionDialogMode;
+        collectionDialog.querySelectorAll('[data-collection-target]').forEach(button => {
+            const selected = button.dataset.collectionTarget === collectionDialogMode;
+            button.classList.toggle('selected', selected);
+            button.setAttribute('aria-checked', selected ? 'true' : 'false');
+        });
+        if (collectionTargetName) {
+            collectionTargetName.textContent = collectionDialogMode === 'new'
+                ? '将创建新歌单并自动切换到该歌单'
+                : '目标：' + String(collectionSummaryState && collectionSummaryState.activePlaylistName || '当前歌单');
+        }
+        if (collectionDialogMode === 'new' && collectionNameInput) collectionNameInput.focus();
+    }
+
+    function syncCollectionDialogGeometry() {
+        if (!collectionDialog || !panel) return;
+        const rect = panel.getBoundingClientRect();
+        if (!rect.width || !rect.height) return;
+        collectionDialog.style.left = rect.left + 'px';
+        collectionDialog.style.top = rect.top + 'px';
+        collectionDialog.style.right = 'auto';
+        collectionDialog.style.bottom = 'auto';
+        collectionDialog.style.width = rect.width + 'px';
+        collectionDialog.style.height = rect.height + 'px';
+    }
+
+    function setCollectionControlsDisabled(disabled) {
+        if (!collectionDialog) return;
+        collectionDialog.querySelectorAll('.collection-choice,.collection-action,.collection-new-name').forEach(control => {
+            control.disabled = !!disabled;
+        });
+    }
+
+    function closeCollectionDialog() {
+        collectionActionToken++;
+        collectionActionBusy = false;
+        collectionDialogBvid = '';
+        if (!collectionDialog) return;
+        collectionDialog.classList.remove('open');
+        collectionDialog.setAttribute('aria-hidden', 'true');
+        delete collectionDialog.dataset.complete;
+        setCollectionControlsDisabled(false);
+        if (collectionConfirmBtn) collectionConfirmBtn.textContent = '确认导入';
+    }
+
+    function handleCollectionDialogClick(event) {
+        if (!collectionDialog) return;
+        if (event.target === collectionDialog || event.target.closest('.collection-action.cancel')) {
+            closeCollectionDialog();
+            return;
+        }
+        const choice = event.target.closest('[data-collection-target]');
+        if (choice && !collectionActionBusy) {
+            setCollectionDialogMode(choice.dataset.collectionTarget);
+            return;
+        }
+        if (event.target.closest('.collection-action.confirm')) {
+            if (collectionDialog.dataset.complete === 'true') closeCollectionDialog();
+            else confirmCollectionImport();
+        }
+    }
+
+    async function confirmCollectionImport() {
+        if (collectionActionBusy || !collectionDialogBvid) return;
+        const bvid = collectionDialogBvid;
+        const token = ++collectionActionToken;
+        collectionActionBusy = true;
+        setCollectionControlsDisabled(true);
+        if (collectionStatus) {
+            collectionStatus.className = 'collection-status';
+            collectionStatus.textContent = collectionDialogMode === 'new' ? '正在创建歌单并导入…' : '正在确认目标歌单…';
+        }
+
+        let latestSummary = collectionSummaryState;
+        if (collectionDialogMode === 'current') {
+            latestSummary = await sendBgRequest({ target: 'bg', cmd: 'getCollection', bvid: bvid }, 15000);
+            if (token !== collectionActionToken || bvid !== getCurrentBvid()) return;
+            if (!latestSummary || !latestSummary.ok) {
+                finishCollectionImportError(latestSummary && latestSummary.error);
+                return;
+            }
+            collectionSummaryState = latestSummary;
+            if (collectionTargetName) collectionTargetName.textContent = '目标：' + String(latestSummary.activePlaylistName || '当前歌单');
+        }
+
+        const payload = buildCollectionImportPayload(
+            bvid,
+            collectionDialogMode,
+            latestSummary,
+            collectionNameInput && collectionNameInput.value
+        );
+        if (collectionStatus) collectionStatus.textContent = collectionDialogMode === 'new' ? '正在导入合集…' : '正在导入到当前歌单…';
+        const result = await sendBgRequest(payload, 30000);
+        if (token !== collectionActionToken || bvid !== getCurrentBvid()) return;
+        if (!result || !result.ok) {
+            finishCollectionImportError(result && result.error);
+            return;
+        }
+
+        collectionActionBusy = false;
+        setCollectionControlsDisabled(true);
+        if (collectionStatus) {
+            const added = Number(result.added) || 0;
+            const dup = Number(result.dup) || 0;
+            collectionStatus.className = 'collection-status success';
+            if (collectionDialogMode === 'new') collectionStatus.textContent = '已创建歌单并导入 ' + added + ' 个视频';
+            else if (!added && dup) collectionStatus.textContent = '全部 ' + dup + ' 个视频均已在当前歌单中';
+            else if (dup) collectionStatus.textContent = '已加入 ' + added + ' 个视频，跳过 ' + dup + ' 个重复项';
+            else collectionStatus.textContent = '已加入 ' + added + ' 个视频';
+        }
+        if (collectionDialog) collectionDialog.dataset.complete = 'true';
+        if (collectionConfirmBtn) {
+            collectionConfirmBtn.disabled = false;
+            collectionConfirmBtn.textContent = '完成';
+        }
+        const cancel = collectionDialog && collectionDialog.querySelector('.collection-action.cancel');
+        if (cancel) cancel.disabled = false;
+    }
+
+    function finishCollectionImportError(error) {
+        collectionActionBusy = false;
+        setCollectionControlsDisabled(false);
+        if (collectionStatus) {
+            collectionStatus.className = 'collection-status error';
+            collectionStatus.textContent = formatCollectionError(error);
+        }
+    }
+
+    function buildCollectionImportPayload(bvid, mode, summary, name) {
+        const payload = {
+            target: 'bg',
+            cmd: 'importCollection',
+            bvid: String(bvid || ''),
+            importTarget: mode === 'new' ? 'new' : 'current'
+        };
+        if (payload.importTarget === 'current' && summary && summary.activePlaylistId) {
+            payload.targetPlaylistId = summary.activePlaylistId;
+        } else if (payload.importTarget === 'new') {
+            payload.name = String(name || summary && summary.title || '').trim().slice(0, 100);
+        }
+        return payload;
     }
 
     function addCurrent() {
@@ -655,7 +1018,18 @@
             getPlayerState: () => playerState,
             updateMiniUI: updateMiniUI,
             bridgeDecision: bridgeDecision,
-            clampPanelGeometry: clampPanelGeometry
+            clampPanelGeometry: clampPanelGeometry,
+            getCurrentBvid: getCurrentBvid,
+            probeCollection: probeCollection,
+            formatCollectionError: formatCollectionError,
+            buildCollectionImportPayload: buildCollectionImportPayload,
+            getCollectionProbeState: () => ({
+                bvid: collectionProbeBvid,
+                available: !!collectionSummaryState,
+                summary: collectionSummaryState,
+                inFlight: collectionProbeInFlight,
+                token: collectionProbeToken
+            })
         });
     }
 

@@ -27,7 +27,7 @@ function makeCtx(opts) {
         window: win,
         sessionStorage: sess,
         location: {
-            protocol: 'https:', hostname: 'www.bilibili.com', pathname: '/video/BV1', search: '',
+            protocol: 'https:', hostname: opts.hostname || 'www.bilibili.com', pathname: opts.pathname || '/video/BV1', search: '',
             reload: () => { reloads++; }
         },
         document: { body: null, getElementById: () => null, createElement: () => ({}), title: 'T' },
@@ -39,6 +39,9 @@ function makeCtx(opts) {
                     // 模拟“扩展上下文失效”（升级前残留标签页）：所有 runtime 调用同步抛错
                     if (opts.sendThrows) throw new Error(opts.sendThrows);
                     sent.push(msg);
+                    if (msg && msg.cmd === 'getCollection' && opts.collectionResponder) {
+                        return opts.collectionResponder(msg, cb);
+                    }
                     let res;
                     if (msg && msg.cmd === 'player') res = playerResponder(msg.payload);
                     else if (msg && msg.cmd === 'resolveAudio') res = { ok: true, urls: ['https://cdn/a.m4s'] };
@@ -120,6 +123,63 @@ function makeCtx(opts) {
     g = clamp(-200, 900, 400, 350, 1000, 800);
     ok(g.x === 4 && g.y === 446 && g.width === 400 && g.height === 350,
         '越界位置被钳制到完整可见范围');
+
+    console.log('\n[content.js 合集检测与 SPA 竞态保护]');
+    const bvidA = 'BV1ABCDEF123';
+    const bvidB = 'BV1ABCDEF124';
+    const pending = {};
+    ctx = makeCtx({
+        pathname: '/video/' + bvidA + '/',
+        collectionResponder: (msg, cb) => { pending[msg.bvid] = cb; }
+    });
+    ok(ctx.__api().getCurrentBvid() === bvidA, '从 B站视频路径解析当前 BVID');
+    let requestA = ctx.__api().probeCollection(true);
+    ctx.location.pathname = '/video/' + bvidB;
+    let requestB = ctx.__api().probeCollection(true);
+    pending[bvidA]({ ok: true, bvid: bvidA, title: '旧页面合集', count: 2, activePlaylistId: 'old' });
+    r = await requestA;
+    ok(r.stale === true, 'SPA 切页后忽略旧 BVID 的迟到响应');
+    pending[bvidB]({ ok: true, bvid: bvidB, title: '新页面合集', count: 3, activePlaylistId: 'new' });
+    r = await requestB;
+    st = ctx.__api().getCollectionProbeState();
+    ok(r.ok && st.available && st.bvid === bvidB && st.summary.title === '新页面合集',
+        '只保留当前 BVID 的合集摘要');
+    const beforeRepeat = ctx.__sent.filter(m => m.cmd === 'getCollection').length;
+    await ctx.__api().probeCollection(false);
+    const afterRepeat = ctx.__sent.filter(m => m.cmd === 'getCollection').length;
+    ok(beforeRepeat === afterRepeat, '已检测的同一 BVID 不被 2 秒轮询重复请求');
+
+    ctx.location.pathname = '/space/123';
+    ok(ctx.__api().getCurrentBvid() === '', '离开视频页后不保留旧 BVID');
+    const importPayload = ctx.__api().buildCollectionImportPayload(
+        bvidB, 'current', { activePlaylistId: 'latest', title: '合集' }, ''
+    );
+    ok(importPayload.targetPlaylistId === 'latest' && importPayload.target === 'bg' &&
+        importPayload.importTarget === 'current',
+        '确认导入使用后台路由和二次刷新后的当前歌单 ID');
+    const newPayload = ctx.__api().buildCollectionImportPayload(bvidB, 'new', { title: '默认标题' }, '自定义歌单');
+    ok(newPayload.target === 'bg' && newPayload.importTarget === 'new' &&
+        newPayload.name === '自定义歌单' && !newPayload.targetPlaylistId,
+        '新歌单导入不携带旧的当前歌单 ID');
+    ok(/存储空间不足/.test(ctx.__api().formatCollectionError('QUOTA_BYTES quota exceeded')) &&
+        /网络请求失败/.test(ctx.__api().formatCollectionError('Failed to fetch')),
+        '存储配额和网络错误转换为可操作提示');
+
+    const collectionRequests = [];
+    ctx = makeCtx({
+        pathname: '/video/' + bvidA,
+        collectionResponder: (msg, cb) => {
+            collectionRequests.push(msg.bvid);
+            cb({ ok: false, notCollection: true, error: '当前视频不属于合集或多P视频' });
+        }
+    });
+    await ctx.__api().probeCollection(false);
+    await ctx.__api().probeCollection(false);
+    ok(collectionRequests.length === 1 && !ctx.__api().getCollectionProbeState().available,
+        '普通单视频检测一次后保持隐藏，不持续请求后台');
+
+    ok(/'<div class="resize-grip"[^\n]*<\/div>' \+\s*'<\/div>' \+\s*'<div class="collection-dialog"/.test(code),
+        '合集确认弹层是 .panel 的 Shadow DOM 同级节点');
 
     console.log('\n[content.js 失效上下文自愈（v2.2.7：升级残留标签页）]');
     // 现场日志实锤：升级前开着的标签页里 runtime 调用全抛 "Extension context invalidated"，

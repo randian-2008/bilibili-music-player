@@ -100,6 +100,10 @@ function normUrl(u) {
 }
 const NETWORK_TIMEOUT_MS = 5000;
 const NETWORK_RETRY_DELAY_MS = 250;
+const COLLECTION_CACHE_TTL_MS = 5 * 60 * 1000;
+const COLLECTION_CACHE_MAX = 20;
+const collectionCache = new Map();
+const collectionInflight = new Map();
 function waitMs(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function isRetryableNetworkError(error) {
     const status = Number(error && error.status) || 0;
@@ -145,6 +149,135 @@ async function biliFetch(url) {
         }
     }
     throw lastError || new Error('网络请求失败');
+}
+
+function isValidBvid(bvid) { return /^BV[0-9A-Za-z]{10,}$/.test(String(bvid || '')); }
+function collectionKey(bvid) { return String(bvid || ''); }
+function collectionItemKey(item) { return String(item.bvid || '') + ':' + String(Number(item.cid) || 0); }
+function addCollectionItem(items, seen, item) {
+    const bvid = String(item.bvid || '');
+    const cid = Number(item.cid) || 0;
+    if (!isValidBvid(bvid) || !cid) return;
+    const normalized = {
+        bvid: bvid,
+        cid: cid,
+        title: String(item.title || bvid),
+        pic: normUrl(item.pic),
+        owner: String(item.owner || ''),
+        duration: Number(item.duration) || 0,
+        page: Number(item.page) || 1
+    };
+    const key = collectionItemKey(normalized);
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push(normalized);
+}
+function collectionItemTitle(episodeTitle, part, nested, fallback) {
+    const episode = String(episodeTitle || '').trim();
+    const pagePart = String(part || '').trim();
+    if (!nested) return pagePart || episode || String(fallback || '未命名视频');
+    if (episode && pagePart && episode !== pagePart) return episode + ' · ' + pagePart;
+    return pagePart || episode || String(fallback || '未命名视频');
+}
+function mapCollection(data, bvid) {
+    const items = [], seen = new Set();
+    const season = data && data.ugc_season;
+    if (season && Array.isArray(season.sections) && season.sections.length) {
+        for (const section of season.sections) {
+            for (const episode of ((section && Array.isArray(section.episodes)) ? section.episodes : [])) {
+                const pages = Array.isArray(episode.pages) && episode.pages.length
+                    ? episode.pages : (episode.page ? [episode.page] : []);
+                for (const page of pages) {
+                    const arc = episode.arc || {};
+                    const owner = arc.author && arc.author.name;
+                    addCollectionItem(items, seen, {
+                        bvid: episode.bvid,
+                        cid: page.cid || episode.cid,
+                        title: collectionItemTitle(episode.title, page.part, pages.length > 1, episode.bvid || bvid),
+                        pic: arc.pic || episode.pic || season.cover,
+                        owner: owner || '',
+                        duration: page.duration || arc.duration || episode.duration,
+                        page: page.page
+                    });
+                }
+            }
+        }
+        return { kind: 'season', title: String(season.title || data.title || bvid), cover: normUrl(season.cover || data.pic), items };
+    }
+    const pages = data && Array.isArray(data.pages) ? data.pages : [];
+    if (pages.length > 1) {
+        for (const page of pages) {
+            const part = String(page.part || '').trim();
+            addCollectionItem(items, seen, {
+                bvid: data.bvid || bvid,
+                cid: page.cid,
+                title: part || String(data.title || bvid),
+                pic: data.pic,
+                owner: data.owner && data.owner.name,
+                duration: page.duration || data.duration,
+                page: page.page
+            });
+        }
+        return { kind: 'pages', title: String(data.title || bvid), cover: normUrl(data.pic), items };
+    }
+    return { kind: 'none', title: String(data && data.title || bvid), cover: normUrl(data && data.pic), items: [] };
+}
+async function loadCollection(bvid) {
+    if (!isValidBvid(bvid)) throw new Error('无效的 BVID');
+    const key = collectionKey(bvid);
+    const cached = collectionCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+        collectionCache.delete(key);
+        collectionCache.set(key, cached);
+        return cached.value;
+    }
+    if (collectionInflight.has(key)) return await collectionInflight.get(key);
+    const task = biliFetch('https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid))
+        .then(response => {
+            if (!response || response.code !== 0 || !response.data) throw new Error((response && response.message) || '无法获取合集信息');
+            const value = mapCollection(response.data, bvid);
+            if (value.kind === 'none' || !value.items.length) {
+                const error = new Error('当前视频不属于合集或多P视频');
+                error.code = 'NOT_COLLECTION';
+                throw error;
+            }
+            collectionCache.delete(key);
+            collectionCache.set(key, { value, expiresAt: Date.now() + COLLECTION_CACHE_TTL_MS });
+            while (collectionCache.size > COLLECTION_CACHE_MAX) collectionCache.delete(collectionCache.keys().next().value);
+            return value;
+        })
+        .finally(() => collectionInflight.delete(key));
+    collectionInflight.set(key, task);
+    return await task;
+}
+async function collectionSummary(bvid) {
+    const value = await loadCollection(bvid);
+    const activeId = await getActiveId();
+    const lists = await getPlaylists();
+    const active = findPl(lists, activeId);
+    return {
+        ok: true, kind: value.kind, bvid: String(bvid), title: value.title,
+        cover: value.cover, count: value.items.length,
+        activePlaylistId: active ? active.id : null,
+        activePlaylistName: active ? active.name : ''
+    };
+}
+function normalizeImportedItems(raw) {
+    const seen = new Set(), items = [];
+    for (const item of (Array.isArray(raw) ? raw : [])) {
+        if (!item || !item.bvid) continue;
+        const normalized = {
+            bvid: String(item.bvid), cid: Number(item.cid) || 0,
+            title: String(item.title || item.bvid), pic: normUrl(item.pic),
+            owner: String(item.owner || ''), duration: Number(item.duration) || 0,
+            page: Number(item.page) || 1
+        };
+        const key = collectionItemKey(normalized);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push(Object.assign({ id: genId() }, normalized));
+    }
+    return items;
 }
 async function resolveCid(bvid, page) {
     const encoded = encodeURIComponent(bvid);
@@ -662,6 +795,55 @@ async function handleBg(msg, sender, mutationLocked) {
         return await withPlaylistMutation(() => handleBg(msg, sender, true));
     }
     switch (msg.cmd) {
+        case 'getCollection': {
+            try { return await collectionSummary(msg.bvid); }
+            catch (e) {
+                if (!e || e.code !== 'NOT_COLLECTION') {
+                    BPLLog.warn('bg', 'getCollection[' + (msg.bvid || '') + '] 失败：' + String((e && e.message) || e));
+                }
+                return { ok: false, notCollection: !!(e && e.code === 'NOT_COLLECTION'), error: String((e && e.message) || e) };
+            }
+        }
+        case 'importCollection': {
+            let value;
+            try { value = await loadCollection(msg.bvid); }
+            catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+            return await withPlaylistMutation(async () => {
+                const lists = await ensureDefaultPlaylist();
+                const rawItems = value.items;
+                // `target` is reserved for the runtime message route (`target: 'bg'`).
+                // Older direct callers used it for the import mode, so keep that shape compatible.
+                const importTarget = msg.importTarget || msg.mode || (msg.target === 'new' ? 'new' : 'current');
+                if (importTarget === 'new') {
+                    const items = normalizeImportedItems(rawItems);
+                    if (!items.length) return { ok: false, error: '合集没有可导入的视频' };
+                    const id = genId();
+                    const name = (msg.name && String(msg.name).trim()) || value.title || '导入的合集';
+                    lists.push({ id, name: name.slice(0, 100), items });
+                    await savePlaylists(lists);
+                    await setActiveId(id);
+                    await broadcastData();
+                    return { ok: true, added: items.length, dup: 0, count: items.length, playlistId: id };
+                }
+                const targetId = msg.targetPlaylistId || await getActiveId();
+                const pl = findPl(lists, targetId);
+                if (!pl) return { ok: false, error: '目标播放列表不存在' };
+                const existing = new Set(pl.items.map(collectionItemKey));
+                let added = 0, dup = 0;
+                for (const item of rawItems) {
+                    const key = collectionItemKey(item);
+                    if (existing.has(key)) { dup++; continue; }
+                    existing.add(key);
+                    pl.items.push(Object.assign({ id: genId() }, item));
+                    added++;
+                }
+                if (added) {
+                    await savePlaylists(lists);
+                    await broadcastData();
+                }
+                return { ok: true, added: added, dup: dup, count: rawItems.length, playlistId: pl.id };
+            });
+        }
         case 'add': {
             const lists = await ensureDefaultPlaylist();
             let activeId = await getActiveId();

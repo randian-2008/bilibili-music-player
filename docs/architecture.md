@@ -43,9 +43,9 @@ flowchart LR
 | 路径 | 职责 |
 | --- | --- |
 | `manifest.json` | 权限、内容脚本、offscreen 资源、命令和可访问资源清单。 |
-| `background.js` | 歌单与状态持久化、Bilibili 元数据和音频源解析、offscreen 生命周期与命令转发。 |
+| `background.js` | 歌单与状态持久化、Bilibili 元数据/合集/音频源解析、offscreen 生命周期与命令转发。 |
 | `offscreen.html` / `offscreen-boot.js` / `offscreen.js` | 独立音频播放、候选源容错、MediaSession、进度和状态广播。 |
-| `content.js` | 网页内 closed Shadow DOM 胶囊/浮动面板、拖拽缩放、iframe 消息桥接。 |
+| `content.js` | 网页内 closed Shadow DOM 胶囊/浮动面板、合集确认交互、拖拽缩放、iframe 消息桥接。 |
 | `sidepanel.html` / `sidepanel.js` / `sidepanel.css` | iframe 中的播放器、歌单和交互视图。 |
 | `theme.js` | 所有固定主题的语义 CSS 变量和主题迁移。 |
 | `logger.js` | 内存缓冲、批量落盘和无存储上下文的日志中继。 |
@@ -62,6 +62,14 @@ iframe 不能直接依赖 `chrome.runtime.sendMessage`。`sidepanel.js` 使用 `
 播放/切歌命令和音量、进度、模式等快速控制分别使用 28s 与 7s 的后台预算。它们不经过全局串行队列；offscreen 用单调递增的播放意图取消旧取源、旧媒体请求和旧 Blob 结果，保证最后一次用户操作获胜。B站 API、媒体 fetch、Blob 读取和 `audio.play()` 另有局部超时，外层播放流程总预算为 25s。
 
 通信异常只允许在本条命令中重建 offscreen 一次，并受 10s 冷却保护。播放途中出现 `audio.error` 或长期 `stalled` 时，offscreen 会重新解析候选源、从当前断点有限重试；短暂卡流自行恢复会取消排队任务，三次恢复仍失败则停止播放并广播 `playerError`。
+
+## 合集导入
+
+合集导入保持“页面交互、后台持有数据”的边界：`content.js` 从当前 `/video/BV...` 地址提取 BVID，`background.js` 请求 view API 并按分区、剧集、分 P 展开条目。非嵌套条目直接使用分 P 名称；仅当合集内的单个视频自身包含多个分 P 时，使用“视频标题 · 分 P 名称”避免不同视频的分 P 重名，分区标题不参与命名。页面端只接收标题、封面、数量和当前歌单等摘要；完整条目保留在后台五分钟缓存中，用户确认后由后台直接执行去重和一次性存储写入。
+
+同一 BVID 的并发检测会合并为一个网络请求，缓存最多保留 20 个合集。content script 为每次检测分配单调递增的 token，并在响应到达时同时校验 token 与当前地址中的 BVID，避免 B站 SPA 导航后旧响应覆盖新页面。合集确认浮层是 `.panel` 的 Shadow DOM 同级节点，不受面板 `overflow` 和 `transform` 产生的裁剪或层叠上下文影响。
+
+导入当前歌单时，确认动作会重新获取轻量摘要以锁定最新的活动歌单 ID；写入在现有歌单变更串行队列中执行。后台按 `bvid + cid` 去重并一次保存完整列表，因此失败前不会留下半批条目。导入为新歌单时会在写入完成后激活新歌单并广播最新数据。
 
 ## 本地检查与发布
 

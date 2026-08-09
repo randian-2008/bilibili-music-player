@@ -2,6 +2,13 @@
 
 本文件记录项目自首次公开发布以来的重要用户可见变化。公开前的内部迭代保留在 Git 提交历史中，不再作为正式版本逐项列出。
 
+## [2.6.4] - 2026-08-09
+
+### 改进
+
+- 在“智能重命名”旁增加简洁的信息提示，说明功能准确性边界及 `rules.json` 自定义入口。
+- 信息提示支持鼠标悬浮和键盘聚焦，不改变复选框原有操作。
+
 ## [2.6.3] - 2026-08-09
 
 ### 新增
@@ -82,6 +89,7 @@
 - 建立包含 146 项断言的自动化测试与 GitHub Actions CI。
 - 采用 GNU GPL v3.0 或更高版本开源。
 
+[2.6.4]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.6.4
 [2.6.3]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.6.3
 [2.6.2]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.6.2
 [2.6.1]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.6.1

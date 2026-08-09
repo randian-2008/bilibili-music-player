@@ -292,8 +292,14 @@
         'border-radius:6px;background:var(--bpl-control);color:var(--bpl-text);font:12px system-ui,"PingFang SC","Microsoft YaHei",sans-serif;outline:none}' +
         '.collection-new-name:focus{border-color:var(--bpl-accent)}' +
         '.collection-dialog[data-mode="current"] .collection-new-name{display:none}' +
-        '.collection-rename{display:flex;align-items:center;gap:7px;margin:2px 0 7px;color:var(--bpl-text);font-size:12px;line-height:1.4;cursor:pointer}' +
+        '.collection-rename-row{position:relative;display:flex;align-items:center;gap:4px;margin:2px 0 7px;min-height:18px}' +
+        '.collection-rename{display:flex;align-items:center;gap:7px;flex:none;min-width:0;margin:0;color:var(--bpl-text);font-size:12px;line-height:1.4;cursor:pointer}' +
         '.collection-rename-check{accent-color:var(--bpl-accent);margin:0}' +
+        '.collection-rename-info{flex:none;width:16px;height:16px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--bpl-faint);cursor:help;display:inline-flex;align-items:center;justify-content:center}' +
+        '.collection-rename-info svg{display:block;width:14px;height:14px}' +
+        '.collection-rename-info:hover,.collection-rename-info:focus-visible{color:var(--bpl-accent);outline:none}' +
+        '.collection-rename-tip{position:absolute;right:0;bottom:calc(100% + 6px);z-index:2;width:220px;padding:7px 9px;border:1px solid var(--bpl-border-strong);border-radius:6px;background:var(--bpl-raised);color:var(--bpl-text);font-size:11px;line-height:1.45;box-shadow:0 6px 16px var(--bpl-shadow-strong);opacity:0;visibility:hidden;pointer-events:none;transform:translateY(3px);transition:opacity .14s ease,transform .14s ease,visibility 0s linear .14s}' +
+        '.collection-rename-info:hover + .collection-rename-tip,.collection-rename-info:focus-visible + .collection-rename-tip{opacity:1;visibility:visible;transform:none;transition:opacity .14s ease,transform .14s ease}' +
         '.collection-rename-prefix{width:100%;height:30px;margin:0 0 9px;padding:0 9px;border:1px solid var(--bpl-border-strong);border-radius:6px;background:var(--bpl-control);color:var(--bpl-text);font:12px system-ui,"PingFang SC","Microsoft YaHei",sans-serif;outline:none}' +
         '.collection-rename-prefix:focus{border-color:var(--bpl-accent)}' +
         '.collection-rename-prefix:disabled{cursor:not-allowed;opacity:.55}' +
@@ -424,7 +430,10 @@
             '</div>' +
             '<p class="collection-target-name"></p>' +
             '<input class="collection-new-name" maxlength="100" aria-label="新播放列表名称" placeholder="新播放列表名称">' +
-            '<label class="collection-rename"><input class="collection-rename-check" type="checkbox">智能重命名</label>' +
+            '<div class="collection-rename-row"><label class="collection-rename"><input class="collection-rename-check" type="checkbox"><span>智能重命名</span></label>' +
+            '<button class="collection-rename-info" type="button" aria-label="智能重命名说明" aria-describedby="bpl-rename-tip">' +
+            '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M12 10v5"></path><path d="M12 7.5h.01"></path></svg></button>' +
+            '<span class="collection-rename-tip" id="bpl-rename-tip" role="tooltip">自动精简分P标题，结果可能不完全准确。可自行配置 rules.json</span></div>' +
             '<input class="collection-rename-prefix" maxlength="80" aria-label="统一前缀（可选）" placeholder="统一前缀（可选）" disabled>' +
             '<p class="collection-status" role="status" aria-live="polite"></p>' +
             '<div class="collection-actions">' +

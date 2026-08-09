@@ -188,6 +188,10 @@ function makeCtx(opts) {
         '合集确认弹层是 .panel 的 Shadow DOM 同级节点');
     ok(code.includes('collection-rename-check') && code.includes('collection-rename-prefix'),
         '合集确认弹窗提供智能重命名和统一前缀控件');
+    ok(code.includes('collection-rename-info') && code.includes('collection-rename-tip') &&
+        code.includes('自动精简分P标题，结果可能不完全准确。可自行配置 rules.json') &&
+        code.includes('role="tooltip"'),
+        '智能重命名旁提供简短说明提示，且不改变复选框操作');
     ok(code.includes('collectionCancelBtn.hidden = true') &&
         code.includes("collectionConfirmBtn.textContent = '确认'") &&
         code.includes('collectionCancelBtn.hidden = false'),

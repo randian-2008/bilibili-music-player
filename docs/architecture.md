@@ -5,6 +5,7 @@
 ```text
 .
 ├── manifest.json              # Manifest V3 入口，必须位于根目录
+├── update.bat                 # Windows 用户更新入口
 ├── README.md                  # 项目简介
 ├── LICENSE                    # GPL-3.0-or-later
 ├── CHANGELOG.md               # 正式版本记录
@@ -37,7 +38,9 @@
 ├── assets/icons/              # 扩展图标
 ├── docs/                      # 维护者文档和用户指南
 ├── tests/                     # 无浏览器依赖的 Node 测试
-├── scripts/                   # 确定性发布脚本
+├── scripts/                   # 发布与更新脚本
+│   ├── package.ps1            # 生成最小发布包和 SHA-256 文件
+│   └── update.ps1             # 下载、校验和部署完整更新包
 └── .github/                   # CI、Issue 和 PR 模板
 ```
 
@@ -73,7 +76,9 @@ flowchart LR
 | `src/network/rules.json` | Bilibili 媒体请求所需的 Referer / Origin 规则。 |
 | `src/rename/` | 合集标题智能重命名；默认逻辑在 JavaScript 中，用户规则只允许使用经过校验的静态 JSON。 |
 | `tests/` | 直接加载真实源码的 Node mock 测试。 |
-| `scripts/package.ps1` | 运行测试、复制最小运行时文件、校验 SHA-256 并生成版本化 ZIP。 |
+| `update.bat` | Windows 用户双击后启动更新脚本。 |
+| `scripts/package.ps1` | 运行测试、复制最小运行时文件、校验并生成版本化 ZIP 与 SHA-256 文件。 |
+| `scripts/update.ps1` | 从官方 GitHub Release 下载完整包，校验后部署并在失败时回滚。 |
 
 ## 路径和配置边界
 

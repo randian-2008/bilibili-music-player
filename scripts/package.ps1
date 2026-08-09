@@ -34,6 +34,8 @@ $packageFiles = @(
     'src/panel/sidepanel.html',
     'src/panel/sidepanel.js',
     'src/shared/theme.js',
+    'update.bat',
+    'scripts/update.ps1',
     'docs/user-guide.md',
     'assets/icons/icon16.png',
     'assets/icons/icon48.png',
@@ -65,6 +67,10 @@ if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force
 }
 Compress-Archive -Path (Join-Path $releaseDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
+$zipHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath).Hash.ToLowerInvariant()
+$checksumPath = $zipPath + '.sha256'
+Set-Content -LiteralPath $checksumPath -Value ("{0}  {1}" -f $zipHash, [IO.Path]::GetFileName($zipPath)) -Encoding ASCII
 
 Write-Host ("Release ready: {0}" -f $releaseDir)
 Write-Host ("Package ready: {0}" -f $zipPath)
+Write-Host ("Checksum ready: {0}" -f $checksumPath)

@@ -2,6 +2,20 @@
 
 本文件记录项目自首次公开发布以来的重要用户可见变化。公开前的内部迭代保留在 Git 提交历史中，不再作为正式版本逐项列出。
 
+## [2.7.0] - 2026-08-09
+
+### 新增
+
+- 增加 Windows `update.bat` 更新入口，用户可在扩展目录中双击检查并部署最新版。
+
+### 改进
+
+- 更新器从官方 GitHub Release 下载完整发布包，校验 SHA-256 后再替换文件。
+- 更新过程使用暂存目录和旧版本备份，部署失败时尝试恢复旧版。
+- 更新时保留用户自定义的 `src/rename/rules.json`；浏览器本地播放列表和界面设置继续由 `chrome.storage.local` 管理。
+- 发布脚本同时生成版本化 ZIP 和对应的 `.sha256` 校验文件，并补充更新文档。
+- 修复 Windows 批处理传递带末尾反斜杠的安装路径时可能导致 PowerShell 路径解析失败的问题。
+
 ## [2.6.4] - 2026-08-09
 
 ### 改进
@@ -89,6 +103,7 @@
 - 建立包含 146 项断言的自动化测试与 GitHub Actions CI。
 - 采用 GNU GPL v3.0 或更高版本开源。
 
+[2.7.0]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.7.0
 [2.6.4]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.6.4
 [2.6.3]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.6.3
 [2.6.2]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.6.2

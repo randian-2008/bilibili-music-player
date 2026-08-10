@@ -83,6 +83,11 @@ function makeCtx(opts) {
             Promise.resolve().then(() => Promise.resolve(resolveAudio(payload.resolveAudio)).then(cb));
             return undefined;
         }
+        if (cb && payload && payload.cmd === 'matchChartItem') {
+            const result = opts.chartMatchResponder ? opts.chartMatchResponder(payload, store) : { ok: false, error: 'no chart matcher' };
+            Promise.resolve().then(() => Promise.resolve(result).then(cb));
+            return undefined;
+        }
         return Promise.resolve(undefined);
     };
     const chromeObj = {
@@ -177,6 +182,27 @@ async function testPlayIndex() {
     ok(r.ok === true && ctx.__audio.src === 'https://cdn/audio.m4s', '正常播放设置 src (' + ctx.__audio.src + ')');
     ok((await getState(ctx)).trackId === 'item0', '起播状态写入稳定 trackId');
 
+    const chartStore = setupPlaylist(3);
+    chartStore.bpl_state.mode = 'shuffle';
+    chartStore.bpl_playlists[0].items[2] = {
+        id: 'chart2', bvid: '', cid: 0, title: '榜单歌曲 - 歌手', pic: '', owner: '', duration: 0, page: 1,
+        chartSource: 'apple', chartId: 'cn-most-played-songs', sourceRank: 3,
+        sourceTitle: '榜单歌曲', sourceArtist: '歌手', matchState: 'pending'
+    };
+    ctx = makeCtx({
+        store: chartStore,
+        chartMatchResponder(payload, store) {
+            const item = store.bpl_playlists[0].items.find(value => value.id === payload.itemId);
+            Object.assign(item, { bvid: 'BVCHART00001', cid: 303, title: '匹配后视频', matchState: 'matched' });
+            return { ok: true, matched: true };
+        }
+    });
+    r = await ctx.pPlayIndex(2, true, null, 'pl1');
+    const chartReq = ctx.__sent.find(message => message && message.cmd === 'matchChartItem');
+    const chartResolve = ctx.__sent.find(message => message && message.resolveAudio && message.resolveAudio.itemId === 'chart2');
+    ok(r.ok === true && chartReq && chartReq.itemId === 'chart2' && chartResolve && chartResolve.resolveAudio.bvid === 'BVCHART00001',
+        '随机播放选中待匹配条目时先匹配该条目，再按原索引播放');
+
     // v2.2.6 回归：state 广播必须经 bg 中继（offscreen 直发 {target:'all'} 到不了网页里的 content script，
     // 现场表现为胶囊不变形/图标动画不切换、面板进度条不动）
     const relays = ctx.__sent.filter(m => m && m.target === 'bg' && m.cmd === 'relay' && m.data && m.data.type === 'state');
@@ -248,6 +274,36 @@ async function testModes() {
     let kept = true;
     for (let i = 0; i < 12; i++) { await ctx.pNext(); if ((await getState(ctx)).playing === false) { kept = false; break; } }
     ok(kept, 'shuffleLoop 不停');
+
+    const mixedChartStore = setupPlaylist(4);
+    mixedChartStore.bpl_state.mode = 'shuffle';
+    mixedChartStore.bpl_state.index = 0;
+    mixedChartStore.bpl_state.trackId = 'item0';
+    for (const index of [1, 2]) {
+        Object.assign(mixedChartStore.bpl_playlists[0].items[index], {
+            bvid: '', chartSource: 'apple', chartId: 'chart', sourceRank: index,
+            sourceTitle: '失败条目' + index, sourceArtist: '歌手', matchState: 'failed', matchError: '此前已匹配失败'
+        });
+    }
+    ctx = makeCtx({ store: mixedChartStore });
+    await ctx.pAdvance();
+    st = await getState(ctx);
+    ok(st.playing === true && st.index === 3 && !ctx.__sent.some(message => message && message.cmd === 'matchChartItem'),
+        '随机序列跳过已失败榜单条目并继续播放本轮可用歌曲，不自动重复匹配');
+
+    const failedChartStore = setupPlaylist(3);
+    failedChartStore.bpl_state.mode = 'shuffleLoop';
+    failedChartStore.bpl_state.index = 0;
+    failedChartStore.bpl_state.trackId = 'item0';
+    failedChartStore.bpl_playlists[0].items.forEach((item, index) => Object.assign(item, {
+        bvid: '', chartSource: 'apple', chartId: 'chart', sourceRank: index + 1,
+        sourceTitle: '失败条目' + index, sourceArtist: '歌手', matchState: 'failed', matchError: '此前已匹配失败'
+    }));
+    ctx = makeCtx({ store: failedChartStore });
+    const allFailed = await ctx.pAdvance();
+    st = await getState(ctx);
+    ok(allFailed.ok === true && st.playing === false && !ctx.__sent.some(message => message && message.cmd === 'matchChartItem'),
+        '随机循环整轮均匹配失败时有界停止，不无限重试失败条目');
 
     ctx = makeCtx({ store: setupPlaylist(3) });
     ctx.__store.bpl_state.mode = 'loop'; ctx.__store.bpl_state.index = 0; ctx.__store.bpl_state.trackId = 'item0'; ctx.__audio.currentTime = 0;

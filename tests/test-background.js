@@ -2,6 +2,10 @@ const fs = require('fs');
 const vm = require('vm');
 const code = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'background', 'background.js'), 'utf8');
 const renamerCode = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'rename', 'renamer.js'), 'utf8');
+const appleCode = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'charts', 'apple.js'), 'utf8');
+const qqCode = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'charts', 'qq.js'), 'utf8');
+const neteaseCode = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'charts', 'netease.js'), 'utf8');
+const matcherCode = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'charts', 'matcher.js'), 'utf8');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; console.log('  PASS: ' + msg); } else { fail++; console.log('  FAIL: ' + msg); } }
@@ -138,6 +142,10 @@ function makeCtx(opts) {
     };
     sandbox.importScripts = (...paths) => {
         if (paths.some(value => String(value).indexOf('rename/renamer.js') >= 0)) vm.runInContext(renamerCode, sandbox);
+        if (paths.some(value => String(value).indexOf('charts/apple.js') >= 0)) vm.runInContext(appleCode, sandbox);
+        if (paths.some(value => String(value).indexOf('charts/qq.js') >= 0)) vm.runInContext(qqCode, sandbox);
+        if (paths.some(value => String(value).indexOf('charts/netease.js') >= 0)) vm.runInContext(neteaseCode, sandbox);
+        if (paths.some(value => String(value).indexOf('charts/matcher.js') >= 0)) vm.runInContext(matcherCode, sandbox);
     };
     vm.createContext(sandbox);
     vm.runInContext(code, sandbox);
@@ -317,6 +325,88 @@ function makeCtx(opts) {
     ok(ctx.__store.bpl_playlists.length === 2 &&
         ctx.__store.bpl_playlists.some(p => p.name === '并发 A') && ctx.__store.bpl_playlists.some(p => p.name === '并发 B'),
         '并发修改依次提交，不发生最后写入覆盖');
+
+    console.log('\n[background Apple 热榜导入与B站匹配]');
+    ctx = makeCtx({ fetchResponder: url => {
+        if (String(url).includes('rss.applemarketingtools.com')) return { feed: { results: [
+            { name: '晴天', artistName: '周杰伦', artworkUrl100: 'https://ignored/apple.jpg', id: 'ignored' },
+            { name: '七里香', artistName: '周杰伦' }
+        ] } };
+        if (String(url).includes('/x/web-interface/search/type')) {
+            const decoded = decodeURIComponent(String(url));
+            if (decoded.includes('七里香')) return { code: 0, data: { result: [
+                { bvid: 'BV1MATCH00002', title: '周杰伦 七里香 官方MV', author: 'B站音乐账号', pic: '//i0.hdslb.com/chart2.jpg', duration: '4:59' }
+            ] } };
+            return { code: 0, data: { result: [
+                { bvid: 'BV1MATCH00001', title: '<em class="keyword">周杰伦</em>《晴天》官方MV', author: 'B站音乐账号', pic: '//i0.hdslb.com/chart.jpg', duration: '4:29' },
+                { bvid: 'BV1SHORT00001', title: '晴天片段', author: '路人', pic: '', duration: '0:25' }
+            ] } };
+        }
+        return { code: 0, data: {} };
+    }});
+    let chartCatalogResult = await ctx.handleBg({ cmd: 'getChartCatalog' }, null);
+    ok(chartCatalogResult.ok && chartCatalogResult.sources.map(source => source.id).join(',') === 'apple,qq,netease' &&
+        chartCatalogResult.sources[0].categories[0].charts[0].id === 'cn-most-played-songs',
+        '后台返回 Apple、QQ、网易云的平台、分类和榜单目录');
+    let chartImport = await ctx.handleBg({ cmd: 'importChart', sourceId: 'apple', chartId: 'cn-most-played-songs', limit: 25 }, null);
+    let chartPlaylist = ctx.__store.bpl_playlists.find(playlist => playlist.id === chartImport.playlistId);
+    ok(chartImport.ok && chartImport.count === 2 && ctx.__store.bpl_active === chartImport.playlistId && chartPlaylist.chartSource === 'apple',
+        '导入后创建并切换到独立热榜播放列表');
+    ok(chartPlaylist.items[0].matchState === 'pending' && !chartPlaylist.items[0].bvid && !chartPlaylist.items[0].pic &&
+        chartPlaylist.items[0].sourceTitle === '晴天' && chartPlaylist.items[0].sourceArtist === '周杰伦' && chartPlaylist.items[0].sourceRank === 1,
+        '占位条目只保存榜单排名、歌曲名和歌手，不混入 Apple 资源字段');
+    ctx.__store.bpl_playlists.push({ id: 'chart-copy', name: '榜单副本', items: [] });
+    let chartCopy = await ctx.handleBg({ cmd: 'batchCopy', indices: [0, 1], toId: 'chart-copy' }, null);
+    ok(chartCopy.ok && chartCopy.added === 2 && ctx.__store.bpl_playlists.find(playlist => playlist.id === 'chart-copy').items.length === 2,
+        '未匹配条目可按榜单身份复制，不会因空 bvid 被错误判重');
+    let chartMatch = await ctx.handleBg({ cmd: 'matchChartItem', playlistId: chartPlaylist.id, itemId: chartPlaylist.items[0].id }, null);
+    chartPlaylist = ctx.__store.bpl_playlists.find(playlist => playlist.id === chartImport.playlistId);
+    const matchedChartItem = chartPlaylist.items[0];
+    ok(chartMatch.ok && matchedChartItem.matchState === 'matched' && matchedChartItem.bvid === 'BV1MATCH00001' &&
+        matchedChartItem.pic === 'https://i0.hdslb.com/chart.jpg' && matchedChartItem.duration === 269 && matchedChartItem.owner === 'B站音乐账号' &&
+        matchedChartItem.title === '晴天 - 周杰伦',
+        '匹配成功后写入B站播放元数据，但保留热榜的歌曲 - 歌手显示名');
+    await ctx.repairResolvedItem({ playlistId: chartPlaylist.id, itemId: matchedChartItem.id, bvid: matchedChartItem.bvid, page: 1 }, {
+        cid: 909,
+        info: { bvid: matchedChartItem.bvid, title: 'B站原标题', pic: '//i0.hdslb.com/resolved.jpg', owner: { name: '另一个UP主' }, duration: 321 },
+        page: { part: '', duration: 321 }
+    });
+    chartPlaylist = ctx.__store.bpl_playlists.find(playlist => playlist.id === chartImport.playlistId);
+    ok(chartPlaylist.items[0].cid === 909 && chartPlaylist.items[0].pic === 'https://i0.hdslb.com/resolved.jpg' &&
+        chartPlaylist.items[0].title === '晴天 - 周杰伦',
+        '榜单条目补齐 cid 时仍保留热榜标题，不被B站原标题覆盖');
+    let nextChartMatch = await ctx.matchNextChartItem(chartPlaylist.id);
+    chartPlaylist = ctx.__store.bpl_playlists.find(playlist => playlist.id === chartImport.playlistId);
+    ok(nextChartMatch.ok && chartPlaylist.items[1].matchState === 'matched' && chartPlaylist.items[1].bvid === 'BV1MATCH00002',
+        '后台队列按排名继续匹配下一首待处理歌曲');
+
+    let qqRequestUrl = '';
+    ctx = makeCtx({ fetchResponder: url => {
+        qqRequestUrl = String(url);
+        return { code: 0, songlist: [
+            { data: { songname: '东风破', singer: [{ name: '周杰伦' }] } },
+            { data: { songname: '牵丝戏', singer: [{ name: '银临' }, { name: 'Aki阿杰' }] } }
+        ] };
+    }});
+    let qqImport = await ctx.handleBg({ cmd: 'importChart', sourceId: 'qq', chartId: '65', limit: 10 }, null);
+    let qqPlaylist = ctx.__store.bpl_playlists.find(playlist => playlist.id === qqImport.playlistId);
+    ok(qqImport.ok && qqRequestUrl.includes('topid=65') && qqRequestUrl.includes('song_num=10') &&
+        qqPlaylist.name === 'QQ音乐 - 国风热歌榜' && qqPlaylist.items[1].sourceArtist === '银临/Aki阿杰',
+        'QQ 音乐导入把数量传给适配器，并创建只含榜单身份的占位播放列表');
+
+    let neteaseRequestUrl = '';
+    ctx = makeCtx({ fetchResponder: url => {
+        neteaseRequestUrl = String(url);
+        return { code: 200, result: { tracks: [
+            { name: '动画主题曲', ar: [{ name: '歌手甲' }] },
+            { name: '游戏配乐', artists: [{ name: '歌手乙' }] }
+        ] } };
+    }});
+    let neteaseImport = await ctx.handleBg({ cmd: 'importChart', sourceId: 'netease', chartId: '71385702', limit: 25 }, null);
+    let neteasePlaylist = ctx.__store.bpl_playlists.find(playlist => playlist.id === neteaseImport.playlistId);
+    ok(neteaseImport.ok && neteaseRequestUrl.includes('id=71385702') && neteasePlaylist.name === '网易云音乐 - ACG榜' &&
+        neteasePlaylist.items.length === 2 && !neteasePlaylist.items[0].pic && !neteasePlaylist.items[0].bvid,
+        '网易云音乐导入识别榜单和数量，并等待后续B站匹配补全播放字段');
 
     console.log('\n[background 合集解析与导入]');
     ctx = makeCtx({ fetchResponder: url => ({ code: 0, data: {

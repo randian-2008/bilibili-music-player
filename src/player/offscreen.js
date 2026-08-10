@@ -253,6 +253,21 @@ function bgResolveAudio(it, playlistId) {
         setTimeout(() => finish({ ok: false, error: '获取音频失败（后台超时）' }), 22000);
     });
 }
+function bgMatchChartItem(it, playlistId) {
+    return new Promise(res => {
+        let done = false;
+        const finish = value => { if (!done) { done = true; res(value); } };
+        try {
+            chrome.runtime.sendMessage({
+                target: 'bg', cmd: 'matchChartItem',
+                playlistId: playlistId || null, itemId: it && it.id || null, manual: false
+            }, r => finish(r || { ok: false, error: '榜单音源匹配无响应' }));
+        } catch (e) {
+            finish({ ok: false, error: String((e && e.message) || e) });
+        }
+        setTimeout(() => finish({ ok: false, error: '榜单音源匹配超时' }), 45000);
+    });
+}
 function pShuffled(count) {
     const arr = [];
     for (let i = 0; i < count; i++) arr.push(i);
@@ -463,7 +478,22 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
     if (!items.length) return { ok: false, error: '当前播放列表为空' };
     if (i < 0 || i >= items.length) return { ok: false, error: '播放索引越界 (' + i + '/' + items.length + ')' };
     if (pIsShuffle(st.mode) && !keepOrder) pBuildFrom(items.length, i);
-    const it = items[i];
+    let it = items[i];
+    if (it && it.chartSource && it.matchState === 'failed' && !it.bvid) {
+        return { ok: false, chartMatchFailed: true, error: it.matchError || '匹配榜单音源失败' };
+    }
+    if (it && it.chartSource && (it.matchState !== 'matched' || !it.bvid)) {
+        BPLLog.info('off', '随机/顺序播放优先匹配榜单条目[' + (it.sourceArtist || '') + ' - ' + (it.sourceTitle || it.title || '') + ']');
+        const match = await bgMatchChartItem(it, targetPlaylistId);
+        if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
+        if (!match || !match.ok) {
+            BPLLog.warn('off', '榜单条目匹配失败，跳过播放：' + ((match && match.error) || '未知错误'));
+            return { ok: false, chartMatchFailed: true, error: (match && match.error) || '匹配榜单音源失败' };
+        }
+        const refreshedItems = await pGetItems(targetPlaylistId);
+        it = refreshedItems[i];
+        if (!it || !it.bvid) return { ok: false, chartMatchFailed: true, error: '匹配后未得到B站视频' };
+    }
     const r = await bgResolveAudio(it, targetPlaylistId);
     if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
     if (!r || !r.ok || !r.urls || !r.urls.length) {
@@ -530,15 +560,45 @@ async function pAdvance() {
     if (!items.length) return { ok: false, error: '当前播放列表为空' };
     const mode = st.mode;
     if (pIsShuffle(mode)) {
-        if (shuffleOrder.length !== items.length) { pBuildAfter(items.length, st.index); return await pPlayIndex(shuffleOrder[shufflePos], true); }
-        if (shufflePos < shuffleOrder.length - 1) { shufflePos++; return await pPlayIndex(shuffleOrder[shufflePos], true); }
-        if (mode === 'shuffleLoop') { pBuildAfter(items.length, st.index); return await pPlayIndex(shuffleOrder[shufflePos], true); }
+        const orderWasEmpty = shuffleOrder.length !== items.length;
+        if (orderWasEmpty) pBuildAfter(items.length, st.index);
+        // A failed chart match is skipped within the current shuffle round. Keep
+        // the number of attempts bounded so a playlist containing only failures
+        // cannot recurse forever in shuffle-loop mode.
+        let attempts = 0;
+        while (attempts < items.length) {
+            if (!orderWasEmpty || attempts > 0) {
+                if (shufflePos >= shuffleOrder.length - 1) break;
+                shufflePos++;
+            }
+            const result = await pPlayIndex(shuffleOrder[shufflePos], true);
+            attempts++;
+            if (!result || !result.chartMatchFailed) return result;
+        }
+        if (mode === 'shuffleLoop') {
+            pBuildAfter(items.length, st.index);
+            for (let roundAttempts = 0; roundAttempts < items.length; roundAttempts++) {
+                if (roundAttempts > 0) {
+                    if (shufflePos >= shuffleOrder.length - 1) break;
+                    shufflePos++;
+                }
+                const result = await pPlayIndex(shuffleOrder[shufflePos], true);
+                if (!result || !result.chartMatchFailed) return result;
+            }
+        }
         return await pStopPlayback();
     }
     const wrap = (mode === 'loop' || mode === 'one');
     let n = st.index + 1;
     if (n >= items.length) { if (wrap) n = 0; else return await pStopPlayback(); }
-    return await pPlayIndex(n, true);
+    const first = n;
+    do {
+        const result = await pPlayIndex(n, true);
+        if (!result || !result.chartMatchFailed) return result;
+        n++;
+        if (n >= items.length) n = wrap ? 0 : items.length;
+    } while (n < items.length && n !== first);
+    return await pStopPlayback();
 }
 async function pNext() { return await pAdvance(); }
 async function pPrev() {

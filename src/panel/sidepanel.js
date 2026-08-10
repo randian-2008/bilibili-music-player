@@ -28,6 +28,8 @@ let drag = null;
 let lastDrop = 0;
 let failedNowPlayingCover = '';
 let locateHighlightTimer = null;
+const initialChartMatches = new Set();
+let initialChartRecoveryTimer = null;
 
 function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -121,7 +123,8 @@ if (logEl) {
 
 function send(cmd, extra) {
     const payload = Object.assign({ target: 'bg', cmd }, extra || {});
-    const timeoutMs = ({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000;
+    const timeoutMs = cmd === 'playChartItem' ? 45000
+        : (({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000);
     const report = r => {
         if (r && r.ok === false && r.error) BPLLog.error('ui', cmd + ' 失败：' + r.error);
         else if (!r) BPLLog.warn('ui', cmd + '：后台无响应（超时）');
@@ -179,6 +182,7 @@ function playingItem() {
     return pl.items.find(it => it.id === state.trackId) || null;
 }
 function itemUrl(s) {
+    if (!s || !s.bvid) return '';
     let url = 'https://www.bilibili.com/video/' + s.bvid;
     if (s.page && s.page > 1) url += '?p=' + s.page;
     return url;
@@ -232,16 +236,21 @@ function render() {
         box.innerHTML = items.map((s, i) => {
             const isPlaying = showPlaying && !!state.trackId && s.id === state.trackId;
             const coverUrl = httpsUrl(s.pic);
+            const chartCoverClass = s.matchState === 'matching' ? ' cover-matching' : (s.matchState === 'failed' ? ' cover-failed' : '');
             const coverHtml = coverUrl
                 ? '<img class="cover" src="' + esc(coverUrl) + '" draggable="false" referrerpolicy="no-referrer">'
-                : '<span class="cover cover-empty" draggable="false" aria-hidden="true"></span>';
+                : '<span class="cover cover-empty' + chartCoverClass + '" draggable="false" aria-hidden="true"></span>';
+            const linkUrl = itemUrl(s);
+            const linkHtml = linkUrl
+                ? '<a class="ibtn link" href="' + esc(linkUrl) + '" title="在原页面打开">↗</a>'
+                : '<span class="ibtn link disabled" aria-hidden="true">↗</span>';
             return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '">' +
                 '<span class="chk"></span>' +
                 coverHtml +
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
                 '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
-                '<a class="ibtn link" href="' + esc(itemUrl(s)) + '" title="在原页面打开">↗</a>' +
+                linkHtml +
                 '</div>';
         }).join('');
     }
@@ -250,6 +259,32 @@ function render() {
     if (selMode) refreshSelUI();
     updateProgress();
     if (!$('#plMenu').classList.contains('hidden')) positionPlaylistMenu();
+    triggerInitialChartMatch();
+}
+
+function triggerInitialChartMatch() {
+    const playlist = activePlaylist();
+    if (!playlist || !playlist.chartSource) return;
+    const first = playlist.items.reduce((best, item) => {
+        if (!item || !item.chartSource) return best;
+        if (!best || (Number(item.sourceRank) || 0) < (Number(best.sourceRank) || 0)) return item;
+        return best;
+    }, null);
+    if (first && first.matchState === 'matching' && Date.now() - (first.matchStartedAt || 0) <= 12000) {
+        if (!initialChartRecoveryTimer) {
+            const remaining = Math.max(100, 12100 - (Date.now() - (first.matchStartedAt || 0)));
+            initialChartRecoveryTimer = setTimeout(() => {
+                initialChartRecoveryTimer = null;
+                triggerInitialChartMatch();
+            }, remaining);
+        }
+        return;
+    }
+    const staleMatching = first && first.matchState === 'matching' && Date.now() - (first.matchStartedAt || 0) > 12000;
+    if (staleMatching) initialChartMatches.delete(first.id);
+    if (!first || (first.matchState !== 'pending' && !staleMatching) || initialChartMatches.has(first.id)) return;
+    initialChartMatches.add(first.id);
+    send('matchChartItem', { playlistId: playlist.id, itemId: first.id, manual: false });
 }
 
 function applyMarquee(wrap) {
@@ -464,6 +499,11 @@ $('#plSelect').addEventListener('change', e => send('setActive', { id: e.target.
 $('#plNew').addEventListener('click', () => {
     const name = prompt('新建播放列表，名称：', '新播放列表');
     if (name != null && name.trim()) send('createPlaylist', { name: name.trim() });
+});
+$('#chartBtn').addEventListener('click', () => {
+    send('openChartWindow').then(result => {
+        if (!result || result.ok === false) toast((result && result.error) || '无法打开热榜窗口');
+    });
 });
 
 const menu = $('#plMenu');
@@ -753,6 +793,15 @@ box.addEventListener('click', e => {
     if (!it) return;
     const i = +it.dataset.i;
     if (selMode) { toggleSel(i); return; }
+    const playlist = activePlaylist();
+    const item = playlist && playlist.items[i];
+    if (item && item.chartSource && (item.matchState !== 'matched' || !item.bvid)) {
+        toast('正在匹配B站音源');
+        send('playChartItem', { playlistId: activeId, itemId: item.id }).then(result => {
+            if (!result || result.ok === false) toast((result && result.error) || '匹配音源失败');
+        });
+        return;
+    }
     act('playIndex', { index: i, playlistId: activeId });
 });
 
@@ -773,13 +822,44 @@ box.addEventListener('mouseleave', () => {
 });
 
 let selAction = null;
+function positionSelectionMenu() {
+    const selMenu = $('#selMenu');
+    if (selMenu.classList.contains('hidden')) return;
+    const anchor = selAction === 'move' ? $('#selMoveBtn') : $('#selCopyBtn');
+    if (!anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    const margin = 8, gap = 6;
+    const below = Math.max(0, window.innerHeight - rect.bottom - gap - margin);
+    const above = Math.max(0, rect.top - gap - margin);
+    const desired = selMenu.scrollHeight;
+    const openBelow = below >= Math.min(desired, 180) || below >= above;
+    if (selAction === 'move') {
+        selMenu.style.left = Math.max(margin, rect.left) + 'px';
+        selMenu.style.right = 'auto';
+    } else {
+        selMenu.style.left = 'auto';
+        selMenu.style.right = Math.max(margin, window.innerWidth - rect.right) + 'px';
+    }
+    if (openBelow) {
+        selMenu.style.top = (rect.bottom + gap) + 'px';
+        selMenu.style.bottom = 'auto';
+        selMenu.style.maxHeight = Math.max(1, below) + 'px';
+    } else {
+        selMenu.style.top = 'auto';
+        selMenu.style.bottom = (window.innerHeight - rect.top + gap) + 'px';
+        selMenu.style.maxHeight = Math.max(1, above) + 'px';
+    }
+}
 function openSelMenu(action) {
     selAction = action;
     const others = playlists.filter(p => p.id !== activeId);
-    $('#selMenu').innerHTML = others.length
+    const selMenu = $('#selMenu');
+    selMenu.innerHTML = others.length
         ? others.map(p => '<div data-plid="' + esc(p.id) + '">' + esc(p.name) + '</div>').join('')
         : '<div class="sel-none">（无其他播放列表）</div>';
-    $('#selMenu').classList.remove('hidden');
+    selMenu.classList.remove('hidden');
+    selMenu.scrollTop = 0;
+    positionSelectionMenu();
 }
 function selIndices() { return [...selected].sort((a, b) => a - b); }
 $('#selMoveBtn').addEventListener('click', () => openSelMenu('move'));
@@ -793,6 +873,7 @@ $('#selDelBtn').addEventListener('click', () => {
 });
 $('#selCancelBtn').addEventListener('click', exitSelMode);
 $('#selMenu').addEventListener('click', e => {
+    e.stopPropagation();
     const d = e.target.closest('[data-plid]');
     $('#selMenu').classList.add('hidden');
     if (!d) return;
@@ -801,11 +882,13 @@ $('#selMenu').addEventListener('click', e => {
     const cmd = selAction === 'move' ? 'batchMove' : 'batchCopy';
     send(cmd, { indices: indices, toId: d.dataset.plid }).then(() => { exitSelMode(); refresh(); });
 });
+$('#selMenu').addEventListener('wheel', e => e.stopPropagation(), { passive: true });
 document.addEventListener('click', e => {
     if (!e.target.closest('#selMenu') && !e.target.closest('#selMoveBtn') && !e.target.closest('#selCopyBtn')) {
         $('#selMenu').classList.add('hidden');
     }
 });
+window.addEventListener('resize', positionSelectionMenu);
 
 function handleBroadcast(msg) {
     if (!msg || msg.target !== 'all') return;

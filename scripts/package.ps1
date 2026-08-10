@@ -20,6 +20,13 @@ if ($LASTEXITCODE -ne 0) { throw 'Syntax checks or tests failed' }
 
 $packageFiles = @(
     'src/background/background.js',
+    'src/charts/apple.js',
+    'src/charts/qq.js',
+    'src/charts/netease.js',
+    'src/charts/matcher.js',
+    'src/charts/chart-picker.html',
+    'src/charts/chart-picker.css',
+    'src/charts/chart-picker.js',
     'src/content/content.js',
     'LICENSE',
     'src/shared/logger.js',

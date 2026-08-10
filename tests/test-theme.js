@@ -67,6 +67,10 @@ const listwrapEnd = sidepanelHtml.indexOf('\n    </div>', listwrapStart);
 const playlistMenu = sidepanelHtml.indexOf('<div id="plMenu"');
 ok(listwrapStart >= 0 && listwrapEnd > listwrapStart && playlistMenu > listwrapEnd,
     '播放列表菜单是 listwrap 外的视口级浮层，不受播放器层叠上下文限制');
+const selectionMenu = sidepanelHtml.indexOf('<div id="selMenu"');
+ok(selectionMenu > listwrapEnd && /\.sel-menu\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?z-index:\s*70;/.test(sidepanelCss) &&
+    /function positionSelectionMenu\(\)/.test(sidepanelCode),
+    '批量移动和复制菜单是列表外的视口级浮层，可覆盖歌曲并按可用空间定位');
 ok(contentCode.includes("THEME_PICKER_ORDER = ['paper', 'gold', 'jade', 'starry'") &&
     contentCode.includes('.theme-picker.open .theme-swatches{max-width:112px') &&
     contentCode.includes('.theme-swatch{appearance:none;flex:none;width:16px;height:16px') &&

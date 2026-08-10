@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>选择热榜</title>
+    <link rel="stylesheet" href="chart-picker.css">
+</head>
+<body>
+    <main class="picker">
+        <h1 class="sr-only">导入热榜</h1>
+        <p id="sourceStatus">正在读取榜单来源</p>
+
+        <section class="fields" aria-label="榜单选择">
+            <label>
+                <span>音乐平台</span>
+                <select id="sourceSelect" disabled></select>
+            </label>
+            <label>
+                <span>榜单分类</span>
+                <select id="categorySelect" disabled></select>
+            </label>
+            <label>
+                <span>具体榜单</span>
+                <select id="chartSelect" disabled></select>
+            </label>
+            <label>
+                <span>导入条目</span>
+                <select id="limitSelect">
+                    <option value="10">前 10 首</option>
+                    <option value="25">前 25 首</option>
+                    <option value="50" selected>前 50 首</option>
+                </select>
+            </label>
+            <label>
+                <span>播放列表名称</span>
+                <input id="playlistName" type="text" maxlength="100" autocomplete="off">
+            </label>
+        </section>
+
+        <div id="error" class="error" role="status" aria-live="polite"></div>
+        <footer>
+            <button id="cancelBtn" class="secondary" type="button">取消</button>
+            <button id="confirmBtn" class="primary" type="button" disabled>确定</button>
+        </footer>
+    </main>
+    <script src="../shared/theme.js"></script>
+    <script src="chart-picker.js"></script>
+</body>
+</html>

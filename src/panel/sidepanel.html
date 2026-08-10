@@ -33,6 +33,10 @@
     <div class="listwrap">
         <div class="pl-bar">
             <select id="plSelect" title="切换播放列表"></select>
+            <button id="chartBtn" class="chart-btn" title="导入热榜">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19V9m6 10V5m6 14v-7m4 7H2"/></svg>
+                <span>热榜</span>
+            </button>
             <button id="plNew" class="pbtn" title="新建播放列表">＋</button>
             <button id="plMenuBtn" class="pbtn" title="播放列表操作">⋯</button>
         </div>
@@ -45,7 +49,6 @@
                 <button class="selbtn danger" id="selDelBtn">删除</button>
                 <button class="selbtn" id="selCancelBtn">取消</button>
             </div>
-            <div class="sel-menu hidden" id="selMenu"></div>
         </div>
         <div id="list" class="list"></div>
     </div>
@@ -65,6 +68,7 @@
         <div data-act="log-export">导出日志 (TXT)</div>
         <div data-act="log-clear">清空日志</div>
     </div>
+    <div id="selMenu" class="sel-menu hidden"></div>
 
     <div id="coverPop"><img id="coverPopImg" alt=""></div>
     <div id="diag" class="diag hidden"></div>

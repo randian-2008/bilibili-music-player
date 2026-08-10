@@ -1,6 +1,10 @@
 // 日志：Service Worker 经 importScripts 载入共享 logger；测试/异常环境下用空实现兜底
 if (typeof importScripts === 'function') { try { importScripts('../shared/logger.js'); } catch (_) {} }
 if (typeof importScripts === 'function') { try { importScripts('../rename/renamer.js'); } catch (_) {} }
+if (typeof importScripts === 'function') { try { importScripts('../charts/apple.js'); } catch (_) {} }
+if (typeof importScripts === 'function') { try { importScripts('../charts/qq.js'); } catch (_) {} }
+if (typeof importScripts === 'function') { try { importScripts('../charts/netease.js'); } catch (_) {} }
+if (typeof importScripts === 'function') { try { importScripts('../charts/matcher.js'); } catch (_) {} }
 if (typeof BPLLog === 'undefined') {
     globalThis.BPLLog = { info() {}, log() {}, warn() {}, error() {}, flush() {}, recent() { return []; } };
 }
@@ -9,6 +13,16 @@ const DEF_STATE = { playlistId: null, trackId: null, index: 0, playing: false, m
 const STORAGE_SCHEMA_VERSION = 1;
 
 const MODES = ['order', 'shuffle', 'one', 'loop', 'shuffleLoop'];
+const CHART_MATCH_STATES = ['pending', 'matching', 'matched', 'failed'];
+const CHART_AUTO_MATCH_DELAY_MS = 8000;
+const CHART_MATCH_TIMEOUT_MS = 12000;
+const CHART_NETWORK_TIMEOUT_MS = 12000;
+const chartMatchInflight = new Map();
+let chartAutoMatchTask = null;
+let chartAutoNextAt = 0;
+let chartAutoPlaylistId = null;
+let chartWasPlaying = false;
+let chartWindowId = null;
 function normalizeMode(st) {
     if (MODES.indexOf(st.mode) >= 0) return st.mode;
     if (st.shuffle) return st.loop ? 'shuffleLoop' : 'shuffle';
@@ -151,10 +165,203 @@ async function biliFetch(url) {
     }
     throw lastError || new Error('网络请求失败');
 }
+async function chartFetch(url) {
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try { return await biliFetchOnce(url, CHART_NETWORK_TIMEOUT_MS); }
+        catch (error) {
+            lastError = error;
+            if (attempt || !isRetryableNetworkError(error)) break;
+            await waitMs(NETWORK_RETRY_DELAY_MS);
+        }
+    }
+    throw lastError || new Error('榜单网络请求失败');
+}
+
+function chartCatalog() {
+    const sources = [];
+    for (const adapter of [globalThis.BPLChartApple, globalThis.BPLChartQQ, globalThis.BPLChartNetease]) {
+        if (adapter && typeof adapter.catalog === 'function') sources.push(adapter.catalog());
+    }
+    return sources;
+}
+function chartAdapter(sourceId) {
+    if (sourceId === 'apple' && globalThis.BPLChartApple) return globalThis.BPLChartApple;
+    if (sourceId === 'qq' && globalThis.BPLChartQQ) return globalThis.BPLChartQQ;
+    if (sourceId === 'netease' && globalThis.BPLChartNetease) return globalThis.BPLChartNetease;
+    return null;
+}
+function chartItemKey(playlistId, itemId) { return String(playlistId || '') + ':' + String(itemId || ''); }
+function isChartItem(item) {
+    return !!(item && item.chartSource && item.sourceTitle && CHART_MATCH_STATES.indexOf(item.matchState) >= 0);
+}
+function chartDisplayTitle(title, artist) {
+    const songTitle = String(title || '').trim();
+    const songArtist = String(artist || '').trim();
+    return songTitle + (songArtist ? ' - ' + songArtist : '');
+}
+function chartPlaceholder(source, song) {
+    const title = String(song.title || '').trim();
+    const artist = String(song.artist || '').trim();
+    return {
+        id: genId(),
+        bvid: '', cid: 0,
+        title: chartDisplayTitle(title, artist),
+        pic: '', owner: '', duration: 0, page: 1,
+        chartSource: source.sourceId,
+        chartId: source.chartId,
+        sourceRank: Number(song.rank) || 0,
+        sourceTitle: title,
+        sourceArtist: artist,
+        matchState: 'pending',
+        matchAttempts: 0
+    };
+}
+function biliSearchCandidate(raw) {
+    const matcher = globalThis.BPLChartMatcher;
+    const arc = String(raw && (raw.arcurl || raw.url) || '');
+    const match = arc.match(/\/video\/(BV[0-9A-Za-z]+)/);
+    return {
+        bvid: String(raw && raw.bvid || (match && match[1]) || ''),
+        title: matcher ? matcher.stripHtml(raw && raw.title) : String(raw && raw.title || '').replace(/<[^>]*>/g, ''),
+        author: String(raw && (raw.author || raw.owner && raw.owner.name) || ''),
+        pic: normUrl(raw && (raw.pic || raw.cover)),
+        duration: raw && raw.duration,
+        play: Number(raw && raw.play) || 0
+    };
+}
+async function searchBiliChartItem(item, manual) {
+    const matcher = globalThis.BPLChartMatcher;
+    if (!matcher || typeof matcher.chooseCandidate !== 'function') throw new Error('榜单匹配器不可用');
+    const keyword = [item.sourceTitle, item.sourceArtist].filter(Boolean).join(' ');
+    const pageSize = manual ? 30 : 10;
+    const url = 'https://api.bilibili.com/x/web-interface/search/type?search_type=video' +
+        '&order=totalrank&page=1&page_size=' + pageSize + '&keyword=' + encodeURIComponent(keyword);
+    const response = await biliFetch(url);
+    if (!response || response.code !== 0 || !response.data) {
+        throw new Error((response && response.message) || 'B站搜索失败');
+    }
+    const candidates = (Array.isArray(response.data.result) ? response.data.result : []).map(biliSearchCandidate);
+    const best = matcher.chooseCandidate({ title: item.sourceTitle, artist: item.sourceArtist }, candidates, manual);
+    return best ? Object.assign({ score: best.score }, best.candidate) : null;
+}
+async function mutateChartItem(playlistId, itemId, updater) {
+    let updated = false;
+    await withPlaylistMutation(async () => {
+        const lists = await getPlaylists();
+        const playlist = findPl(lists, playlistId);
+        const item = playlist && playlist.items.find(entry => entry.id === itemId);
+        if (!item || !isChartItem(item)) return;
+        updated = updater(item) !== false;
+        if (!updated) return;
+        await savePlaylists(lists);
+        await broadcastData();
+    });
+    return updated;
+}
+async function performChartMatch(playlistId, itemId, manual) {
+    const lists = await getPlaylists();
+    const playlist = findPl(lists, playlistId);
+    const snapshot = playlist && playlist.items.find(item => item.id === itemId);
+    if (!snapshot || !isChartItem(snapshot)) return { ok: false, cancelled: true, error: '榜单条目不存在' };
+    if (snapshot.matchState === 'matched' && snapshot.bvid) return { ok: true, matched: true, itemId: itemId };
+
+    const sourceIdentity = [snapshot.chartSource, snapshot.chartId, snapshot.sourceRank, snapshot.sourceTitle, snapshot.sourceArtist].join('|');
+    await mutateChartItem(playlistId, itemId, item => {
+        item.matchState = 'matching';
+        item.matchStartedAt = Date.now();
+        item.matchAttempts = (Number(item.matchAttempts) || 0) + 1;
+        delete item.matchError;
+    });
+
+    try {
+        const candidate = await searchBiliChartItem(snapshot, !!manual);
+        if (!candidate || !isValidBvid(candidate.bvid)) throw new Error('没有找到可信的B站视频');
+        const matcher = globalThis.BPLChartMatcher;
+        const changed = await mutateChartItem(playlistId, itemId, item => {
+            const currentIdentity = [item.chartSource, item.chartId, item.sourceRank, item.sourceTitle, item.sourceArtist].join('|');
+            if (currentIdentity !== sourceIdentity) return false;
+            item.bvid = candidate.bvid;
+            item.cid = 0;
+            // Keep the canonical chart label. The Bilibili candidate supplies
+            // playback metadata only; its promotional/original title should
+            // not leak into a chart playlist.
+            item.title = chartDisplayTitle(item.sourceTitle, item.sourceArtist) || candidate.title;
+            item.pic = normUrl(candidate.pic);
+            item.owner = candidate.author || '';
+            item.duration = matcher ? matcher.parseDuration(candidate.duration) : 0;
+            item.page = 1;
+            item.matchState = 'matched';
+            item.matchScore = Number(candidate.score) || 0;
+            item.matchedAt = Date.now();
+            delete item.matchStartedAt;
+            delete item.matchError;
+        });
+        return changed ? { ok: true, matched: true, itemId: itemId, bvid: candidate.bvid }
+            : { ok: false, cancelled: true, error: '榜单条目已发生变化' };
+    } catch (error) {
+        const message = String(error && error.message || error || '匹配失败');
+        await mutateChartItem(playlistId, itemId, item => {
+            item.matchState = 'failed';
+            item.matchError = message;
+            item.matchFailedAt = Date.now();
+            delete item.matchStartedAt;
+        });
+        BPLLog.warn('chart', '匹配失败[' + snapshot.sourceArtist + ' - ' + snapshot.sourceTitle + ']：' + message);
+        return { ok: false, error: message, itemId: itemId };
+    }
+}
+async function matchChartItem(playlistId, itemId, manual) {
+    const key = chartItemKey(playlistId, itemId);
+    const existing = chartMatchInflight.get(key);
+    if (existing) return await existing;
+    const task = performChartMatch(playlistId, itemId, manual)
+        .finally(() => chartMatchInflight.delete(key));
+    chartMatchInflight.set(key, task);
+    return await task;
+}
+async function matchNextChartItem(playlistId) {
+    if (!playlistId) return { ok: true, idle: true };
+    const lists = await getPlaylists();
+    const playlist = findPl(lists, playlistId);
+    if (!playlist || !playlist.chartSource) return { ok: true, idle: true };
+    const now = Date.now();
+    const item = playlist.items.find(entry => isChartItem(entry) && (
+        entry.matchState === 'pending' || (entry.matchState === 'matching' && now - (entry.matchStartedAt || 0) > CHART_MATCH_TIMEOUT_MS)
+    ));
+    return item ? await matchChartItem(playlist.id, item.id, false) : { ok: true, idle: true };
+}
+async function playChartItem(playlistId, itemId) {
+    let lists = await getPlaylists();
+    let playlist = findPl(lists, playlistId);
+    let index = playlist ? playlist.items.findIndex(item => item.id === itemId) : -1;
+    if (index < 0) return { ok: false, error: '榜单条目不存在' };
+    let item = playlist.items[index];
+    if (isChartItem(item) && (item.matchState !== 'matched' || !item.bvid)) {
+        const matched = await matchChartItem(playlistId, itemId, true);
+        if (!matched || !matched.ok) return matched || { ok: false, error: '匹配音源失败' };
+        lists = await getPlaylists();
+        playlist = findPl(lists, playlistId);
+        index = playlist ? playlist.items.findIndex(entry => entry.id === itemId) : -1;
+        item = index >= 0 ? playlist.items[index] : null;
+    }
+    if (!item || !item.bvid) return { ok: false, error: '匹配音源失败' };
+    return await sendToOffscreen({ cmd: 'playIndex', index: index, playlistId: playlistId });
+}
 
 function isValidBvid(bvid) { return /^BV[0-9A-Za-z]{10,}$/.test(String(bvid || '')); }
 function collectionKey(bvid) { return String(bvid || ''); }
 function collectionItemKey(item) { return String(item.bvid || '') + ':' + String(Number(item.cid) || 0); }
+function samePlaylistContent(left, right) {
+    if (!left || !right) return false;
+    if (left.bvid && right.bvid) return left.bvid === right.bvid && (left.cid || 0) === (right.cid || 0);
+    if (isChartItem(left) && isChartItem(right)) {
+        return left.chartSource === right.chartSource && left.chartId === right.chartId &&
+            Number(left.sourceRank) === Number(right.sourceRank) && left.sourceTitle === right.sourceTitle &&
+            left.sourceArtist === right.sourceArtist;
+    }
+    return false;
+}
 function addCollectionItem(items, seen, item) {
     const bvid = String(item.bvid || '');
     const cid = Number(item.cid) || 0;
@@ -397,7 +604,9 @@ async function repairResolvedItem(p, resolved) {
         const pl = findPl(lists, p.playlistId);
         const it = pl && pl.items.find(x => x.id === p.itemId);
         if (!it || it.bvid !== p.bvid || it.cid) return;
+        const chartTitle = isChartItem(it) ? chartDisplayTitle(it.sourceTitle, it.sourceArtist) : '';
         Object.assign(it, resolvedItemFields(resolved, p.bvid, p.page || 1, it));
+        if (chartTitle) it.title = chartTitle;
         await savePlaylists(lists);
         await broadcastData();
     });
@@ -769,6 +978,31 @@ async function broadcastData() {
     broadcast({ type: 'data', playlists, activeId, state });
 }
 
+async function openChartPickerWindow() {
+    if (!chrome.windows || typeof chrome.windows.create !== 'function') {
+        throw new Error('当前浏览器不支持独立榜单窗口');
+    }
+    if (chartWindowId != null && typeof chrome.windows.update === 'function') {
+        try {
+            await chrome.windows.update(chartWindowId, { focused: true });
+            return { ok: true, windowId: chartWindowId, reused: true };
+        } catch (_) {
+            chartWindowId = null;
+        }
+    }
+    const created = await chrome.windows.create({
+        url: chrome.runtime.getURL('src/charts/chart-picker.html'),
+        type: 'popup', width: 680, height: 640, focused: true
+    });
+    chartWindowId = created && created.id != null ? created.id : null;
+    return { ok: true, windowId: chartWindowId };
+}
+if (chrome.windows && chrome.windows.onRemoved && typeof chrome.windows.onRemoved.addListener === 'function') {
+    chrome.windows.onRemoved.addListener(id => {
+        if (id === chartWindowId) chartWindowId = null;
+    });
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg) return;
     if (msg.bplPing === 'offscreen-nostorage') {
@@ -804,6 +1038,50 @@ async function handleBg(msg, sender, mutationLocked) {
         return await withPlaylistMutation(() => handleBg(msg, sender, true));
     }
     switch (msg.cmd) {
+        case 'getChartCatalog': {
+            const sources = chartCatalog();
+            return sources.length ? { ok: true, sources: sources } : { ok: false, error: '没有可用的榜单来源' };
+        }
+        case 'openChartWindow': {
+            return await openChartPickerWindow();
+        }
+        case 'importChart': {
+            const adapter = chartAdapter(String(msg.sourceId || ''));
+            if (!adapter || typeof adapter.fetchChart !== 'function') return { ok: false, error: '不支持的榜单来源' };
+            let chart;
+            try { chart = await adapter.fetchChart(String(msg.chartId || ''), chartFetch, { limit: msg.limit }); }
+            catch (error) {
+                const message = String(error && error.message || error || '榜单读取失败');
+                BPLLog.warn('chart', '榜单读取失败：' + message);
+                return { ok: false, error: message };
+            }
+            const items = (chart.items || []).map(song => chartPlaceholder(chart, song));
+            if (!items.length) return { ok: false, error: '榜单没有可导入的歌曲' };
+            return await withPlaylistMutation(async () => {
+                const lists = await getPlaylists();
+                const id = genId();
+                const requestedName = String(msg.name || '').trim();
+                const defaultName = chart.sourceName + ' - ' + chart.chartName;
+                lists.push({
+                    id: id,
+                    name: (requestedName || defaultName).slice(0, 100),
+                    items: items,
+                    chartSource: chart.sourceId,
+                    chartId: chart.chartId,
+                    chartName: chart.chartName
+                });
+                await savePlaylists(lists);
+                await setActiveId(id);
+                await broadcastData();
+                return { ok: true, playlistId: id, count: items.length };
+            });
+        }
+        case 'matchChartItem': {
+            return await matchChartItem(String(msg.playlistId || ''), String(msg.itemId || ''), !!msg.manual);
+        }
+        case 'playChartItem': {
+            return await playChartItem(String(msg.playlistId || ''), String(msg.itemId || ''));
+        }
         case 'getCollection': {
             try { return await collectionSummary(msg.bvid); }
             catch (e) {
@@ -909,6 +1187,30 @@ async function handleBg(msg, sender, mutationLocked) {
             // 必须由 bg 转发而非 offscreen 直发——现场实证 offscreen 直发的 runtime 广播
             // 到不了网页里的 content script（胶囊/面板进度条因此冻住）；bg→content 是实证通路。
             if (msg.data && typeof msg.data === 'object') broadcast(msg.data);
+            const data = msg.data || {};
+            if (data.type === 'state' && data.state) {
+                const playing = !!data.state.playing;
+                const playlistId = data.state.playlistId || null;
+                if (playing && (!chartWasPlaying || chartAutoPlaylistId !== playlistId)) {
+                    chartAutoPlaylistId = playlistId;
+                    chartAutoNextAt = Date.now() + CHART_AUTO_MATCH_DELAY_MS;
+                }
+                chartWasPlaying = playing;
+            }
+            if (data.type === 'progress' && data.playing && !chartAutoPlaylistId) {
+                const storedState = await getState();
+                chartAutoPlaylistId = storedState.playlistId || null;
+                chartAutoNextAt = Date.now() + CHART_AUTO_MATCH_DELAY_MS;
+                chartWasPlaying = true;
+            }
+            if (data.type === 'progress' && data.playing && chartAutoPlaylistId && Date.now() >= chartAutoNextAt) {
+                chartAutoNextAt = Date.now() + CHART_AUTO_MATCH_DELAY_MS;
+                if (!chartAutoMatchTask) {
+                    chartAutoMatchTask = matchNextChartItem(chartAutoPlaylistId)
+                        .finally(() => { chartAutoMatchTask = null; });
+                }
+                await chartAutoMatchTask;
+            }
             return { ok: true };
         }
         case 'storageGet': {
@@ -1001,7 +1303,7 @@ async function handleBg(msg, sender, mutationLocked) {
             let added = 0;
             for (const i of asc) {
                 const it = fromPl.items[i];
-                if (it && !toPl.items.some(x => x.bvid === it.bvid && (x.cid || 0) === (it.cid || 0))) {
+                if (it && !toPl.items.some(x => samePlaylistContent(x, it))) {
                     const copy = Object.assign({}, it);
                     if (msg.cmd === 'batchCopy') copy.id = genId();
                     toPl.items.push(copy);

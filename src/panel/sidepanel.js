@@ -12,7 +12,7 @@ const MODES = [
     { id: 'loop', label: '列表循环', icon: svg('<path d="M17 2l4 4-4 4M3 11V9a4 4 0 014-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 01-4 4H3"/>') },
     { id: 'shuffleLoop', label: '随机循环', icon: svg('<path d="M17 2l4 4-4 4M3 11V9a4 4 0 014-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 01-4 4H3"/><path d="M9.5 14.5l5-5M9.5 9.5l5 5" opacity=".8"/>') }
 ];
-const SOURCE_REPAIR_ICON = svg('<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4 4"/>');
+const SOURCE_REMATCH_ICON = svg('<path d="M20 7h-5V2"/><path d="M20 7a8.5 8.5 0 10.8 9"/>');
 function modeIndex(id) { const i = MODES.findIndex(m => m.id === id); return i >= 0 ? i : 3; }
 function normMode(st) {
     if (MODES.some(m => m.id === st.mode)) return st.mode;
@@ -31,7 +31,12 @@ let failedNowPlayingCover = '';
 let locateHighlightTimer = null;
 const initialChartMatches = new Set();
 let initialChartRecoveryTimer = null;
-const repairingSources = new Set();
+const rematchingSources = new Set();
+
+function canRematchItem(item) {
+    return !!(item && item.bvid && (item.sourceUnavailable || item.matchOrigin === 'chart' || item.matchOrigin === 'repair' ||
+        (item.chartSource && item.matchState === 'matched')));
+}
 
 function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -125,7 +130,7 @@ if (logEl) {
 
 function send(cmd, extra) {
     const payload = Object.assign({ target: 'bg', cmd }, extra || {});
-    const timeoutMs = cmd === 'repairSource' ? 90000
+    const timeoutMs = (cmd === 'rematchSource' || cmd === 'repairSource') ? 90000
         : (cmd === 'playChartItem' ? 45000
             : (({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000));
     const report = r => {
@@ -249,17 +254,20 @@ function render() {
             const linkHtml = linkUrl
                 ? '<a class="ibtn link" href="' + esc(linkUrl) + '" title="在原页面打开">↗</a>'
                 : '<span class="ibtn link disabled" aria-hidden="true">↗</span>';
-            const repairHtml = sourceUnavailable
-                ? '<button type="button" class="ibtn source-repair' + (repairingSources.has(s.id) ? ' repairing' : '') +
-                    '" data-repair="' + esc(s.id) + '" title="自动匹配替代源" aria-label="自动匹配替代源"' +
-                    (repairingSources.has(s.id) ? ' disabled' : '') + '>' + SOURCE_REPAIR_ICON + '</button>'
-                : '';
+            const rematchable = canRematchItem(s);
+            const rematching = rematchingSources.has(s.id);
+            const sourceSlotHtml = '<span class="source-slot' + (rematchable ? ' rematchable' : '') +
+                (sourceUnavailable ? ' unavailable' : '') +
+                (rematching ? ' rematching' : '') + '">' +
+                '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
+                (rematchable ? '<button type="button" class="source-rematch" data-rematch="' + esc(s.id) +
+                    '" title="重新匹配音源" aria-label="重新匹配音源"' + (rematching ? ' disabled' : '') + '>' +
+                    SOURCE_REMATCH_ICON + '</button>' : '') + '</span>';
             return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '">' +
                 '<span class="chk"></span>' +
                 coverHtml +
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
-                repairHtml +
-                '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
+                sourceSlotHtml +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
                 linkHtml +
                 '</div>';
@@ -465,16 +473,17 @@ function buildMd(pl) {
     return lines.join('\r\n');
 }
 function buildJson(pl) {
+    const playlist = Object.assign({}, pl);
+    delete playlist.id;
+    delete playlist.items;
     return JSON.stringify({
         app: 'bilibili-music-player',
         type: 'playlist',
+        formatVersion: 2,
         name: pl.name,
         exportedAt: new Date().toISOString(),
-        items: pl.items.map(s => ({
-            bvid: s.bvid, cid: s.cid || 0, title: s.title,
-            pic: s.pic || '', owner: s.owner || '',
-            duration: s.duration || 0, page: s.page || 1
-        }))
+        playlist: playlist,
+        items: pl.items.map(item => Object.assign({}, item))
     }, null, 2);
 }
 function exportAs(format) {
@@ -492,13 +501,18 @@ function handleImportFile(f) {
     reader.onload = () => {
         try {
             const data = JSON.parse(reader.result);
-            let name = '', items = [];
+            let name = '', items = [], playlist = {};
             if (Array.isArray(data)) items = data;
-            else if (data && Array.isArray(data.items)) { name = data.name || ''; items = data.items; }
+            else if (data && Array.isArray(data.items)) {
+                playlist = data.playlist && typeof data.playlist === 'object' ? data.playlist : {};
+                name = data.name || playlist.name || '';
+                items = data.items;
+            }
             else { alert('不是有效的播放列表 JSON'); return; }
-            items = items.filter(x => x && x.bvid);
-            if (!items.length) { alert('JSON 里没有有效条目（需要包含 bvid）'); return; }
-            send('importPlaylist', { name: name || f.name.replace(/\.json$/i, ''), items });
+            items = items.filter(x => x && typeof x === 'object' &&
+                (x.bvid || (x.chartSource && x.sourceTitle)));
+            if (!items.length) { alert('JSON 里没有有效条目'); return; }
+            send('importPlaylist', { name: name || f.name.replace(/\.json$/i, ''), playlist, items });
         } catch (err) {
             alert('JSON 解析失败：' + err.message);
         }
@@ -798,19 +812,19 @@ box.addEventListener('click', e => {
         send('openTab', { url: lk.getAttribute('href') });
         return;
     }
-    const repair = e.target.closest('[data-repair]');
-    if (repair) {
+    const rematch = e.target.closest('[data-rematch]');
+    if (rematch) {
         e.stopPropagation();
         const playlist = activePlaylist();
-        const item = playlist && playlist.items.find(value => value.id === repair.dataset.repair);
-        if (!item || !item.sourceUnavailable || repairingSources.has(item.id)) return;
-        repairingSources.add(item.id);
+        const item = playlist && playlist.items.find(value => value.id === rematch.dataset.rematch);
+        if (!canRematchItem(item) || rematchingSources.has(item.id)) return;
+        rematchingSources.add(item.id);
         render();
-        toast('正在匹配替代源');
-        send('repairSource', { playlistId: activeId, itemId: item.id }).then(result => {
-            repairingSources.delete(item.id);
-            if (result && result.ok) toast(result.replaced ? '已匹配并切换到替代源' : '原视频已恢复');
-            else toast((result && result.error) || '未找到合适的替代源');
+        toast('正在重新匹配音源');
+        send('rematchSource', { playlistId: activeId, itemId: item.id }).then(result => {
+            rematchingSources.delete(item.id);
+            if (result && result.ok) toast(result.replaced ? '已切换到新的匹配源' : '原视频已恢复');
+            else toast((result && result.error) || '未找到新的可信来源');
             refresh();
         });
         return;

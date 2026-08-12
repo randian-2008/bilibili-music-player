@@ -480,7 +480,7 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
     if (pIsShuffle(st.mode) && !keepOrder) pBuildFrom(items.length, i);
     let it = items[i];
     if (it && it.sourceUnavailable) {
-        return { ok: false, sourceUnavailable: true, error: '原视频已失效，请使用放大镜匹配替代源' };
+        return { ok: false, sourceUnavailable: true, error: '原视频已失效，请将鼠标移到条目上重新匹配音源' };
     }
     if (it && it.chartSource && it.matchState === 'failed' && !it.bvid) {
         return { ok: false, chartMatchFailed: true, error: it.matchError || '匹配榜单音源失败' };

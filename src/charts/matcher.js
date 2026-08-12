@@ -191,11 +191,12 @@
         return score;
     }
 
-    function rankReplacementCandidates(item, candidates) {
+    function rankReplacementCandidates(item, candidates, minimumScore) {
+        const minimum = Number.isFinite(Number(minimumScore)) ? Number(minimumScore) : 48;
         return (Array.isArray(candidates) ? candidates : [])
             .filter(candidate => candidate && candidate.bvid)
             .map(candidate => ({ candidate, score: scoreReplacementCandidate(item, candidate) }))
-            .filter(entry => Number.isFinite(entry.score) && entry.score >= 48)
+            .filter(entry => Number.isFinite(entry.score) && entry.score >= minimum)
             .sort((left, right) => right.score - left.score);
     }
 

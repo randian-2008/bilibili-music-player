@@ -2,6 +2,21 @@
 
 本文件记录项目自首次公开发布以来的重要用户可见变化。公开前的内部迭代保留在 Git 提交历史中，不再作为正式版本逐项列出。
 
+## [2.8.2] - 2026-08-12
+
+### 新增
+
+- 自动匹配得到的条目可在时长区域悬浮后重新匹配音源；已确认失效的条目会持续显示该入口。
+- 为自动匹配条目记录固定匹配目标和完整来源历史，重新匹配时不会再次选择当前或曾用过的视频。
+- JSON 导出升级为完整播放列表备份，可恢复音源、匹配目标、匹配历史和待匹配状态等内部条目信息。
+
+### 改进
+
+- 热榜首次匹配、热榜重新匹配和失效源替换共用统一的候选评分逻辑，并保留条目的固定显示标题。
+- TXT 和 Markdown 继续只导出标题、UP 主、时长与链接等显式信息，适合阅读和分享。
+- JSON 导入兼容旧版基础格式，恢复时重新生成播放列表和条目 ID，并过滤无效条目和危险对象键。
+- 自动化测试增至 260 项，覆盖匹配历史、重复来源排除、完整备份恢复和导出信息边界。
+
 ## [2.8.1] - 2026-08-12
 
 ### 新增
@@ -140,6 +155,7 @@
 - 建立包含 146 项断言的自动化测试与 GitHub Actions CI。
 - 采用 GNU GPL v3.0 或更高版本开源。
 
+[2.8.2]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.2
 [2.8.1]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.1
 [2.8.0]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.0
 [2.7.0]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.7.0

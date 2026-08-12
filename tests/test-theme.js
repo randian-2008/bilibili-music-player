@@ -91,10 +91,15 @@ ok(/function volumeIcon\(v, muted\)/.test(sidepanelCode) &&
     /id="muteBtn"[^>]*><svg[^>]*stroke="currentColor"/.test(sidepanelHtml) &&
     /\.vbtn\s*\{[\s\S]*?color: var\(--bpl-muted\)/.test(sidepanelCss),
     '音量图标使用 currentColor SVG 并随主题着色');
-ok(/data-repair=/.test(sidepanelCode) && /title="自动匹配替代源"/.test(sidepanelCode) &&
+ok(/data-rematch=/.test(sidepanelCode) && /title="重新匹配音源"/.test(sidepanelCode) &&
+    /function canRematchItem\(item\)/.test(sidepanelCode) &&
     /sourceUnavailable \? '' : httpsUrl\(s\.pic\)/.test(sidepanelCode) &&
-    /\.ibtn\.source-repair\s*\{/.test(sidepanelCss),
-    '仅对确认失效条目显示放大镜修复按钮，并使用失效封面');
+    /sourceUnavailable \? ' unavailable' : ''/.test(sidepanelCode) &&
+    /\.source-slot\s*\{/.test(sidepanelCss) && /\.source-slot\.rematchable:hover \.source-rematch/.test(sidepanelCss) &&
+    /\.source-slot\.unavailable \.source-rematch/.test(sidepanelCss) &&
+    !/\.item:hover \.source-slot\.rematchable \.source-rematch/.test(sidepanelCss) &&
+    /width: 42px; height: 22px/.test(sidepanelCss),
+    '自动匹配条目仅悬浮时长槽才显示按钮，失效条目则持续显示重新匹配按钮');
 ok((sidepanelHtml.match(/data-locate-playing/g) || []).length === 2 &&
     /async function locatePlayingItem\(\)/.test(sidepanelCode) &&
     /send\('setActive', \{ id: pl\.id \}\)/.test(sidepanelCode) &&
@@ -102,6 +107,17 @@ ok((sidepanelHtml.match(/data-locate-playing/g) || []).length === 2 &&
     /scrollIntoView\(\{ block: 'center', behavior: 'smooth' \}\)/.test(sidepanelCode) &&
     /\.item\.located\s*\{ animation: locateItem/.test(sidepanelCss),
     '点击当前封面或标题可切换到所属播放列表，并按 trackId 定位和高亮当前条目');
+const txtExportCode = sidepanelCode.slice(sidepanelCode.indexOf('function buildTxt'), sidepanelCode.indexOf('function buildMd'));
+const mdExportCode = sidepanelCode.slice(sidepanelCode.indexOf('function buildMd'), sidepanelCode.indexOf('function buildJson'));
+const jsonExportCode = sidepanelCode.slice(sidepanelCode.indexOf('function buildJson'), sidepanelCode.indexOf('function exportAs'));
+const internalExportFields = /matchHistory|matchTarget|matchOrigin|matchState|chartSource|sourceUnavailable/;
+ok(!internalExportFields.test(txtExportCode) && !internalExportFields.test(mdExportCode) &&
+    /s\.title/.test(txtExportCode) && /itemUrl\(s\)/.test(txtExportCode) &&
+    /s\.title/.test(mdExportCode) && /itemUrl\(s\)/.test(mdExportCode),
+    'TXT 和 Markdown 仅导出标题、作者、时长、链接等显式信息');
+ok(/formatVersion:\s*2/.test(jsonExportCode) && /playlist:\s*playlist/.test(jsonExportCode) &&
+    /pl\.items\.map\(item => Object\.assign\(\{\}, item\)\)/.test(jsonExportCode),
+    'JSON v2 导出播放列表元数据和完整条目字段，可保留匹配历史');
 
 function luminance(hex) {
     const rgb = hex.match(/[0-9a-f]{2}/gi).map(value => parseInt(value, 16) / 255)

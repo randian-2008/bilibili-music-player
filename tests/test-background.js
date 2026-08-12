@@ -539,6 +539,10 @@ function makeCtx(opts) {
         '播放残缺条目时补齐 cid、封面和标题');
 
     console.log('\n[background 失效来源识别与用户触发修复]');
+    ok(!ctx.canRematchSource({ bvid: 'BV1MANUAL001', title: '手动来源' }) &&
+        ctx.canRematchSource({ bvid: 'BV1LEGACY001', chartSource: 'apple', sourceTitle: '旧热榜条目', matchState: 'matched' }) &&
+        ctx.canRematchSource({ bvid: 'BV1BROKEN001', sourceUnavailable: true }),
+        '正常手动来源不可换源，旧版自动匹配条目和确认失效来源可以重新匹配');
     ctx = makeCtx({ fetchResponder: url => {
         if (url.includes('/x/web-interface/view')) return {
             code: 0, data: { bvid: 'BV1NETWORK001', title: '仍然存在', pages: [{ page: 1, cid: 33 }] }
@@ -590,6 +594,82 @@ function makeCtx(opts) {
         '用户触发后排除同名翻唱，完整验证替代视频并原子替换来源，同时保留播放列表标题');
     ok(ctx.__portSent.some(message => message.cmd === 'playIndex' && message.playlistId === 'repair'),
         '替代源写入成功后立即按新来源播放');
+    ok(replaced.matchOrigin === 'repair' && replaced.matchTargetTitle === '保留的播放列表标题' &&
+        replaced.matchHistory.join(',') === 'BV1OLDDEAD01,BV1REPLACE01',
+        '失效源修复后保存固定匹配目标及条目级来源历史');
+
+    ctx = makeCtx({ fetchResponder: url => {
+        if (url.includes('/x/web-interface/search/type')) return { code: 0, data: { result: [
+            { bvid: 'BV1MATCHOLD01', title: '周杰伦 晴天 官方MV', author: '旧账号', pic: '//img/old.jpg', duration: '4:29', rank_index: 1, play: 500000 },
+            { bvid: 'BV1MATCHNEW01', title: '周杰伦《晴天》高音质', author: '新账号', pic: '//img/new.jpg', duration: '4:28', rank_index: 2, play: 300000 }
+        ] } };
+        if (url.includes('/x/web-interface/view') && url.includes('BV1MATCHNEW01')) return { code: 0, data: {
+            bvid: 'BV1MATCHNEW01', title: 'B站新标题', pic: '//img/new.jpg', owner: { name: '新账号' },
+            pages: [{ page: 1, cid: 707, duration: 268, part: 'B站新标题' }]
+        } };
+        return { code: 0, data: { dash: { audio: [{ baseUrl: 'https://cdn/rematched.m4s', bandwidth: 1 }] } } };
+    }});
+    ctx.__store.bpl_playlists = [{ id: 'chart-rematch', name: '热榜', chartSource: 'apple', items: [{
+        id: 'chart0', bvid: 'BV1MATCHOLD01', cid: 101, title: '晴天 - 周杰伦', pic: '//img/old.jpg',
+        owner: '旧账号', duration: 269, page: 1, chartSource: 'apple', chartId: 'chart', sourceRank: 1,
+        sourceTitle: '晴天', sourceArtist: '周杰伦', matchState: 'matched', matchOrigin: 'chart',
+        matchTargetTitle: '晴天', matchTargetArtist: '周杰伦', matchTargetDuration: 269,
+        matchHistory: ['BV1MATCHOLD01']
+    }] }];
+    ctx.__store.bpl_active = 'chart-rematch';
+    r = await ctx.handleBg({ cmd: 'rematchSource', playlistId: 'chart-rematch', itemId: 'chart0' }, null);
+    const rematched = ctx.__store.bpl_playlists[0].items[0];
+    ok(r.ok === true && rematched.bvid === 'BV1MATCHNEW01' && rematched.cid === 707 &&
+        rematched.title === '晴天 - 周杰伦' && rematched.matchHistory.join(',') === 'BV1MATCHOLD01,BV1MATCHNEW01',
+        '自动匹配条目可重新匹配，并排除当前来源、保留固定显示标题和完整来源历史');
+    r = await ctx.handleBg({ cmd: 'rematchSource', playlistId: 'chart-rematch', itemId: 'chart0' }, null);
+    ok(r.ok === false && /没有找到/.test(r.error) && ctx.__store.bpl_playlists[0].items[0].bvid === 'BV1MATCHNEW01',
+        '来源历史中的全部 BVID 均被排除，无新候选时保留当前可用来源');
+
+    console.log('\n[background 播放列表 JSON 完整备份恢复]');
+    ctx = makeCtx();
+    const backupItem = JSON.parse('{"id":"backup-item","bvid":"BV1BACKUP001","cid":321,"title":"完整备份条目",' +
+        '"pic":"http://i0.hdslb.com/backup.jpg","owner":"原UP","duration":245,"page":2,' +
+        '"matchOrigin":"repair","matchTargetTitle":"固定匹配目标","matchTargetArtist":"目标作者",' +
+        '"matchTargetDuration":244,"matchTargetOwner":"原UP","matchHistory":["BV1OLDMATCH01","bad","BV1OLDMATCH01","BV1BACKUP001"],' +
+        '"sourceUnavailable":true,"customData":{"enabled":true},"__proto__":{"polluted":true},"constructor":{"polluted":true}}');
+    const placeholderItem = {
+        id: 'backup-placeholder', bvid: '', cid: 0, title: '待匹配歌曲 - 歌手', pic: '', owner: '', duration: 0, page: 1,
+        chartSource: 'apple', chartId: 'chart-id', sourceRank: 3, sourceTitle: '待匹配歌曲', sourceArtist: '歌手', matchState: 'pending'
+    };
+    r = await ctx.handleBg({
+        cmd: 'importPlaylist', name: '恢复后的播放列表',
+        playlist: JSON.parse('{"id":"backup-playlist","name":"备份名称","chartSource":"apple","customSettings":{"limit":25},"__proto__":{"polluted":true}}'),
+        items: [backupItem, placeholderItem, { id: 'invalid', bvid: 'not-a-bvid', title: '无效条目' }]
+    }, null);
+    const restoredPlaylist = ctx.__store.bpl_playlists[0];
+    const restoredItem = restoredPlaylist.items[0];
+    const restoredPlaceholder = restoredPlaylist.items[1];
+    ok(r.ok === true && r.count === 2 && restoredPlaylist.id !== 'backup-playlist' &&
+        restoredPlaylist.name === '恢复后的播放列表' && restoredPlaylist.chartSource === 'apple' &&
+        restoredPlaylist.customSettings.limit === 25,
+        '恢复播放列表级元数据、过滤无效条目，并重新生成播放列表 ID');
+    ok(restoredItem.id !== 'backup-item' && restoredItem.bvid === 'BV1BACKUP001' && restoredItem.cid === 321 &&
+        restoredItem.pic === 'https://i0.hdslb.com/backup.jpg' && restoredItem.matchOrigin === 'repair' &&
+        restoredItem.matchTargetTitle === '固定匹配目标' && restoredItem.matchTargetArtist === '目标作者' &&
+        restoredItem.matchTargetDuration === 244 && restoredItem.matchTargetOwner === '原UP' &&
+        restoredItem.customData.enabled === true,
+        '完整恢复条目字段和固定匹配目标，同时重新生成条目 ID');
+    ok(restoredItem.matchHistory.join(',') === 'BV1OLDMATCH01,BV1BACKUP001' &&
+        !Object.prototype.hasOwnProperty.call(restoredItem, '__proto__') &&
+        !Object.prototype.hasOwnProperty.call(restoredItem, 'constructor') && !({}).polluted,
+        '匹配历史去重并过滤无效 BVID，危险对象键不会进入存储');
+    ok(restoredPlaceholder.bvid === '' && restoredPlaceholder.matchState === 'pending' &&
+        restoredPlaceholder.chartSource === 'apple' && restoredPlaceholder.sourceTitle === '待匹配歌曲',
+        '未匹配的热榜占位条目可由完整 JSON 备份恢复');
+
+    ctx = makeCtx();
+    r = await ctx.handleBg({ cmd: 'importPlaylist', name: '旧版备份', items: [{
+        id: 'legacy-id', bvid: 'BV1LEGACY001', cid: 11, title: '旧版条目', pic: '', owner: '', duration: 90, page: 1
+    }] }, null);
+    ok(r.ok === true && ctx.__store.bpl_playlists[0].items[0].bvid === 'BV1LEGACY001' &&
+        ctx.__store.bpl_playlists[0].items[0].id !== 'legacy-id',
+        '旧版仅含基础字段的 JSON 仍可导入并获得新的条目 ID');
 
     console.log('\n[background offscreen 路由（Port 通信）]');
     // sendToOffscreen 正常：创建 offscreen 并经 Port 转发命令

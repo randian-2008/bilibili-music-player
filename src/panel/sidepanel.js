@@ -12,6 +12,7 @@ const MODES = [
     { id: 'loop', label: '列表循环', icon: svg('<path d="M17 2l4 4-4 4M3 11V9a4 4 0 014-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 01-4 4H3"/>') },
     { id: 'shuffleLoop', label: '随机循环', icon: svg('<path d="M17 2l4 4-4 4M3 11V9a4 4 0 014-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 01-4 4H3"/><path d="M9.5 14.5l5-5M9.5 9.5l5 5" opacity=".8"/>') }
 ];
+const SOURCE_REPAIR_ICON = svg('<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4 4"/>');
 function modeIndex(id) { const i = MODES.findIndex(m => m.id === id); return i >= 0 ? i : 3; }
 function normMode(st) {
     if (MODES.some(m => m.id === st.mode)) return st.mode;
@@ -30,6 +31,7 @@ let failedNowPlayingCover = '';
 let locateHighlightTimer = null;
 const initialChartMatches = new Set();
 let initialChartRecoveryTimer = null;
+const repairingSources = new Set();
 
 function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -123,8 +125,9 @@ if (logEl) {
 
 function send(cmd, extra) {
     const payload = Object.assign({ target: 'bg', cmd }, extra || {});
-    const timeoutMs = cmd === 'playChartItem' ? 45000
-        : (({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000);
+    const timeoutMs = cmd === 'repairSource' ? 90000
+        : (cmd === 'playChartItem' ? 45000
+            : (({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000));
     const report = r => {
         if (r && r.ok === false && r.error) BPLLog.error('ui', cmd + ' 失败：' + r.error);
         else if (!r) BPLLog.warn('ui', cmd + '：后台无响应（超时）');
@@ -235,8 +238,10 @@ function render() {
     } else {
         box.innerHTML = items.map((s, i) => {
             const isPlaying = showPlaying && !!state.trackId && s.id === state.trackId;
-            const coverUrl = httpsUrl(s.pic);
-            const chartCoverClass = s.matchState === 'matching' ? ' cover-matching' : (s.matchState === 'failed' ? ' cover-failed' : '');
+            const sourceUnavailable = !!s.sourceUnavailable;
+            const coverUrl = sourceUnavailable ? '' : httpsUrl(s.pic);
+            const chartCoverClass = s.matchState === 'matching' ? ' cover-matching'
+                : ((s.matchState === 'failed' || sourceUnavailable) ? ' cover-failed' : '');
             const coverHtml = coverUrl
                 ? '<img class="cover" src="' + esc(coverUrl) + '" draggable="false" referrerpolicy="no-referrer">'
                 : '<span class="cover cover-empty' + chartCoverClass + '" draggable="false" aria-hidden="true"></span>';
@@ -244,10 +249,16 @@ function render() {
             const linkHtml = linkUrl
                 ? '<a class="ibtn link" href="' + esc(linkUrl) + '" title="在原页面打开">↗</a>'
                 : '<span class="ibtn link disabled" aria-hidden="true">↗</span>';
+            const repairHtml = sourceUnavailable
+                ? '<button type="button" class="ibtn source-repair' + (repairingSources.has(s.id) ? ' repairing' : '') +
+                    '" data-repair="' + esc(s.id) + '" title="自动匹配替代源" aria-label="自动匹配替代源"' +
+                    (repairingSources.has(s.id) ? ' disabled' : '') + '>' + SOURCE_REPAIR_ICON + '</button>'
+                : '';
             return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '">' +
                 '<span class="chk"></span>' +
                 coverHtml +
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
+                repairHtml +
                 '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
                 '<div class="ibtn" data-rename="' + i + '" title="重命名">✎</div>' +
                 linkHtml +
@@ -785,6 +796,23 @@ box.addEventListener('click', e => {
         e.preventDefault();
         e.stopPropagation();
         send('openTab', { url: lk.getAttribute('href') });
+        return;
+    }
+    const repair = e.target.closest('[data-repair]');
+    if (repair) {
+        e.stopPropagation();
+        const playlist = activePlaylist();
+        const item = playlist && playlist.items.find(value => value.id === repair.dataset.repair);
+        if (!item || !item.sourceUnavailable || repairingSources.has(item.id)) return;
+        repairingSources.add(item.id);
+        render();
+        toast('正在匹配替代源');
+        send('repairSource', { playlistId: activeId, itemId: item.id }).then(result => {
+            repairingSources.delete(item.id);
+            if (result && result.ok) toast(result.replaced ? '已匹配并切换到替代源' : '原视频已恢复');
+            else toast((result && result.error) || '未找到合适的替代源');
+            refresh();
+        });
         return;
     }
     const rn = e.target.closest('[data-rename]');

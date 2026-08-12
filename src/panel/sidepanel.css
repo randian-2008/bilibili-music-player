@@ -285,6 +285,14 @@ input[type=range]:hover::-webkit-slider-thumb { transform: scale(1.3); }
 .ibtn.link { display: flex; align-items: center; justify-content: center; text-decoration: none; color: var(--bpl-subtle); }
 .ibtn.link:hover { color: var(--bpl-accent); background: var(--bpl-accent-soft); }
 .ibtn.link.disabled { opacity: .25; pointer-events: none; }
+.ibtn.source-repair {
+    appearance: none; padding: 0; border: 0; outline: none; background: transparent;
+    display: flex; align-items: center; justify-content: center; color: var(--bpl-danger);
+}
+.ibtn.source-repair:hover { color: var(--bpl-accent); background: var(--bpl-accent-soft); }
+.ibtn.source-repair:disabled { cursor: wait; opacity: .55; }
+.ibtn.source-repair.repairing { animation: repairPulse .9s ease-in-out infinite alternate; }
+@keyframes repairPulse { to { opacity: .25; } }
 
 .empty { text-align: center; color: var(--bpl-faint); font-size: 13px; padding: 40px 20px; line-height: 1.8; }
 

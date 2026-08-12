@@ -86,7 +86,7 @@ Offscreen Document：后台音频播放
 
 ## 项目信息
 
-- 当前版本：**v2.8.0**
+- 当前版本：**v2.8.1**
 - 开源许可：[GNU GPL v3.0 或更高版本](LICENSE)
 - 参与贡献：[CONTRIBUTING.md](CONTRIBUTING.md)
 - 安全问题：[SECURITY.md](SECURITY.md)

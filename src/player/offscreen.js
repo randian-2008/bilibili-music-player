@@ -479,6 +479,9 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
     if (i < 0 || i >= items.length) return { ok: false, error: '播放索引越界 (' + i + '/' + items.length + ')' };
     if (pIsShuffle(st.mode) && !keepOrder) pBuildFrom(items.length, i);
     let it = items[i];
+    if (it && it.sourceUnavailable) {
+        return { ok: false, sourceUnavailable: true, error: '原视频已失效，请使用放大镜匹配替代源' };
+    }
     if (it && it.chartSource && it.matchState === 'failed' && !it.bvid) {
         return { ok: false, chartMatchFailed: true, error: it.matchError || '匹配榜单音源失败' };
     }
@@ -499,7 +502,11 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
     if (!r || !r.ok || !r.urls || !r.urls.length) {
         BPLLog.error('off', 'resolveAudio 失败[' + it.bvid + ']：' + ((r && r.error) || '无候选（取音源模块无有效应答）'));
         BPLLog.flush();
-        return { ok: false, error: (r && r.error) || '获取音频失败' };
+        return {
+            ok: false,
+            sourceUnavailable: !!(r && r.sourceUnavailable),
+            error: (r && r.error) || '获取音频失败'
+        };
     }
     BPLLog.info('off', 'resolveAudio 返回 ' + r.urls.length + ' 个候选[' + it.bvid + '，' + (it.title || '') + ']');
     let blocked = false;
@@ -573,7 +580,7 @@ async function pAdvance() {
             }
             const result = await pPlayIndex(shuffleOrder[shufflePos], true);
             attempts++;
-            if (!result || !result.chartMatchFailed) return result;
+            if (!result || (!result.chartMatchFailed && !result.sourceUnavailable)) return result;
         }
         if (mode === 'shuffleLoop') {
             pBuildAfter(items.length, st.index);
@@ -583,7 +590,7 @@ async function pAdvance() {
                     shufflePos++;
                 }
                 const result = await pPlayIndex(shuffleOrder[shufflePos], true);
-                if (!result || !result.chartMatchFailed) return result;
+                if (!result || (!result.chartMatchFailed && !result.sourceUnavailable)) return result;
             }
         }
         return await pStopPlayback();
@@ -594,7 +601,7 @@ async function pAdvance() {
     const first = n;
     do {
         const result = await pPlayIndex(n, true);
-        if (!result || !result.chartMatchFailed) return result;
+        if (!result || (!result.chartMatchFailed && !result.sourceUnavailable)) return result;
         n++;
         if (n >= items.length) n = wrap ? 0 : items.length;
     } while (n < items.length && n !== first);

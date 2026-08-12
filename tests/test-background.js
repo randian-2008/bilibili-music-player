@@ -538,6 +538,59 @@ function makeCtx(opts) {
     ok(r.ok === true && r.cid === 222 && repaired.cid === 222 && repaired.pic === 'https://i0.hdslb.com/repaired.jpg' && repaired.title === '已修复歌曲',
         '播放残缺条目时补齐 cid、封面和标题');
 
+    console.log('\n[background 失效来源识别与用户触发修复]');
+    ctx = makeCtx({ fetchResponder: url => {
+        if (url.includes('/x/web-interface/view')) return {
+            code: 0, data: { bvid: 'BV1NETWORK001', title: '仍然存在', pages: [{ page: 1, cid: 33 }] }
+        };
+        return { code: -352, message: '风控校验失败' };
+    }});
+    ctx.__store.bpl_playlists = [{ id: 'repair', name: '修复', items: [
+        { id: 'network0', bvid: 'BV1NETWORK001', cid: 33, title: '网络失败不换源', pic: '', duration: 180, page: 1 }
+    ] }];
+    r = await ctx.handleResolveAudio({ bvid: 'BV1NETWORK001', cid: 33, page: 1, playlistId: 'repair', itemId: 'network0' });
+    ok(r.ok === false && !r.sourceUnavailable && !ctx.__store.bpl_playlists[0].items[0].sourceUnavailable,
+        '风控或临时取源失败不会把条目标记为永久失效');
+
+    ctx = makeCtx({ fetchResponder: () => ({ code: -404, message: '啥都木有' }) });
+    ctx.__store.bpl_playlists = [{ id: 'repair', name: '修复', items: [
+        { id: 'dead0', bvid: 'BV1OLDDEAD01', cid: 44, title: '已经失效', pic: 'https://img/old.jpg', duration: 180, page: 1 }
+    ] }];
+    r = await ctx.handleResolveAudio({ bvid: 'BV1OLDDEAD01', cid: 44, page: 1, playlistId: 'repair', itemId: 'dead0' });
+    ok(r.ok === false && r.sourceUnavailable === true && ctx.__store.bpl_playlists[0].items[0].sourceUnavailable === true,
+        '明确的 -404 响应才持久化失效标记');
+
+    ctx = makeCtx({ fetchResponder: url => {
+        if (url.includes('/x/web-interface/view') && url.includes('BV1OLDDEAD01')) {
+            return { code: -404, message: '原视频已删除' };
+        }
+        if (url.includes('/x/web-interface/search/type')) {
+            return { code: 0, data: { result: [
+                { bvid: 'BV1COVER0001', title: '<em>保留的播放列表标题</em>', author: '翻唱UP', typename: '翻唱', tag: 'COVER,翻唱', pic: '//img/cover.jpg', duration: '3:00', rank_index: 1, play: 100000 },
+                { bvid: 'BV1REPLACE01', title: '<em>保留的播放列表标题</em> 完整版', author: '新UP', pic: '//img/new-search.jpg', duration: '3:01' },
+                { bvid: 'BV1UNRELATED', title: '完全无关的视频', author: '其他', duration: '20:00' }
+            ] } };
+        }
+        if (url.includes('/x/web-interface/view') && url.includes('BV1REPLACE01')) {
+            return { code: 0, data: {
+                bvid: 'BV1REPLACE01', title: '新视频原标题', pic: 'http://i0.hdslb.com/new.jpg',
+                owner: { name: '新UP' }, pages: [{ page: 1, cid: 909, duration: 181, part: '新视频原标题' }]
+            } };
+        }
+        return { code: 0, data: { dash: { audio: [{ baseUrl: 'https://cdn/new.m4s', bandwidth: 1 }] } } };
+    }});
+    ctx.__store.bpl_playlists = [{ id: 'repair', name: '修复', items: [
+        { id: 'dead0', bvid: 'BV1OLDDEAD01', cid: 44, title: '保留的播放列表标题', pic: 'https://img/old.jpg', duration: 180, page: 1, sourceUnavailable: true }
+    ] }];
+    ctx.__store.bpl_active = 'repair';
+    r = await ctx.handleBg({ cmd: 'repairSource', playlistId: 'repair', itemId: 'dead0' }, null);
+    const replaced = ctx.__store.bpl_playlists[0].items[0];
+    ok(r.ok === true && r.replaced === true && replaced.bvid === 'BV1REPLACE01' && replaced.cid === 909 &&
+        replaced.title === '保留的播放列表标题' && !replaced.sourceUnavailable,
+        '用户触发后排除同名翻唱，完整验证替代视频并原子替换来源，同时保留播放列表标题');
+    ok(ctx.__portSent.some(message => message.cmd === 'playIndex' && message.playlistId === 'repair'),
+        '替代源写入成功后立即按新来源播放');
+
     console.log('\n[background offscreen 路由（Port 通信）]');
     // sendToOffscreen 正常：创建 offscreen 并经 Port 转发命令
     ctx = makeCtx({ offscreenResponder: (msg) => ({ ok: true, echoed: msg.cmd }) });

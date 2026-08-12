@@ -91,6 +91,10 @@ ok(/function volumeIcon\(v, muted\)/.test(sidepanelCode) &&
     /id="muteBtn"[^>]*><svg[^>]*stroke="currentColor"/.test(sidepanelHtml) &&
     /\.vbtn\s*\{[\s\S]*?color: var\(--bpl-muted\)/.test(sidepanelCss),
     '音量图标使用 currentColor SVG 并随主题着色');
+ok(/data-repair=/.test(sidepanelCode) && /title="自动匹配替代源"/.test(sidepanelCode) &&
+    /sourceUnavailable \? '' : httpsUrl\(s\.pic\)/.test(sidepanelCode) &&
+    /\.ibtn\.source-repair\s*\{/.test(sidepanelCss),
+    '仅对确认失效条目显示放大镜修复按钮，并使用失效封面');
 ok((sidepanelHtml.match(/data-locate-playing/g) || []).length === 2 &&
     /async function locatePlayingItem\(\)/.test(sidepanelCode) &&
     /send\('setActive', \{ id: pl\.id \}\)/.test(sidepanelCode) &&

@@ -305,6 +305,29 @@ async function testModes() {
     ok(allFailed.ok === true && st.playing === false && !ctx.__sent.some(message => message && message.cmd === 'matchChartItem'),
         '随机循环整轮均匹配失败时有界停止，不无限重试失败条目');
 
+    const unavailableStore = setupPlaylist(4);
+    unavailableStore.bpl_state.mode = 'loop';
+    unavailableStore.bpl_state.index = 0;
+    unavailableStore.bpl_state.trackId = 'item0';
+    unavailableStore.bpl_playlists[0].items[1].sourceUnavailable = true;
+    unavailableStore.bpl_playlists[0].items[2].sourceUnavailable = true;
+    ctx = makeCtx({ store: unavailableStore });
+    await ctx.pAdvance();
+    st = await getState(ctx);
+    ok(st.playing === true && st.index === 3,
+        '自动播放跳过已确认失效的普通条目并继续下一条');
+
+    const allUnavailableStore = setupPlaylist(3);
+    allUnavailableStore.bpl_state.mode = 'shuffleLoop';
+    allUnavailableStore.bpl_state.index = 0;
+    allUnavailableStore.bpl_state.trackId = 'item0';
+    allUnavailableStore.bpl_playlists[0].items.forEach(item => { item.sourceUnavailable = true; });
+    ctx = makeCtx({ store: allUnavailableStore });
+    const unavailableResult = await ctx.pAdvance();
+    st = await getState(ctx);
+    ok(unavailableResult.ok === true && st.playing === false,
+        '整张播放列表均失效时有界停止，不循环尝试');
+
     ctx = makeCtx({ store: setupPlaylist(3) });
     ctx.__store.bpl_state.mode = 'loop'; ctx.__store.bpl_state.index = 0; ctx.__store.bpl_state.trackId = 'item0'; ctx.__audio.currentTime = 0;
     await ctx.pPrev();

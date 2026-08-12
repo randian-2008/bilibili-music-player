@@ -18,6 +18,8 @@ const CHART_AUTO_MATCH_DELAY_MS = 8000;
 const CHART_MATCH_TIMEOUT_MS = 12000;
 const CHART_NETWORK_TIMEOUT_MS = 12000;
 const chartMatchInflight = new Map();
+const sourceRepairInflight = new Map();
+const DEFINITIVE_UNAVAILABLE_CODES = new Set([-404, 62002]);
 let chartAutoMatchTask = null;
 let chartAutoNextAt = 0;
 let chartAutoPlaylistId = null;
@@ -124,6 +126,14 @@ function isRetryableNetworkError(error) {
     const status = Number(error && error.status) || 0;
     return !status || status === 408 || status === 429 || status >= 500;
 }
+function isDefinitiveUnavailableResponse(value) {
+    return !!(value && DEFINITIVE_UNAVAILABLE_CODES.has(Number(value.code)));
+}
+function apiResponseError(value, fallback) {
+    const error = new Error(String(value && value.message || fallback || 'B站接口返回异常'));
+    if (isDefinitiveUnavailableResponse(value)) error.sourceUnavailable = true;
+    return error;
+}
 async function biliFetchOnce(url, timeout) {
     const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     let timer = null;
@@ -227,7 +237,11 @@ function biliSearchCandidate(raw) {
         author: String(raw && (raw.author || raw.owner && raw.owner.name) || ''),
         pic: normUrl(raw && (raw.pic || raw.cover)),
         duration: raw && raw.duration,
-        play: Number(raw && raw.play) || 0
+        play: Number(raw && raw.play) || 0,
+        typename: String(raw && raw.typename || ''),
+        tags: String(raw && (raw.tag || raw.tags) || ''),
+        description: matcher ? matcher.stripHtml(raw && raw.description) : String(raw && raw.description || '').replace(/<[^>]*>/g, ''),
+        rank: Number(raw && (raw.rank_index || raw.rank)) || 0
     };
 }
 async function searchBiliChartItem(item, manual) {
@@ -347,6 +361,148 @@ async function playChartItem(playlistId, itemId) {
     }
     if (!item || !item.bvid) return { ok: false, error: '匹配音源失败' };
     return await sendToOffscreen({ cmd: 'playIndex', index: index, playlistId: playlistId });
+}
+
+async function setSourceUnavailable(playlistId, itemId, bvid, message) {
+    if (!playlistId || !itemId || !bvid) return false;
+    return await mutatePlaylistItem(playlistId, itemId, item => {
+        if (item.bvid !== bvid) return false;
+        item.sourceUnavailable = true;
+        item.sourceUnavailableAt = Date.now();
+        item.sourceUnavailableReason = String(message || '原视频已失效').slice(0, 200);
+    });
+}
+
+async function mutatePlaylistItem(playlistId, itemId, updater) {
+    let updated = false;
+    await withPlaylistMutation(async () => {
+        const lists = await getPlaylists();
+        const playlist = findPl(lists, playlistId);
+        const item = playlist && playlist.items.find(entry => entry.id === itemId);
+        if (!item) return;
+        updated = updater(item) !== false;
+        if (!updated) return;
+        await savePlaylists(lists);
+        await broadcastData();
+    });
+    return updated;
+}
+
+async function checkBiliSource(bvid) {
+    try {
+        const response = await biliFetch('https://api.bilibili.com/x/web-interface/view?bvid=' + encodeURIComponent(bvid));
+        if (response && response.code === 0 && response.data) return { available: true, response };
+        if (isDefinitiveUnavailableResponse(response)) {
+            return { available: false, unavailable: true, error: String(response.message || '原视频已失效') };
+        }
+        return { available: false, unavailable: false, error: String(response && response.message || '无法确认原视频状态') };
+    } catch (error) {
+        return { available: false, unavailable: false, error: String(error && error.message || error) };
+    }
+}
+
+async function searchReplacementCandidates(item) {
+    const matcher = globalThis.BPLChartMatcher;
+    if (!matcher || typeof matcher.rankReplacementCandidates !== 'function') throw new Error('替代源匹配器不可用');
+    const keyword = String(item && item.title || '').trim();
+    if (!keyword) throw new Error('条目标题为空，无法搜索替代源');
+    const url = 'https://api.bilibili.com/x/web-interface/search/type?search_type=video' +
+        '&order=totalrank&page=1&page_size=30&keyword=' + encodeURIComponent(keyword);
+    const response = await biliFetch(url);
+    if (!response || response.code !== 0 || !response.data) {
+        throw new Error((response && response.message) || 'B站搜索失败');
+    }
+    const candidates = (Array.isArray(response.data.result) ? response.data.result : [])
+        .map(biliSearchCandidate)
+        .filter(candidate => candidate.bvid && candidate.bvid !== item.bvid);
+    return matcher.rankReplacementCandidates({
+        title: item.title,
+        duration: item.duration,
+        sourceArtist: item.sourceArtist,
+        owner: item.owner
+    }, candidates).slice(0, 3);
+}
+
+function replacementResolvedPage(item, resolved) {
+    const pages = resolved && resolved.info && Array.isArray(resolved.info.pages) ? resolved.info.pages : [];
+    const duration = Number(item && item.duration) || 0;
+    if (pages.length <= 1 || !duration) return resolved;
+    let best = pages[0];
+    let bestDiff = Math.abs((Number(best.duration) || 0) - duration);
+    for (const page of pages.slice(1)) {
+        const diff = Math.abs((Number(page.duration) || 0) - duration);
+        if (diff < bestDiff) { best = page; bestDiff = diff; }
+    }
+    return { cid: best.cid || resolved.cid, info: resolved.info, page: best };
+}
+
+async function performSourceRepair(playlistId, itemId) {
+    let lists = await getPlaylists();
+    let playlist = findPl(lists, playlistId);
+    let item = playlist && playlist.items.find(entry => entry.id === itemId);
+    if (!item || !item.sourceUnavailable || !isValidBvid(item.bvid)) {
+        return { ok: false, error: '该条目不需要匹配替代源' };
+    }
+    const originalBvid = item.bvid;
+    const originalTitle = item.title;
+    const recheck = await checkBiliSource(originalBvid);
+    if (recheck.available) {
+        await mutatePlaylistItem(playlistId, itemId, current => {
+            if (current.bvid !== originalBvid) return false;
+            delete current.sourceUnavailable;
+            delete current.sourceUnavailableAt;
+            delete current.sourceUnavailableReason;
+        });
+        lists = await getPlaylists();
+        playlist = findPl(lists, playlistId);
+        const index = playlist ? playlist.items.findIndex(entry => entry.id === itemId) : -1;
+        if (index < 0) return { ok: false, error: '条目已发生变化' };
+        return await sendToOffscreen({ cmd: 'playIndex', index, playlistId });
+    }
+    if (!recheck.unavailable) return { ok: false, error: '暂时无法确认原视频已失效，请稍后重试' };
+
+    const ranked = await searchReplacementCandidates(item);
+    if (!ranked.length) return { ok: false, error: '没有找到足够相似的替代源' };
+    let lastError = null;
+    for (const entry of ranked) {
+        try {
+            let resolved = await resolveCid(entry.candidate.bvid, 1);
+            resolved = replacementResolvedPage(item, resolved);
+            if (!resolved.cid) throw new Error('候选视频没有可播放的分P');
+            await getAudioUrls(entry.candidate.bvid, resolved.cid);
+            const replacement = resolvedItemFields(resolved, entry.candidate.bvid, resolved.page && resolved.page.page || 1, entry.candidate);
+            const changed = await mutatePlaylistItem(playlistId, itemId, current => {
+                if (current.bvid !== originalBvid || !current.sourceUnavailable) return false;
+                const title = current.title || originalTitle;
+                Object.assign(current, replacement);
+                current.title = title;
+                delete current.sourceUnavailable;
+                delete current.sourceUnavailableAt;
+                delete current.sourceUnavailableReason;
+            });
+            if (!changed) return { ok: false, error: '条目已发生变化' };
+            lists = await getPlaylists();
+            playlist = findPl(lists, playlistId);
+            const index = playlist ? playlist.items.findIndex(current => current.id === itemId) : -1;
+            if (index < 0) return { ok: false, error: '条目已发生变化' };
+            const played = await sendToOffscreen({ cmd: 'playIndex', index, playlistId });
+            return Object.assign({}, played, { replaced: true, bvid: replacement.bvid });
+        } catch (error) {
+            lastError = error;
+            BPLLog.warn('repair', '替代候选不可播放[' + entry.candidate.bvid + ']：' + String(error && error.message || error));
+        }
+    }
+    return { ok: false, error: '没有找到可播放的替代源' + (lastError ? '：' + String(lastError.message || lastError) : '') };
+}
+
+async function repairUnavailableSource(playlistId, itemId) {
+    const key = chartItemKey(playlistId, itemId);
+    const existing = sourceRepairInflight.get(key);
+    if (existing) return await existing;
+    const task = performSourceRepair(playlistId, itemId)
+        .finally(() => sourceRepairInflight.delete(key));
+    sourceRepairInflight.set(key, task);
+    return await task;
 }
 
 function isValidBvid(bvid) { return /^BV[0-9A-Za-z]{10,}$/.test(String(bvid || '')); }
@@ -504,7 +660,7 @@ async function resolveCid(bvid, page) {
     const viewResult = await viewTask;
     const view = viewResult.value;
     const info = view && view.data;
-    let viewError = viewResult.error || (!info ? new Error((view && view.message) || '无法解析视频信息') : null);
+    let viewError = viewResult.error || (!info ? apiResponseError(view, '无法解析视频信息') : null);
     const pages = (info && info.pages) || [];
     let pg = (page && pages.find(x => x.page === page)) || pages[0] || {};
     let cid = pg.cid || (info && info.cid) || 0;
@@ -521,7 +677,7 @@ async function resolveCid(bvid, page) {
         if (!Array.isArray(fallbackInfo.pages) || !fallbackInfo.pages.length) fallbackInfo.pages = fallbackPages;
         return { cid: cid, info: fallbackInfo, page: pg };
     }
-    if (!viewError) viewError = pageResult.error || new Error((fallback && fallback.message) || '无法解析视频 cid');
+    if (!viewError) viewError = pageResult.error || apiResponseError(fallback, '无法解析视频 cid');
     throw viewError || new Error('无法解析视频 cid');
 }
 async function getAudioUrls(bvid, cid) {
@@ -557,7 +713,10 @@ async function getAudioUrls(bvid, cid) {
     if (!urls.length) {
         const msg = (jDash && jDash.message) || (jMp4 && jMp4.message);
         BPLLog.error('bg', 'getAudioUrls[' + bvid + '/' + cid + '] 未获取到音频流：' + (msg || '未知'));
-        throw new Error('未获取到音频流' + (msg ? '：' + msg : '（可能需要登录B站或该视频无音频）'));
+        const error = new Error('未获取到音频流' + (msg ? '：' + msg : '（可能需要登录B站或该视频无音频）'));
+        const responses = [jDash, jMp4].filter(Boolean);
+        if (responses.length === 2 && responses.every(isDefinitiveUnavailableResponse)) error.sourceUnavailable = true;
+        throw error;
     }
     const uniq = [...new Set(urls)];
     const dash = jDash && jDash.data && jDash.data.dash;
@@ -782,8 +941,15 @@ async function handleResolveAudio(p) {
         const urls = await getAudioUrls(p.bvid, cid);
         return { ok: true, urls: urls, cid: cid };
     } catch (e) {
-        BPLLog.error('bg', 'resolveAudio[' + (p && p.bvid) + '] 失败：' + String((e && e.message) || e));
-        return { ok: false, error: String((e && e.message) || e) };
+        const message = String((e && e.message) || e);
+        let unavailable = !!(e && e.sourceUnavailable);
+        if (!unavailable && p && p.bvid) {
+            const checked = await checkBiliSource(p.bvid);
+            unavailable = !!checked.unavailable;
+        }
+        if (unavailable && p) await setSourceUnavailable(p.playlistId, p.itemId, p.bvid, message);
+        BPLLog.error('bg', 'resolveAudio[' + (p && p.bvid) + '] 失败：' + message);
+        return { ok: false, error: message, sourceUnavailable: unavailable };
     }
 }
 // Port 先等即时 ACK。收到 ACK 说明命令已经进入 offscreen 执行；未收到 ACK
@@ -1081,6 +1247,9 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'playChartItem': {
             return await playChartItem(String(msg.playlistId || ''), String(msg.itemId || ''));
+        }
+        case 'repairSource': {
+            return await repairUnavailableSource(String(msg.playlistId || ''), String(msg.itemId || ''));
         }
         case 'getCollection': {
             try { return await collectionSummary(msg.bvid); }

@@ -82,6 +82,41 @@ vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'charts', 'mat
     ok(matcher.parseDuration('1:02:03') === 3723 && matcher.stripHtml('<em>晴天</em>') === '晴天',
         '搜索结果时长和高亮标题可正常归一化');
 
+    const replacements = matcher.rankReplacementCandidates({ title: 'JavaScript 入门教程 第一课', duration: 1250 }, [
+        { bvid: 'BVUNRELATED01', title: 'JavaScript 音乐混剪', duration: '3:20', rank: 1 },
+        { bvid: 'BVCOURSE0001', title: 'JavaScript入门教程 第一课 完整版', duration: '20:48', rank: 2 }
+    ]);
+    ok(replacements.length && replacements[0].candidate.bvid === 'BVCOURSE0001',
+        '通用替代源评分按源标题解释衍生词，并结合标题与时长选择课程视频');
+    const songReplacements = matcher.rankReplacementCandidates({ title: '孤单北半球', duration: 0 }, [
+        { bvid: 'BVCOVER00001', title: '孤单北半球', typename: '翻唱', tags: 'COVER,男声,翻唱', play: 201, rank: 1 },
+        { bvid: 'BVAMBIGUOUS1', title: '孤单北半球', typename: '音乐综合', tags: '歌曲', play: 1075, rank: 12 },
+        { bvid: 'BVORIGINAL01', title: '孤单北半球----欧得洋', typename: '音乐综合', tags: '歌曲,流行音乐,听歌', play: 642616, rank: 4 }
+    ]);
+    ok(songReplacements.length && songReplacements[0].candidate.bvid === 'BVORIGINAL01' &&
+        !songReplacements.some(entry => entry.candidate.bvid === 'BVCOVER00001'),
+        '先排除与原条目意图冲突的同名翻唱，再按排名和热度选择高可信音源');
+    const coverReplacements = matcher.rankReplacementCandidates({ title: '孤单北半球 翻唱', duration: 0 }, [
+        { bvid: 'BVCOVER00002', title: '孤单北半球 翻唱完整版', typename: '翻唱', tags: 'COVER,翻唱', play: 3000, rank: 2 }
+    ]);
+    ok(coverReplacements.length && coverReplacements[0].candidate.bvid === 'BVCOVER00002',
+        '原条目本身声明翻唱时不会机械排除翻唱候选');
+    const durationReplacements = matcher.rankReplacementCandidates({ title: '完整课程 第一课', duration: 1200 }, [
+        { bvid: 'BVSHORTCLIP1', title: '完整课程 第一课', duration: '2:00', rank: 1, play: 100000 },
+        { bvid: 'BVFULLCOURSE1', title: '完整课程 第一课 新版', duration: '19:58', rank: 8, play: 2000 }
+    ]);
+    ok(durationReplacements.length && durationReplacements[0].candidate.bvid === 'BVFULLCOURSE1' &&
+        !durationReplacements.some(entry => entry.candidate.bvid === 'BVSHORTCLIP1'),
+        '原时长已知时直接排除长度明显不符的同名片段');
+    const artistReplacements = matcher.rankReplacementCandidates({ title: '同名歌曲', sourceArtist: '目标歌手' }, [
+        { bvid: 'BVPOPULAR001', title: '同名歌曲', author: '其他歌手', rank: 1, play: 100000 },
+        { bvid: 'BVARTIST0001', title: '目标歌手《同名歌曲》', author: '音乐账号', rank: 7, play: 10000 }
+    ]);
+    ok(artistReplacements.length && artistReplacements[0].candidate.bvid === 'BVARTIST0001',
+        '原条目带有歌手元数据时优先选择歌手一致的候选');
+    ok(matcher.diceSimilarity('完全相同的标题', '完全相同的标题') === 1,
+        '通用标题相似度对相同标题返回 1');
+
     console.log('\n结果: ' + pass + ' passed, ' + fail + ' failed');
     if (fail) process.exit(1);
 })().catch(error => {

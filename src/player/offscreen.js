@@ -482,6 +482,9 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
     if (it && it.sourceUnavailable) {
         return { ok: false, sourceUnavailable: true, error: '原视频已失效，请将鼠标移到条目上重新匹配音源' };
     }
+    if (it && it.matchOrigin === 'manual' && !it.bvid) {
+        return { ok: false, manualMatchPending: true, error: '请先点击搜索按钮匹配音源' };
+    }
     if (it && it.chartSource && it.matchState === 'failed' && !it.bvid) {
         return { ok: false, chartMatchFailed: true, error: it.matchError || '匹配榜单音源失败' };
     }
@@ -580,7 +583,7 @@ async function pAdvance() {
             }
             const result = await pPlayIndex(shuffleOrder[shufflePos], true);
             attempts++;
-            if (!result || (!result.chartMatchFailed && !result.sourceUnavailable)) return result;
+            if (!result || (!result.chartMatchFailed && !result.sourceUnavailable && !result.manualMatchPending)) return result;
         }
         if (mode === 'shuffleLoop') {
             pBuildAfter(items.length, st.index);
@@ -590,7 +593,7 @@ async function pAdvance() {
                     shufflePos++;
                 }
                 const result = await pPlayIndex(shuffleOrder[shufflePos], true);
-                if (!result || (!result.chartMatchFailed && !result.sourceUnavailable)) return result;
+                if (!result || (!result.chartMatchFailed && !result.sourceUnavailable && !result.manualMatchPending)) return result;
             }
         }
         return await pStopPlayback();
@@ -601,7 +604,7 @@ async function pAdvance() {
     const first = n;
     do {
         const result = await pPlayIndex(n, true);
-        if (!result || (!result.chartMatchFailed && !result.sourceUnavailable)) return result;
+        if (!result || (!result.chartMatchFailed && !result.sourceUnavailable && !result.manualMatchPending)) return result;
         n++;
         if (n >= items.length) n = wrap ? 0 : items.length;
     } while (n < items.length && n !== first);

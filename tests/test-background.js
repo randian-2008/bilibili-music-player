@@ -380,6 +380,43 @@ function makeCtx(opts) {
     ok(nextChartMatch.ok && chartPlaylist.items[1].matchState === 'matched' && chartPlaylist.items[1].bvid === 'BV1MATCH00002',
         '后台队列按排名继续匹配下一首待处理歌曲');
 
+    console.log('\n[background 手动添加条目与按需匹配]');
+    ctx = makeCtx({ fetchResponder: url => {
+        if (String(url).includes('/x/web-interface/search/type')) {
+            return { code: 0, data: { result: [
+                { bvid: 'BV1MANUAL0001', title: '手动歌曲 官方MV', author: '音乐账号', pic: '//i0.hdslb.com/manual.jpg', duration: '3:40' }
+            ] } };
+        }
+        return { code: 0, data: {} };
+    }});
+    ctx.__store.bpl_playlists = [{ id: 'manual-pl', name: '手动测试', items: [] }];
+    ctx.__store.bpl_active = 'manual-pl';
+    let manualAdd = await ctx.handleBg({ cmd: 'addManualItem', title: '手动歌曲' }, null);
+    let manualPlaylist = ctx.__store.bpl_playlists[0];
+    const manualItem = manualPlaylist.items[0];
+    ok(manualAdd.ok && manualItem.matchOrigin === 'manual' && !manualItem.bvid &&
+        manualItem.matchState === 'pending' && manualItem.title === '手动歌曲' &&
+        manualItem.matchTargetTitle === '手动歌曲',
+        '手动添加只保存用户标题和待匹配目标，不立即联网');
+    const manualMatch = await ctx.handleBg({ cmd: 'matchManualItem', playlistId: 'manual-pl', itemId: manualItem.id }, null);
+    manualPlaylist = ctx.__store.bpl_playlists[0];
+    ok(manualMatch.ok && manualPlaylist.items[0].matchState === 'matched' &&
+        manualPlaylist.items[0].bvid === 'BV1MANUAL0001' &&
+        manualPlaylist.items[0].title === '手动歌曲' &&
+        manualPlaylist.items[0].pic === 'https://i0.hdslb.com/manual.jpg',
+        '手动匹配写入B站播放元数据但保留用户标题');
+    const restoredManual = await ctx.handleBg({ cmd: 'importPlaylist', name: '手动恢复', items: [{
+        matchOrigin: 'manual', matchTargetTitle: '待匹配歌曲', matchState: 'pending', title: '待匹配歌曲'
+    }] }, null);
+    const manualRestoredPlaylist = ctx.__store.bpl_playlists.find(p => p.name === '手动恢复');
+    ok(restoredManual.ok && manualRestoredPlaylist && manualRestoredPlaylist.items.length === 1 &&
+        manualRestoredPlaylist.items[0].matchOrigin === 'manual' && !manualRestoredPlaylist.items[0].bvid,
+        '完整JSON可恢复未匹配的手动占位条目');
+    const rejectedManual = await ctx.handleBg({ cmd: 'importPlaylist', name: '非法恢复', items: [{
+        title: '没有来源'
+    }] }, null);
+    ok(rejectedManual.ok === false, '任意无来源空条目不会被JSON恢复');
+
     let qqRequestUrl = '';
     ctx = makeCtx({ fetchResponder: url => {
         qqRequestUrl = String(url);

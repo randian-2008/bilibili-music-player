@@ -2,6 +2,20 @@
 
 本文件记录项目自首次公开发布以来的重要用户可见变化。公开前的内部迭代保留在 Git 提交历史中，不再作为正式版本逐项列出。
 
+## [2.8.3] - 2026-08-25
+
+### 新增
+
+- 播放列表工具栏增加“＋”手动添加入口，可输入名称或搜索关键词创建待匹配条目。
+- 手动条目支持按需搜索 B 站音源；匹配成功后保留用户输入的显示标题，并记录来源历史。
+- 手动条目支持 JSON 完整备份与恢复，未匹配条目不会被自动播放流程联网。
+
+### 改进
+
+- 工具栏统一为“播放列表、添加条目、热榜、更多操作”；新建播放列表移入“更多操作”菜单。
+- 手动匹配使用现有候选评分逻辑和更宽的搜索范围，匹配失败时可再次尝试。
+- 统一按钮的居中布局和图标描边，避免不同字体或主题下出现视觉偏移。
+
 ## [2.8.2] - 2026-08-12
 
 ### 新增
@@ -155,6 +169,7 @@
 - 建立包含 146 项断言的自动化测试与 GitHub Actions CI。
 - 采用 GNU GPL v3.0 或更高版本开源。
 
+[2.8.3]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.3
 [2.8.2]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.2
 [2.8.1]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.1
 [2.8.0]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.0

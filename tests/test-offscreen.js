@@ -203,6 +203,19 @@ async function testPlayIndex() {
     ok(r.ok === true && chartReq && chartReq.itemId === 'chart2' && chartResolve && chartResolve.resolveAudio.bvid === 'BVCHART00001',
         '随机播放选中待匹配条目时先匹配该条目，再按原索引播放');
 
+    const manualStore = setupPlaylist(2);
+    manualStore.bpl_playlists[0].items[0] = {
+        id: 'manual1', bvid: '', cid: 0, title: '手动歌曲', pic: '', owner: '', duration: 0, page: 1,
+        matchOrigin: 'manual', matchTargetTitle: '手动歌曲', matchState: 'pending'
+    };
+    ctx = makeCtx({ store: manualStore });
+    r = await ctx.pPlayIndex(0, true);
+    ok(r.ok === false && r.manualMatchPending && ctx.__resolveAudioCalls() === 0,
+        '手动待匹配条目不会在自动播放时联网');
+    r = await ctx.pAdvance();
+    ok(r.ok === true && (await getState(ctx)).trackId === 'item1',
+        '自动播放会跳过未手动匹配的条目');
+
     // v2.2.6 回归：state 广播必须经 bg 中继（offscreen 直发 {target:'all'} 到不了网页里的 content script，
     // 现场表现为胶囊不变形/图标动画不切换、面板进度条不动）
     const relays = ctx.__sent.filter(m => m && m.target === 'bg' && m.cmd === 'relay' && m.data && m.data.type === 'state');

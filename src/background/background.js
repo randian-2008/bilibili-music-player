@@ -205,6 +205,13 @@ function chartItemKey(playlistId, itemId) { return String(playlistId || '') + ':
 function isChartItem(item) {
     return !!(item && item.chartSource && item.sourceTitle && CHART_MATCH_STATES.indexOf(item.matchState) >= 0);
 }
+function isManualItem(item) {
+    return !!(item && item.matchOrigin === 'manual' && item.matchTargetTitle &&
+        CHART_MATCH_STATES.indexOf(item.matchState) >= 0);
+}
+function isMatchItem(item) {
+    return isChartItem(item) || isManualItem(item);
+}
 function chartDisplayTitle(title, artist) {
     const songTitle = String(title || '').trim();
     const songArtist = String(artist || '').trim();
@@ -230,7 +237,7 @@ function extendedMatchHistory(item, ...bvids) {
     return result;
 }
 function matchOrigin(item) {
-    if (item && (item.matchOrigin === 'chart' || item.matchOrigin === 'repair')) return item.matchOrigin;
+    if (item && (item.matchOrigin === 'chart' || item.matchOrigin === 'repair' || item.matchOrigin === 'manual')) return item.matchOrigin;
     return isChartItem(item) && item.bvid ? 'chart' : '';
 }
 function canRematchSource(item) {
@@ -283,7 +290,9 @@ function biliSearchCandidate(raw) {
 async function searchBiliChartItem(item, manual) {
     const matcher = globalThis.BPLChartMatcher;
     if (!matcher || typeof matcher.rankReplacementCandidates !== 'function') throw new Error('榜单匹配器不可用');
-    const keyword = [item.sourceTitle, item.sourceArtist].filter(Boolean).join(' ');
+    const target = sourceMatchTarget(item);
+    const keyword = [target.title, target.sourceArtist].filter(Boolean).join(' ');
+    if (!keyword) throw new Error('条目标题为空，无法搜索音源');
     const pageSize = manual ? 30 : 10;
     const url = 'https://api.bilibili.com/x/web-interface/search/type?search_type=video' +
         '&order=totalrank&page=1&page_size=' + pageSize + '&keyword=' + encodeURIComponent(keyword);
@@ -296,9 +305,9 @@ async function searchBiliChartItem(item, manual) {
         .map(biliSearchCandidate)
         .filter(candidate => candidate.bvid && !excluded.has(candidate.bvid));
     const ranked = matcher.rankReplacementCandidates({
-        title: item.sourceTitle,
-        sourceArtist: item.sourceArtist,
-        duration: Number(item.matchTargetDuration) || 0
+        title: target.title,
+        sourceArtist: target.sourceArtist,
+        duration: target.duration
     }, candidates, manual ? 18 : 24);
     return ranked.length ? Object.assign({ score: ranked[0].score }, ranked[0].candidate) : null;
 }
@@ -308,7 +317,7 @@ async function mutateChartItem(playlistId, itemId, updater) {
         const lists = await getPlaylists();
         const playlist = findPl(lists, playlistId);
         const item = playlist && playlist.items.find(entry => entry.id === itemId);
-        if (!item || !isChartItem(item)) return;
+        if (!item || !isMatchItem(item)) return;
         updated = updater(item) !== false;
         if (!updated) return;
         await savePlaylists(lists);
@@ -320,10 +329,12 @@ async function performChartMatch(playlistId, itemId, manual) {
     const lists = await getPlaylists();
     const playlist = findPl(lists, playlistId);
     const snapshot = playlist && playlist.items.find(item => item.id === itemId);
-    if (!snapshot || !isChartItem(snapshot)) return { ok: false, cancelled: true, error: '榜单条目不存在' };
+    if (!snapshot || !isMatchItem(snapshot)) return { ok: false, cancelled: true, error: '待匹配条目不存在' };
     if (snapshot.matchState === 'matched' && snapshot.bvid) return { ok: true, matched: true, itemId: itemId };
 
-    const sourceIdentity = [snapshot.chartSource, snapshot.chartId, snapshot.sourceRank, snapshot.sourceTitle, snapshot.sourceArtist].join('|');
+    const sourceIdentity = [snapshot.matchOrigin || '', snapshot.chartSource || '', snapshot.chartId || '',
+        snapshot.sourceRank || '', snapshot.sourceTitle || '', snapshot.sourceArtist || '',
+        snapshot.matchTargetTitle || '', snapshot.matchTargetArtist || ''].join('|');
     await mutateChartItem(playlistId, itemId, item => {
         item.matchState = 'matching';
         item.matchStartedAt = Date.now();
@@ -336,14 +347,17 @@ async function performChartMatch(playlistId, itemId, manual) {
         if (!candidate || !isValidBvid(candidate.bvid)) throw new Error('没有找到可信的B站视频');
         const matcher = globalThis.BPLChartMatcher;
         const changed = await mutateChartItem(playlistId, itemId, item => {
-            const currentIdentity = [item.chartSource, item.chartId, item.sourceRank, item.sourceTitle, item.sourceArtist].join('|');
+            const currentIdentity = [item.matchOrigin || '', item.chartSource || '', item.chartId || '',
+                item.sourceRank || '', item.sourceTitle || '', item.sourceArtist || '',
+                item.matchTargetTitle || '', item.matchTargetArtist || ''].join('|');
             if (currentIdentity !== sourceIdentity) return false;
             item.bvid = candidate.bvid;
             item.cid = 0;
             // Keep the canonical chart label. The Bilibili candidate supplies
             // playback metadata only; its promotional/original title should
             // not leak into a chart playlist.
-            item.title = chartDisplayTitle(item.sourceTitle, item.sourceArtist) || candidate.title;
+            const isChart = isChartItem(item);
+            if (isChart) item.title = chartDisplayTitle(item.sourceTitle, item.sourceArtist) || candidate.title;
             item.pic = normUrl(candidate.pic);
             item.owner = candidate.author || '';
             item.duration = matcher ? matcher.parseDuration(candidate.duration) : 0;
@@ -351,10 +365,10 @@ async function performChartMatch(playlistId, itemId, manual) {
             item.matchState = 'matched';
             item.matchScore = Number(candidate.score) || 0;
             item.matchedAt = Date.now();
-            item.matchOrigin = 'chart';
-            item.matchTargetTitle = item.sourceTitle;
-            item.matchTargetArtist = item.sourceArtist || '';
-            item.matchTargetDuration = matcher ? matcher.parseDuration(candidate.duration) : 0;
+            item.matchOrigin = isChart ? 'chart' : 'manual';
+            item.matchTargetTitle = isChart ? item.sourceTitle : (item.matchTargetTitle || item.title);
+            item.matchTargetArtist = isChart ? (item.sourceArtist || '') : (item.matchTargetArtist || '');
+            item.matchTargetDuration = item.matchTargetDuration || (matcher ? matcher.parseDuration(candidate.duration) : 0);
             item.matchHistory = extendedMatchHistory(item, candidate.bvid);
             delete item.matchStartedAt;
             delete item.matchError;
@@ -369,7 +383,8 @@ async function performChartMatch(playlistId, itemId, manual) {
             item.matchFailedAt = Date.now();
             delete item.matchStartedAt;
         });
-        BPLLog.warn('chart', '匹配失败[' + snapshot.sourceArtist + ' - ' + snapshot.sourceTitle + ']：' + message);
+        BPLLog.warn('chart', '匹配失败[' + (snapshot.sourceArtist || snapshot.matchTargetArtist || '') + ' - ' +
+            (snapshot.sourceTitle || snapshot.matchTargetTitle || snapshot.title || '') + ']：' + message);
         return { ok: false, error: message, itemId: itemId };
     }
 }
@@ -734,19 +749,26 @@ function restorePlaylistItem(raw) {
     const bvid = String(item.bvid || '');
     const chartPlaceholder = !bvid && item.chartSource && item.sourceTitle &&
         CHART_MATCH_STATES.indexOf(String(item.matchState || '')) >= 0;
-    if ((!bvid || !isValidBvid(bvid)) && !chartPlaceholder) return null;
+    const manualPlaceholder = !bvid && item.matchOrigin === 'manual' && item.matchTargetTitle &&
+        CHART_MATCH_STATES.indexOf(String(item.matchState || '')) >= 0;
+    if ((!bvid || !isValidBvid(bvid)) && !chartPlaceholder && !manualPlaceholder) return null;
 
     item.id = genId();
     item.bvid = bvid;
     item.cid = Number(item.cid) || 0;
-    item.title = String(item.title || item.sourceTitle || bvid);
+    item.title = String(item.title || item.sourceTitle || item.matchTargetTitle || bvid);
     item.pic = normUrl(item.pic);
     item.owner = String(item.owner || '');
     item.duration = Number(item.duration) || 0;
     item.page = Number(item.page) || 1;
 
-    if (item.matchOrigin !== 'chart' && item.matchOrigin !== 'repair') delete item.matchOrigin;
+    if (item.matchOrigin !== 'chart' && item.matchOrigin !== 'repair' && item.matchOrigin !== 'manual') delete item.matchOrigin;
     if (CHART_MATCH_STATES.indexOf(String(item.matchState || '')) < 0) delete item.matchState;
+    if (item.matchOrigin === 'manual') {
+        item.matchTargetTitle = String(item.matchTargetTitle || item.title || '').trim().slice(0, 200);
+        item.matchTargetArtist = String(item.matchTargetArtist || '').trim();
+        item.matchTargetDuration = Number(item.matchTargetDuration) || 0;
+    }
     item.matchHistory = normalizedMatchHistory(item);
     if (!item.matchHistory.length) delete item.matchHistory;
     if (!item.bvid) {
@@ -1305,7 +1327,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 const PLAYLIST_MUTATION_CMDS = new Set([
-    'add', 'remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'moveItem', 'clear',
+    'add', 'addManualItem', 'remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'moveItem', 'clear',
     'createPlaylist', 'renamePlaylist', 'deletePlaylist', 'importPlaylist', 'setActive'
 ]);
 
@@ -1357,6 +1379,9 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'matchChartItem': {
             return await matchChartItem(String(msg.playlistId || ''), String(msg.itemId || ''), !!msg.manual);
+        }
+        case 'matchManualItem': {
+            return await matchChartItem(String(msg.playlistId || ''), String(msg.itemId || ''), true);
         }
         case 'playChartItem': {
             return await playChartItem(String(msg.playlistId || ''), String(msg.itemId || ''));
@@ -1451,6 +1476,30 @@ async function handleBg(msg, sender, mutationLocked) {
             await savePlaylists(lists);
             await broadcastData();
             return { ok: true, incomplete: !it.cid };
+        }
+        case 'addManualItem': {
+            const title = String(msg.title || '').trim().slice(0, 200);
+            if (!title) return { ok: false, error: '条目名称不能为空' };
+            const lists = await ensureDefaultPlaylist();
+            let activeId = await getActiveId();
+            let pl = findPl(lists, activeId);
+            if (!pl) { pl = lists[0]; await setActiveId(pl.id); }
+            const item = {
+                id: genId(),
+                bvid: '', cid: 0, title: title,
+                pic: '', owner: '', duration: 0, page: 1,
+                matchOrigin: 'manual',
+                matchTargetTitle: title,
+                matchTargetArtist: '',
+                matchTargetDuration: 0,
+                matchState: 'pending',
+                matchAttempts: 0,
+                matchHistory: []
+            };
+            pl.items.push(item);
+            await savePlaylists(lists);
+            await broadcastData();
+            return { ok: true, itemId: item.id, playlistId: pl.id };
         }
         case 'resolveAudio': {
             return await handleResolveAudio(msg.resolveAudio || msg);

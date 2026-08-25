@@ -13,6 +13,7 @@ const MODES = [
     { id: 'shuffleLoop', label: '随机循环', icon: svg('<path d="M17 2l4 4-4 4M3 11V9a4 4 0 014-4h14M7 22l-4-4 4-4M21 13v2a4 4 0 01-4 4H3"/><path d="M9.5 14.5l5-5M9.5 9.5l5 5" opacity=".8"/>') }
 ];
 const SOURCE_REMATCH_ICON = svg('<path d="M20 7h-5V2"/><path d="M20 7a8.5 8.5 0 10.8 9"/>');
+const MANUAL_MATCH_ICON = svg('<circle cx="10.8" cy="10.8" r="5.8"/><path d="m15.2 15.2 5 5"/>');
 function modeIndex(id) { const i = MODES.findIndex(m => m.id === id); return i >= 0 ? i : 3; }
 function normMode(st) {
     if (MODES.some(m => m.id === st.mode)) return st.mode;
@@ -32,10 +33,15 @@ let locateHighlightTimer = null;
 const initialChartMatches = new Set();
 let initialChartRecoveryTimer = null;
 const rematchingSources = new Set();
+const manualMatchingItems = new Set();
 
 function canRematchItem(item) {
     return !!(item && item.bvid && (item.sourceUnavailable || item.matchOrigin === 'chart' || item.matchOrigin === 'repair' ||
-        (item.chartSource && item.matchState === 'matched')));
+        item.matchOrigin === 'manual' || (item.chartSource && item.matchState === 'matched')));
+}
+function isManualPending(item) {
+    return !!(item && item.matchOrigin === 'manual' && !item.bvid &&
+        (item.matchState === 'pending' || item.matchState === 'matching' || item.matchState === 'failed'));
 }
 
 function esc(s) {
@@ -131,7 +137,7 @@ if (logEl) {
 function send(cmd, extra) {
     const payload = Object.assign({ target: 'bg', cmd }, extra || {});
     const timeoutMs = (cmd === 'rematchSource' || cmd === 'repairSource') ? 90000
-        : (cmd === 'playChartItem' ? 45000
+        : ((cmd === 'playChartItem' || cmd === 'matchManualItem') ? 45000
             : (({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000));
     const report = r => {
         if (r && r.ok === false && r.error) BPLLog.error('ui', cmd + ' 失败：' + r.error);
@@ -239,7 +245,7 @@ function render() {
     const box = $('#list');
     const showPlaying = activeId === state.playlistId;
     if (!items.length) {
-        box.innerHTML = '<div class="empty">这个播放列表是空的<br>去B站视频页点「＋加入」</div>';
+        box.innerHTML = '<div class="empty">这个播放列表是空的<br>点击上方「＋」添加条目，或去B站视频页点「＋加入」</div>';
     } else {
         box.innerHTML = items.map((s, i) => {
             const isPlaying = showPlaying && !!state.trackId && s.id === state.trackId;
@@ -256,10 +262,15 @@ function render() {
                 : '<span class="ibtn link disabled" aria-hidden="true">↗</span>';
             const rematchable = canRematchItem(s);
             const rematching = rematchingSources.has(s.id);
+            const manualPending = isManualPending(s);
+            const manualMatching = manualMatchingItems.has(s.id) || s.matchState === 'matching';
             const sourceSlotHtml = '<span class="source-slot' + (rematchable ? ' rematchable' : '') +
                 (sourceUnavailable ? ' unavailable' : '') +
                 (rematching ? ' rematching' : '') + '">' +
-                '<span class="dur">' + (s.duration ? fmt(s.duration) : '') + '</span>' +
+                '<span class="dur">' + (manualPending ? '' : (s.duration ? fmt(s.duration) : '')) + '</span>' +
+                (manualPending ? '<button type="button" class="manual-match" data-manual-match="' + esc(s.id) +
+                    '" title="搜索音源" aria-label="搜索音源"' + (manualMatching ? ' disabled' : '') + '>' +
+                    MANUAL_MATCH_ICON + '</button>' : '') +
                 (rematchable ? '<button type="button" class="source-rematch" data-rematch="' + esc(s.id) +
                     '" title="重新匹配音源" aria-label="重新匹配音源"' + (rematching ? ' disabled' : '') + '>' +
                     SOURCE_REMATCH_ICON + '</button>' : '') + '</span>';
@@ -510,7 +521,8 @@ function handleImportFile(f) {
             }
             else { alert('不是有效的播放列表 JSON'); return; }
             items = items.filter(x => x && typeof x === 'object' &&
-                (x.bvid || (x.chartSource && x.sourceTitle)));
+                (x.bvid || (x.chartSource && x.sourceTitle) ||
+                    (x.matchOrigin === 'manual' && x.matchTargetTitle)));
             if (!items.length) { alert('JSON 里没有有效条目'); return; }
             send('importPlaylist', { name: name || f.name.replace(/\.json$/i, ''), playlist, items });
         } catch (err) {
@@ -521,10 +533,33 @@ function handleImportFile(f) {
 }
 
 $('#plSelect').addEventListener('change', e => send('setActive', { id: e.target.value }));
-$('#plNew').addEventListener('click', () => {
-    const name = prompt('新建播放列表，名称：', '新播放列表');
-    if (name != null && name.trim()) send('createPlaylist', { name: name.trim() });
+
+const manualItemDialog = $('#manualItemDialog');
+const manualItemForm = $('#manualItemForm');
+const manualItemTitle = $('#manualItemTitle');
+function openManualItemDialog() {
+    if (!activePlaylist()) { toast('请先创建或选择一个播放列表'); return; }
+    manualItemTitle.value = '';
+    if (typeof manualItemDialog.showModal === 'function') manualItemDialog.showModal();
+    else manualItemDialog.setAttribute('open', '');
+    setTimeout(() => manualItemTitle.focus(), 0);
+}
+function closeManualItemDialog() {
+    if (typeof manualItemDialog.close === 'function') manualItemDialog.close();
+    else manualItemDialog.removeAttribute('open');
+}
+$('#addItemBtn').addEventListener('click', openManualItemDialog);
+$('#manualItemCancel').addEventListener('click', closeManualItemDialog);
+manualItemForm.addEventListener('submit', e => {
+    e.preventDefault();
+    const title = String(manualItemTitle.value || '').trim();
+    if (!title) { manualItemTitle.focus(); return; }
+    closeManualItemDialog();
+    send('addManualItem', { title: title.slice(0, 200) }).then(result => {
+        if (!result || result.ok === false) toast((result && result.error) || '添加条目失败');
+    });
 });
+
 $('#chartBtn').addEventListener('click', () => {
     send('openChartWindow').then(result => {
         if (!result || result.ok === false) toast((result && result.error) || '无法打开热榜窗口');
@@ -574,6 +609,11 @@ menu.addEventListener('click', e => {
     setPlaylistMenuOpen(false);
     const pl = activePlaylist();
     if (act === 'import') { fileInput.click(); return; }
+    if (act === 'create') {
+        const name = prompt('新建播放列表，名称：', '新播放列表');
+        if (name != null && name.trim()) send('createPlaylist', { name: name.trim() });
+        return;
+    }
     if (act === 'log') { openLog(true); return; }
     if (act === 'log-export') { exportLog(); return; }
     if (act === 'log-clear') { chrome.storage.local.set({ bpl_log: [] }); logCache = []; renderLog(); return; }
@@ -829,6 +869,23 @@ box.addEventListener('click', e => {
         });
         return;
     }
+    const manualMatch = e.target.closest('[data-manual-match]');
+    if (manualMatch) {
+        e.stopPropagation();
+        const playlist = activePlaylist();
+        const item = playlist && playlist.items.find(value => value.id === manualMatch.dataset.manualMatch);
+        if (!item || !isManualPending(item) || manualMatchingItems.has(item.id)) return;
+        manualMatchingItems.add(item.id);
+        render();
+        toast('正在搜索B站音源');
+        send('matchManualItem', { playlistId: activeId, itemId: item.id }).then(result => {
+            manualMatchingItems.delete(item.id);
+            if (result && result.ok) toast('已匹配B站音源');
+            else toast((result && result.error) || '未找到可信音源');
+            refresh();
+        });
+        return;
+    }
     const rn = e.target.closest('[data-rename]');
     if (rn) { e.stopPropagation(); renameItem(+rn.dataset.rename); return; }
     const it = e.target.closest('.item');
@@ -837,6 +894,10 @@ box.addEventListener('click', e => {
     if (selMode) { toggleSel(i); return; }
     const playlist = activePlaylist();
     const item = playlist && playlist.items[i];
+    if (item && item.matchOrigin === 'manual' && !item.bvid) {
+        toast('请先点击搜索按钮匹配音源');
+        return;
+    }
     if (item && item.chartSource && (item.matchState !== 'matched' || !item.bvid)) {
         toast('正在匹配B站音源');
         send('playChartItem', { playlistId: activeId, itemId: item.id }).then(result => {

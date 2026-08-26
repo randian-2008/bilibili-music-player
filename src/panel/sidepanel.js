@@ -43,6 +43,9 @@ function isManualPending(item) {
     return !!(item && item.matchOrigin === 'manual' && !item.bvid &&
         (item.matchState === 'pending' || item.matchState === 'matching' || item.matchState === 'failed'));
 }
+function isFailedChartItem(item) {
+    return !!(item && item.chartSource && !item.bvid && item.matchState === 'failed');
+}
 
 function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => (
@@ -137,8 +140,9 @@ if (logEl) {
 function send(cmd, extra) {
     const payload = Object.assign({ target: 'bg', cmd }, extra || {});
     const timeoutMs = (cmd === 'rematchSource' || cmd === 'repairSource') ? 90000
+        : (cmd === 'matchChartItem' ? 120000
         : ((cmd === 'playChartItem' || cmd === 'matchManualItem') ? 45000
-            : (({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000));
+            : (({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000)));
     const report = r => {
         if (r && r.ok === false && r.error) BPLLog.error('ui', cmd + ' 失败：' + r.error);
         else if (!r) BPLLog.warn('ui', cmd + '：后台无响应（超时）');
@@ -263,6 +267,8 @@ function render() {
             const rematchable = canRematchItem(s);
             const rematching = rematchingSources.has(s.id);
             const manualPending = isManualPending(s);
+            const chartRetry = isFailedChartItem(s) ||
+                (manualMatchingItems.has(s.id) && s.chartSource && !s.bvid);
             const manualMatching = manualMatchingItems.has(s.id) || s.matchState === 'matching';
             const sourceSlotHtml = '<span class="source-slot' + (rematchable ? ' rematchable' : '') +
                 (sourceUnavailable ? ' unavailable' : '') +
@@ -270,6 +276,9 @@ function render() {
                 '<span class="dur">' + (manualPending ? '' : (s.duration ? fmt(s.duration) : '')) + '</span>' +
                 (manualPending ? '<button type="button" class="manual-match" data-manual-match="' + esc(s.id) +
                     '" title="搜索音源" aria-label="搜索音源"' + (manualMatching ? ' disabled' : '') + '>' +
+                    MANUAL_MATCH_ICON + '</button>' : '') +
+                (chartRetry ? '<button type="button" class="manual-match" data-chart-rematch="' + esc(s.id) +
+                    '" title="重新匹配音源" aria-label="重新匹配音源"' + (manualMatching ? ' disabled' : '') + '>' +
                     MANUAL_MATCH_ICON + '</button>' : '') +
                 (rematchable ? '<button type="button" class="source-rematch" data-rematch="' + esc(s.id) +
                     '" title="重新匹配音源" aria-label="重新匹配音源"' + (rematching ? ' disabled' : '') + '>' +
@@ -879,6 +888,23 @@ box.addEventListener('click', e => {
         render();
         toast('正在搜索B站音源');
         send('matchManualItem', { playlistId: activeId, itemId: item.id }).then(result => {
+            manualMatchingItems.delete(item.id);
+            if (result && result.ok) toast('已匹配B站音源');
+            else toast((result && result.error) || '未找到可信音源');
+            refresh();
+        });
+        return;
+    }
+    const chartRematch = e.target.closest('[data-chart-rematch]');
+    if (chartRematch) {
+        e.stopPropagation();
+        const playlist = activePlaylist();
+        const item = playlist && playlist.items.find(value => value.id === chartRematch.dataset.chartRematch);
+        if (!isFailedChartItem(item) || manualMatchingItems.has(item.id)) return;
+        manualMatchingItems.add(item.id);
+        render();
+        toast('正在重新匹配音源');
+        send('matchChartItem', { playlistId: activeId, itemId: item.id, manual: true, verifyPlayable: true }).then(result => {
             manualMatchingItems.delete(item.id);
             if (result && result.ok) toast('已匹配B站音源');
             else toast((result && result.error) || '未找到可信音源');

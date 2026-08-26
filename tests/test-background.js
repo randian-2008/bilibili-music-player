@@ -14,6 +14,7 @@ function makeCtx(opts) {
     opts = opts || {};
     let resp = {};
     let fetchCalls = 0;
+    const fetchOptions = [];
     const store = {};
     const clone = value => JSON.parse(JSON.stringify(value));
     const off = { exists: false, createCalls: 0, closeCalls: 0, disconnectCalls: 0 };
@@ -65,14 +66,18 @@ function makeCtx(opts) {
         console, Math, JSON, Promise, Date,
         setTimeout: opts.realTimers ? setTimeout : fastSetTimeout,
         clearTimeout: opts.realTimers ? clearTimeout : fastClearTimeout,
-        fetch: (url) => {
+        fetch: (url, options) => {
             fetchCalls++;
+            fetchOptions.push(options || {});
             if (opts.fetchNever) return new Promise(() => {});
             const isRulesRequest = String(url).indexOf('/rename/rules.json') >= 0;
             const responseData = isRulesRequest ? (opts.renameRules || {}) : (opts.fetchResponder ? opts.fetchResponder(url) : resp);
+            const httpStatus = responseData && typeof responseData === 'object' && responseData.__httpStatus
+                ? Number(responseData.__httpStatus) : 200;
             const responseText = typeof responseData === 'string' ? responseData : JSON.stringify(responseData);
             return Promise.resolve({
-                ok: true,
+                ok: httpStatus >= 200 && httpStatus < 300,
+                status: httpStatus,
                 json: () => Promise.resolve(typeof responseData === 'string' ? JSON.parse(responseData) : responseData),
                 text: () => Promise.resolve(responseText),
                 headers: { get: () => String(Buffer.byteLength(responseText, 'utf8')) }
@@ -80,6 +85,7 @@ function makeCtx(opts) {
         },
         __setResp: r => { resp = r; },
         __fetchCalls: () => fetchCalls,
+        __fetchOptions: () => fetchOptions.slice(),
         __store: store,
         __off: off,
         __portSent: portSent,
@@ -163,6 +169,9 @@ function makeCtx(opts) {
     let urls = await ctx.getAudioUrls('BV1', 1);
     ok(urls[0] === 'https://cdn/high.m4s', 'dash 高码率在前 (' + urls[0] + ')');
     ok(urls.length >= 2, '返回多个候选源 (' + urls.length + ')');
+    ok(ctx.__fetchOptions().every(options => options.credentials === 'omit' && options.cache === 'no-store' &&
+        options.referrer === 'https://www.bilibili.com/' && options.referrerPolicy === 'strict-origin-when-cross-origin'),
+        'B站接口请求使用匿名且不读缓存的选项');
 
     // 含备用链接
     ctx = makeCtx();
@@ -189,7 +198,7 @@ function makeCtx(opts) {
     ctx = makeCtx();
     ctx.__setResp({ code: -403, message: '需要登录' });
     let threw = false;
-    try { await ctx.getAudioUrls('BV1', 1); } catch (e) { threw = /需要登录|未获取到音频流/.test(e.message); }
+    try { await ctx.getAudioUrls('BV1', 1); } catch (e) { threw = /需要登录|未获取到.*音频流/.test(e.message); }
     ok(threw, '接口错误抛异常');
 
     ctx = makeCtx({ fetchNever: true });
@@ -379,6 +388,89 @@ function makeCtx(opts) {
     chartPlaylist = ctx.__store.bpl_playlists.find(playlist => playlist.id === chartImport.playlistId);
     ok(nextChartMatch.ok && chartPlaylist.items[1].matchState === 'matched' && chartPlaylist.items[1].bvid === 'BV1MATCH00002',
         '后台队列按排名继续匹配下一首待处理歌曲');
+
+    console.log('\n[background 热榜匹配失败与手动重试]');
+    ctx = makeCtx({ fetchResponder: url => {
+        if (String(url).includes('/x/web-interface/search/type')) return { __httpStatus: 412 };
+        return { code: 0, data: {} };
+    }});
+    ctx.__store.bpl_playlists = [{ id: 'chart-failed', name: '失败热榜', chartSource: 'apple', items: [{
+        id: 'failed0', bvid: '', cid: 0, title: '晴天 - 周杰伦', pic: '', owner: '', duration: 0, page: 1,
+        chartSource: 'apple', chartId: 'chart', sourceRank: 1, sourceTitle: '晴天', sourceArtist: '周杰伦',
+        matchState: 'pending', matchAttempts: 0
+    }] }];
+    let failedMatch = await ctx.handleBg({ cmd: 'matchChartItem', playlistId: 'chart-failed', itemId: 'failed0' }, null);
+    const failedItem = ctx.__store.bpl_playlists[0].items[0];
+    ok(failedMatch.ok === false && failedMatch.error === 'HTTP 412' && failedItem.matchState === 'failed' &&
+        failedItem.matchError === 'HTTP 412' && !failedItem.bvid,
+        'B站搜索返回 HTTP 412 时保留热榜占位条目的失败状态');
+    const callsAfterFailure = ctx.__fetchCalls();
+    const throttledMatch = await ctx.handleBg({ cmd: 'matchChartItem', playlistId: 'chart-failed', itemId: 'failed0' }, null);
+    ok(throttledMatch.ok === false && throttledMatch.throttled === true && ctx.__fetchCalls() === callsAfterFailure,
+        '自动匹配失败后短时间内不重复请求，等待用户手动重试');
+    const callsBeforeManual412 = ctx.__fetchCalls();
+    const manual412 = await ctx.handleBg({ cmd: 'matchChartItem', playlistId: 'chart-failed', itemId: 'failed0', manual: true, verifyPlayable: true }, null);
+    ok(manual412.ok === false && manual412.error === 'HTTP 412' && ctx.__fetchCalls() === callsBeforeManual412 + 4,
+        '手动重试对搜索接口 HTTP 412 进行有限退避重试后结束');
+
+    let rateLimitedSearchCalls = 0;
+    ctx = makeCtx({ fetchResponder: url => {
+        const value = String(url);
+        if (value.includes('/x/web-interface/search/type')) {
+            rateLimitedSearchCalls++;
+            if (rateLimitedSearchCalls <= 2) return { __httpStatus: 412 };
+            return { code: 0, data: { result: [
+                { bvid: 'BV1SEARCHOK01', title: '晴天 周杰伦 官方MV', author: '音乐账号', pic: '//img/search-ok.jpg', duration: '4:29' }
+            ] } };
+        }
+        if (value.includes('/x/web-interface/view')) return { code: 0, data: {
+            bvid: 'BV1SEARCHOK01', title: '晴天', pic: '//img/search-ok.jpg', owner: { name: '音乐账号' },
+            pages: [{ page: 1, cid: 401, duration: 269, part: '晴天' }]
+        } };
+        return { code: 0, data: { dash: { audio: [{ baseUrl: 'https://cdn/search-ok.m4s', bandwidth: 1 }] } } };
+    }});
+    ctx.__store.bpl_playlists = [{ id: 'chart-search-retry', name: '搜索退避', chartSource: 'apple', items: [{
+        id: 'search-retry0', bvid: '', cid: 0, title: '晴天 - 周杰伦', pic: '', owner: '', duration: 0, page: 1,
+        chartSource: 'apple', chartId: 'chart', sourceRank: 1, sourceTitle: '晴天', sourceArtist: '周杰伦',
+        matchState: 'failed', matchError: '上次匹配失败', matchFailedAt: Date.now() - 20000
+    }] }];
+    const searchRetryMatch = await ctx.handleBg({ cmd: 'matchChartItem', playlistId: 'chart-search-retry', itemId: 'search-retry0', manual: true, verifyPlayable: true }, null);
+    const searchRetryItem = ctx.__store.bpl_playlists[0].items[0];
+    ok(searchRetryMatch.ok && rateLimitedSearchCalls === 3 && searchRetryItem.matchState === 'matched' &&
+        searchRetryItem.bvid === 'BV1SEARCHOK01' && searchRetryItem.cid === 401,
+        '搜索前两次 HTTP 412 时自动退避，第三次成功并完成可播放验证');
+
+    let searchRounds = 0;
+    ctx = makeCtx({ fetchResponder: url => {
+        const value = String(url);
+        if (value.includes('/x/web-interface/search/type')) {
+            searchRounds++;
+            const bvid = 'BV1RETRY000' + searchRounds;
+            return { code: 0, data: { result: [
+                { bvid: bvid, title: '晴天 周杰伦 官方MV', author: '音乐账号', pic: '//img/retry.jpg', duration: '4:29' }
+            ] } };
+        }
+        if (value.includes('/x/web-interface/view')) {
+            if (value.includes('BV1RETRY0001') || value.includes('BV1RETRY0002')) {
+                return { code: -404, message: '候选视频已失效' };
+            }
+            return { code: 0, data: {
+                bvid: 'BV1RETRY0003', title: '晴天', pic: '//img/retry.jpg', owner: { name: '音乐账号' },
+                pages: [{ page: 1, cid: 303, duration: 269, part: '晴天' }]
+            } };
+        }
+        return { code: 0, data: { dash: { audio: [{ baseUrl: 'https://cdn/retry.m4s', bandwidth: 1 }] } } };
+    }});
+    ctx.__store.bpl_playlists = [{ id: 'chart-retry', name: '重试热榜', chartSource: 'apple', items: [{
+        id: 'retry0', bvid: '', cid: 0, title: '晴天 - 周杰伦', pic: '', owner: '', duration: 0, page: 1,
+        chartSource: 'apple', chartId: 'chart', sourceRank: 1, sourceTitle: '晴天', sourceArtist: '周杰伦',
+        matchState: 'failed', matchError: '上次匹配失败', matchFailedAt: Date.now() - 20000
+    }] }];
+    const retryMatch = await ctx.handleBg({ cmd: 'matchChartItem', playlistId: 'chart-retry', itemId: 'retry0', manual: true, verifyPlayable: true }, null);
+    const retryItem = ctx.__store.bpl_playlists[0].items[0];
+    ok(retryMatch.ok && searchRounds === 3 && retryItem.bvid === 'BV1RETRY0003' && retryItem.cid === 303 &&
+        retryItem.matchState === 'matched',
+        '手动重试按轮次重新搜索并跳过不可播放候选，最多十次后写入可播放来源');
 
     console.log('\n[background 手动添加条目与按需匹配]');
     ctx = makeCtx({ fetchResponder: url => {

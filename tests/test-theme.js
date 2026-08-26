@@ -102,6 +102,8 @@ ok(/function volumeIcon\(v, muted\)/.test(sidepanelCode) &&
     '音量图标使用 currentColor SVG 并随主题着色');
 ok(/data-rematch=/.test(sidepanelCode) && /title="重新匹配音源"/.test(sidepanelCode) &&
     /function canRematchItem\(item\)/.test(sidepanelCode) &&
+    /function isFailedChartItem\(item\)/.test(sidepanelCode) && /data-chart-rematch=/.test(sidepanelCode) &&
+    /send\('matchChartItem', \{ playlistId: activeId, itemId: item.id, manual: true, verifyPlayable: true \}\)/.test(sidepanelCode) &&
     /sourceUnavailable \? '' : httpsUrl\(s\.pic\)/.test(sidepanelCode) &&
     /sourceUnavailable \? ' unavailable' : ''/.test(sidepanelCode) &&
     /\.source-slot\s*\{/.test(sidepanelCss) && /\.source-slot\.rematchable:hover \.source-rematch/.test(sidepanelCss) &&

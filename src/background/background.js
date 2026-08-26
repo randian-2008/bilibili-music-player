@@ -117,6 +117,16 @@ function normUrl(u) {
 }
 const NETWORK_TIMEOUT_MS = 5000;
 const NETWORK_RETRY_DELAY_MS = 250;
+// A failed automatic chart search should not be retriggered by several UI
+// contexts in quick succession. Manual retry deliberately bypasses this gate.
+const CHART_MATCH_FAILURE_COOLDOWN_MS = 15000;
+const CHART_MANUAL_RETRY_LIMIT = 10;
+// Bilibili may temporarily reject extension-originated search requests with
+// HTTP 412. Retry only the search request itself, with a short backoff, so a
+// single user action can recover without turning a rejection into a request
+// burst. Candidate/playability retries remain controlled by the caller.
+const BILI_SEARCH_412_RETRY_LIMIT = 4;
+const BILI_SEARCH_412_RETRY_DELAYS_MS = [1500, 3000, 6000];
 const COLLECTION_CACHE_TTL_MS = 5 * 60 * 1000;
 const COLLECTION_CACHE_MAX = 20;
 const collectionCache = new Map();
@@ -151,7 +161,15 @@ async function biliFetchOnce(url, timeout) {
             error.name = 'TimeoutError';
             finish(reject, error);
         }, timeout || NETWORK_TIMEOUT_MS);
-        const options = { credentials: 'include' };
+        // 所有接口都只读取公开数据，不需要用户登录态。显式 omit 可避免
+        // Edge/Chrome 对扩展跨站凭据请求执行更严格的 CORS/隐私拦截。
+        const options = { credentials: 'omit', cache: 'no-store' };
+        if (/^https:\/\/api\.bilibili\.com\//i.test(String(url || ''))) {
+            // B站公开接口会拒绝没有来源的扩展请求（HTTP 412）。
+            // 该 referrer 只附加到扩展自身发出的 fetch，不会修改网页请求。
+            options.referrer = 'https://www.bilibili.com/';
+            options.referrerPolicy = 'strict-origin-when-cross-origin';
+        }
         if (controller) options.signal = controller.signal;
         Promise.resolve(fetch(url, options)).then(async response => {
             if (response && response.ok === false) {
@@ -178,6 +196,7 @@ async function biliFetch(url) {
 async function chartFetch(url) {
     let lastError;
     for (let attempt = 0; attempt < 2; attempt++) {
+        // 榜单只需要公开的歌曲名、歌手和排名，不需要用户 Cookie。
         try { return await biliFetchOnce(url, CHART_NETWORK_TIMEOUT_MS); }
         catch (error) {
             lastError = error;
@@ -186,6 +205,38 @@ async function chartFetch(url) {
         }
     }
     throw lastError || new Error('榜单网络请求失败');
+}
+
+function isSearchRateLimitedResponse(value) {
+    const code = Number(value && value.code);
+    return code === 412 || code === -412;
+}
+
+// Search endpoints get a separate, bounded 412 retry policy. The generic
+// Bilibili fetch helper intentionally does not retry 412 because most other
+// endpoints should fail fast when anti-abuse checks reject a request.
+async function biliSearchFetch(url) {
+    let lastError;
+    for (let attempt = 0; attempt < BILI_SEARCH_412_RETRY_LIMIT; attempt++) {
+        try {
+            const response = await biliFetch(url);
+            if (isSearchRateLimitedResponse(response)) {
+                const error = apiResponseError(response, 'HTTP 412');
+                error.status = 412;
+                throw error;
+            }
+            return response;
+        } catch (error) {
+            lastError = error;
+            const status = Number(error && error.status) || 0;
+            if (status !== 412 || attempt + 1 >= BILI_SEARCH_412_RETRY_LIMIT) break;
+            const delay = BILI_SEARCH_412_RETRY_DELAYS_MS[attempt] || BILI_SEARCH_412_RETRY_DELAYS_MS[BILI_SEARCH_412_RETRY_DELAYS_MS.length - 1];
+            BPLLog.info('chart', 'B站搜索返回 HTTP 412，' + delay + 'ms 后重试（' +
+                (attempt + 2) + '/' + BILI_SEARCH_412_RETRY_LIMIT + '）');
+            await waitMs(delay);
+        }
+    }
+    throw lastError || new Error('B站搜索失败');
 }
 
 function chartCatalog() {
@@ -287,7 +338,7 @@ function biliSearchCandidate(raw) {
         rank: Number(raw && (raw.rank_index || raw.rank)) || 0
     };
 }
-async function searchBiliChartItem(item, manual) {
+async function searchBiliChartItem(item, manual, extraExcluded) {
     const matcher = globalThis.BPLChartMatcher;
     if (!matcher || typeof matcher.rankReplacementCandidates !== 'function') throw new Error('榜单匹配器不可用');
     const target = sourceMatchTarget(item);
@@ -296,11 +347,12 @@ async function searchBiliChartItem(item, manual) {
     const pageSize = manual ? 30 : 10;
     const url = 'https://api.bilibili.com/x/web-interface/search/type?search_type=video' +
         '&order=totalrank&page=1&page_size=' + pageSize + '&keyword=' + encodeURIComponent(keyword);
-    const response = await biliFetch(url);
+    const response = await biliSearchFetch(url);
     if (!response || response.code !== 0 || !response.data) {
         throw new Error((response && response.message) || 'B站搜索失败');
     }
     const excluded = new Set(extendedMatchHistory(item, item.bvid));
+    for (const bvid of (extraExcluded || [])) excluded.add(String(bvid || ''));
     const candidates = (Array.isArray(response.data.result) ? response.data.result : [])
         .map(biliSearchCandidate)
         .filter(candidate => candidate.bvid && !excluded.has(candidate.bvid));
@@ -325,12 +377,17 @@ async function mutateChartItem(playlistId, itemId, updater) {
     });
     return updated;
 }
-async function performChartMatch(playlistId, itemId, manual) {
+async function performChartMatch(playlistId, itemId, manual, verifyPlayable) {
     const lists = await getPlaylists();
     const playlist = findPl(lists, playlistId);
     const snapshot = playlist && playlist.items.find(item => item.id === itemId);
     if (!snapshot || !isMatchItem(snapshot)) return { ok: false, cancelled: true, error: '待匹配条目不存在' };
     if (snapshot.matchState === 'matched' && snapshot.bvid) return { ok: true, matched: true, itemId: itemId };
+    if (!manual && snapshot.matchState === 'failed' && snapshot.matchFailedAt &&
+        Date.now() - Number(snapshot.matchFailedAt) < CHART_MATCH_FAILURE_COOLDOWN_MS) {
+        return { ok: false, throttled: true, itemId: itemId,
+            error: snapshot.matchError || '自动匹配暂未成功，请稍后手动重试' };
+    }
 
     const sourceIdentity = [snapshot.matchOrigin || '', snapshot.chartSource || '', snapshot.chartId || '',
         snapshot.sourceRank || '', snapshot.sourceTitle || '', snapshot.sourceArtist || '',
@@ -343,8 +400,47 @@ async function performChartMatch(playlistId, itemId, manual) {
     });
 
     try {
-        const candidate = await searchBiliChartItem(snapshot, !!manual);
-        if (!candidate || !isValidBvid(candidate.bvid)) throw new Error('没有找到可信的B站视频');
+        const excludedCandidates = new Set();
+        const retryLimit = manual && verifyPlayable ? CHART_MANUAL_RETRY_LIMIT : 1;
+        let candidate = null;
+        let verified = null;
+        let lastCandidateError = null;
+        for (let attempt = 0; attempt < retryLimit; attempt++) {
+            let current = null;
+            try {
+                // 每一轮都重新发起一次搜索，只采用这一轮的最佳结果。
+                // 不把一次搜索返回的多个候选当作同一轮的重试。
+                current = await searchBiliChartItem(snapshot, !!manual, excludedCandidates);
+                if (!current || !isValidBvid(current.bvid)) throw new Error('没有找到可信的B站视频');
+                candidate = current;
+                if (!(manual && verifyPlayable)) break;
+                const resolved = await resolveCid(current.bvid, 1);
+                if (!resolved || !resolved.cid) throw new Error('候选视频没有可播放的分P');
+                const urls = await getAudioUrls(current.bvid, resolved.cid);
+                if (!urls || !urls.length) throw new Error('候选视频没有公开音频流');
+                verified = { candidate: current, resolved: resolved };
+                break;
+            } catch (candidateError) {
+                lastCandidateError = candidateError;
+                if (current && current.bvid) excludedCandidates.add(current.bvid);
+                BPLLog.info('chart', '第 ' + (attempt + 1) + '/' + retryLimit + ' 次匹配失败' +
+                    (current && current.bvid ? '[' + current.bvid + ']' : '') + '：' +
+                    String(candidateError && candidateError.message || candidateError));
+                // biliSearchFetch already made bounded, delayed retries for
+                // HTTP 412. If they all failed there is no candidate to
+                // exclude, so stop this match instead of starting another
+                // outer candidate round against the same rejection.
+                if (!current && Number(candidateError && candidateError.status) === 412) throw candidateError;
+                if (attempt + 1 >= retryLimit) {
+                    if (!(manual && verifyPlayable)) throw candidateError;
+                    throw new Error('最多重试 ' + retryLimit + ' 次后仍未找到可播放音源：' +
+                        String(lastCandidateError && lastCandidateError.message || lastCandidateError));
+                }
+            }
+        }
+        if (!candidate || (manual && verifyPlayable && !verified)) {
+            throw new Error('没有找到可信的可播放B站视频');
+        }
         const matcher = globalThis.BPLChartMatcher;
         const changed = await mutateChartItem(playlistId, itemId, item => {
             const currentIdentity = [item.matchOrigin || '', item.chartSource || '', item.chartId || '',
@@ -352,7 +448,7 @@ async function performChartMatch(playlistId, itemId, manual) {
                 item.matchTargetTitle || '', item.matchTargetArtist || ''].join('|');
             if (currentIdentity !== sourceIdentity) return false;
             item.bvid = candidate.bvid;
-            item.cid = 0;
+            item.cid = verified && verified.resolved ? (Number(verified.resolved.cid) || 0) : 0;
             // Keep the canonical chart label. The Bilibili candidate supplies
             // playback metadata only; its promotional/original title should
             // not leak into a chart playlist.
@@ -361,7 +457,8 @@ async function performChartMatch(playlistId, itemId, manual) {
             item.pic = normUrl(candidate.pic);
             item.owner = candidate.author || '';
             item.duration = matcher ? matcher.parseDuration(candidate.duration) : 0;
-            item.page = 1;
+            item.page = verified && verified.resolved && verified.resolved.page
+                ? (Number(verified.resolved.page.page) || 1) : 1;
             item.matchState = 'matched';
             item.matchScore = Number(candidate.score) || 0;
             item.matchedAt = Date.now();
@@ -388,11 +485,11 @@ async function performChartMatch(playlistId, itemId, manual) {
         return { ok: false, error: message, itemId: itemId };
     }
 }
-async function matchChartItem(playlistId, itemId, manual) {
+async function matchChartItem(playlistId, itemId, manual, verifyPlayable) {
     const key = chartItemKey(playlistId, itemId);
     const existing = chartMatchInflight.get(key);
     if (existing) return await existing;
-    const task = performChartMatch(playlistId, itemId, manual)
+    const task = performChartMatch(playlistId, itemId, manual, verifyPlayable)
         .finally(() => chartMatchInflight.delete(key));
     chartMatchInflight.set(key, task);
     return await task;
@@ -415,7 +512,7 @@ async function playChartItem(playlistId, itemId) {
     if (index < 0) return { ok: false, error: '榜单条目不存在' };
     let item = playlist.items[index];
     if (isChartItem(item) && (item.matchState !== 'matched' || !item.bvid)) {
-        const matched = await matchChartItem(playlistId, itemId, true);
+        const matched = await matchChartItem(playlistId, itemId, true, true);
         if (!matched || !matched.ok) return matched || { ok: false, error: '匹配音源失败' };
         lists = await getPlaylists();
         playlist = findPl(lists, playlistId);
@@ -472,7 +569,7 @@ async function searchReplacementCandidates(item) {
     if (!keyword) throw new Error('条目标题为空，无法搜索替代源');
     const url = 'https://api.bilibili.com/x/web-interface/search/type?search_type=video' +
         '&order=totalrank&page=1&page_size=30&keyword=' + encodeURIComponent(keyword);
-    const response = await biliFetch(url);
+    const response = await biliSearchFetch(url);
     if (!response || response.code !== 0 || !response.data) {
         throw new Error((response && response.message) || 'B站搜索失败');
     }
@@ -824,13 +921,16 @@ async function getAudioUrls(bvid, cid) {
             for (const b of (a.backupUrl || a.backup_url || [])) if (b) urls.push(b);
         }
     };
+    let dashError = null;
+    let mp4Error = null;
     const [jDash, jMp4] = await Promise.all([
-        biliFetch(base + '&fnval=4048&fourk=1').catch(() => null),
-        biliFetch(base + '&fnval=1').catch(() => null)
+        biliFetch(base + '&fnval=4048&fourk=1').catch(error => { dashError = error; return null; }),
+        biliFetch(base + '&fnval=1').catch(error => { mp4Error = error; return null; })
     ]);
-    if (!jDash) BPLLog.warn('bg', 'playurl(dash) 请求失败/无响应[' + bvid + ']');
+    const errorText = error => error ? (': ' + String(error.message || error)) : '';
+    if (!jDash) BPLLog.warn('bg', 'playurl(dash) 请求失败/无响应[' + bvid + ']' + errorText(dashError));
     else if (jDash.code !== 0) BPLLog.warn('bg', 'playurl(dash) code=' + jDash.code + ' ' + (jDash.message || '') + '[' + bvid + ']');
-    if (!jMp4) BPLLog.warn('bg', 'playurl(durl) 请求失败/无响应[' + bvid + ']');
+    if (!jMp4) BPLLog.warn('bg', 'playurl(durl) 请求失败/无响应[' + bvid + ']' + errorText(mp4Error));
     else if (jMp4.code !== 0) BPLLog.warn('bg', 'playurl(durl) code=' + jMp4.code + ' ' + (jMp4.message || '') + '[' + bvid + ']');
     const urls = [];
     if (jDash && jDash.code === 0 && jDash.data && jDash.data.dash) {
@@ -847,8 +947,8 @@ async function getAudioUrls(bvid, cid) {
     }
     if (!urls.length) {
         const msg = (jDash && jDash.message) || (jMp4 && jMp4.message);
-        BPLLog.error('bg', 'getAudioUrls[' + bvid + '/' + cid + '] 未获取到音频流：' + (msg || '未知'));
-        const error = new Error('未获取到音频流' + (msg ? '：' + msg : '（可能需要登录B站或该视频无音频）'));
+        BPLLog.error('bg', 'getAudioUrls[' + bvid + '/' + cid + '] 未获取到公开音频流：' + (msg || '未知'));
+        const error = new Error('未获取到公开音频流' + (msg ? '：' + msg : '（接口未返回可用音频或该视频无音频）'));
         const responses = [jDash, jMp4].filter(Boolean);
         if (responses.length === 2 && responses.every(isDefinitiveUnavailableResponse)) error.sourceUnavailable = true;
         throw error;
@@ -1273,9 +1373,12 @@ function broadcast(msg) {
 }
 
 async function broadcastData() {
-    const playlists = await getPlaylists();
-    const activeId = await getActiveId();
-    const state = await getState();
+    // These reads are independent after a playlist mutation. Run them in
+    // parallel so importing a chart does not wait for three storage IPC
+    // round-trips in sequence.
+    const [playlists, activeId, state] = await Promise.all([
+        getPlaylists(), getActiveId(), getState()
+    ]);
     broadcast({ type: 'data', playlists, activeId, state });
 }
 
@@ -1378,7 +1481,7 @@ async function handleBg(msg, sender, mutationLocked) {
             });
         }
         case 'matchChartItem': {
-            return await matchChartItem(String(msg.playlistId || ''), String(msg.itemId || ''), !!msg.manual);
+            return await matchChartItem(String(msg.playlistId || ''), String(msg.itemId || ''), !!msg.manual, !!msg.verifyPlayable);
         }
         case 'matchManualItem': {
             return await matchChartItem(String(msg.playlistId || ''), String(msg.itemId || ''), true);

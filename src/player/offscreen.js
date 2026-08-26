@@ -345,7 +345,9 @@ function fetchMedia(url, timeout, parentSignal) {
     const controller = newAbortController();
     let timer = null, abortHandler = null;
     const request = (() => {
-        const options = { credentials: 'include' };
+        // 音频 CDN 只提供公开媒体流，不需要 B 站登录态。
+        // 跨站携带 Cookie 会触发更严格的 CORS/隐私校验，导致 fetch 直接失败。
+        const options = { credentials: 'omit', cache: 'no-store' };
         if (controller) options.signal = controller.signal;
         return Promise.resolve(fetch(url, options));
     })();

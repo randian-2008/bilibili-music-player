@@ -17,6 +17,7 @@ function makeCtx(opts) {
     const playFailUrls = new Set(opts.playFailUrls || []);
     const playNeverUrls = new Set(opts.playNeverUrls || []);
     const fetchFailUrls = new Set(opts.fetchFailUrls || []);
+    const fetchOptions = [];
     const asyncErrorUrls = new Set(opts.asyncErrorUrls || []);   // play() 成功后异步触发 error（模拟 CDN 403）
     const audio = {
         paused: true, currentTime: 0, duration: 0, playbackRate: 1, volume: 1, muted: false,
@@ -129,7 +130,8 @@ function makeCtx(opts) {
         console, Math, JSON, Promise, Date, URLSearchParams,
         // setImmediate 驱动：offscreen 的 playSettled 宽限计时需真实触发（忽略延时、立即排队）
         setTimeout: fastSetTimeout, clearTimeout: fastClearTimeout, setInterval: () => 0,
-        fetch: (url) => {
+        fetch: (url, options) => {
+            fetchOptions.push(options || {});
             if (fetchFailUrls.has(url)) return Promise.reject(new Error('fetch fail'));
             return Promise.resolve({ ok: true, blob: () => Promise.resolve({}) });
         },
@@ -141,7 +143,7 @@ function makeCtx(opts) {
         navigator: {},
         document: { getElementById: () => audio },
         chrome: chromeObj,
-        __audio: audio, __store: store,
+        __audio: audio, __store: store, __fetchOptions: () => fetchOptions.slice(),
         __resolveAudioCalls: () => resolveAudioCalls,
         __port: port, __portSent: portSent, __sent: sent,
         __drive: (msg) => { handlers.forEach(fn => fn(msg)); },
@@ -239,6 +241,8 @@ async function testPlayIndex() {
     });
     r = await ctx.pPlayIndex(0);
     ok(r.ok === true && ctx.__audio.src === 'blob:mock', '直接播放失败→fetch+blob 兜底成功 (' + ctx.__audio.src + ')');
+    ok(ctx.__fetchOptions().every(options => options.credentials === 'omit' && options.cache === 'no-store'),
+        '音频 CDN 回退请求使用匿名且不读缓存的选项');
 
     ctx = makeCtx({
         store: setupPlaylist(2),

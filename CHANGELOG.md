@@ -2,7 +2,7 @@
 
 本文件记录项目自首次公开发布以来的重要用户可见变化。公开前的内部迭代保留在 Git 提交历史中，不再作为正式版本逐项列出。
 
-## [未发布]
+## [2.8.4] - 2026-08-26
 
 ### 改进
 
@@ -181,6 +181,7 @@
 - 建立包含 146 项断言的自动化测试与 GitHub Actions CI。
 - 采用 GNU GPL v3.0 或更高版本开源。
 
+[2.8.4]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.4
 [2.8.3]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.3
 [2.8.2]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.2
 [2.8.1]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.1

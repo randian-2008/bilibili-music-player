@@ -27,6 +27,7 @@
     let frameLoaded = false;
     let built = false;
     let posX = null, posY = null, panelWidth = null, panelHeight = null;
+    let panelXRatio = null, panelYRatio = null, preferredPanelWidth = null, preferredPanelHeight = null;
     let collectionProbeBvid = '';
     let collectionProbeAt = 0;
     let collectionProbeInFlight = false;
@@ -52,6 +53,38 @@
         const left = Math.max(PANEL_MARGIN, Math.min(Number(x) || PANEL_MARGIN, viewportWidth - w - PANEL_MARGIN));
         const top = Math.max(PANEL_MARGIN, Math.min(Number(y) || PANEL_MARGIN, viewportHeight - h - PANEL_MARGIN));
         return { x: left, y: top, width: w, height: h };
+    }
+
+    function clampRatio(value, fallback) {
+        const n = Number(value);
+        if (!Number.isFinite(n)) return fallback;
+        return Math.max(0, Math.min(n, 1));
+    }
+
+    function panelRatiosFromGeometry(x, y, width, height, viewportWidth, viewportHeight, fallbackX, fallbackY) {
+        const g = clampPanelGeometry(x, y, width, height, viewportWidth, viewportHeight);
+        const travelX = Math.max(0, viewportWidth - g.width - PANEL_MARGIN * 2);
+        const travelY = Math.max(0, viewportHeight - g.height - PANEL_MARGIN * 2);
+        return {
+            xRatio: travelX > 0
+                ? clampRatio((g.x - PANEL_MARGIN) / travelX, 0.5)
+                : clampRatio(fallbackX, 0.5),
+            yRatio: travelY > 0
+                ? clampRatio((g.y - PANEL_MARGIN) / travelY, 0.5)
+                : clampRatio(fallbackY, 0.5)
+        };
+    }
+
+    function panelGeometryFromRatios(xRatio, yRatio, width, height, viewportWidth, viewportHeight) {
+        const sized = clampPanelGeometry(PANEL_MARGIN, PANEL_MARGIN, width, height, viewportWidth, viewportHeight);
+        const travelX = Math.max(0, viewportWidth - sized.width - PANEL_MARGIN * 2);
+        const travelY = Math.max(0, viewportHeight - sized.height - PANEL_MARGIN * 2);
+        return {
+            x: PANEL_MARGIN + clampRatio(xRatio, 0.5) * travelX,
+            y: PANEL_MARGIN + clampRatio(yRatio, 0.5) * travelY,
+            width: sized.width,
+            height: sized.height
+        };
     }
 
     function isBiliVideo() {
@@ -548,17 +581,38 @@
             }
         }).catch(e => reviveIfDead(e));
 
-        // 恢复面板位置与用户调整后的尺寸。开合状态仍不持久化：新页面/刷新后一律默认收起。
+        // 恢复面板在可移动区域内的相对位置与用户尺寸。开合状态仍不持久化。
         chrome.storage.local.get(STORE_KEY).then(r => {
             const p = (r && r[STORE_KEY]) || {};
-            const hasPosition = typeof p.x === 'number' && typeof p.y === 'number';
-            const hasSize = typeof p.width === 'number' && typeof p.height === 'number';
-            if (hasPosition || hasSize) {
-                const width = hasSize ? p.width : panel.offsetWidth;
-                const height = hasSize ? p.height : panel.offsetHeight;
-                const x = hasPosition ? p.x : window.innerWidth - width - 20;
-                const y = hasPosition ? p.y : window.innerHeight - height - 146;
-                applyPanelGeometry(clampPanelGeometry(x, y, width, height, window.innerWidth, window.innerHeight));
+            const hasRatioPosition = Number.isFinite(p.xRatio) && Number.isFinite(p.yRatio);
+            const hasLegacyPosition = Number.isFinite(p.x) && Number.isFinite(p.y);
+            const hasSize = Number.isFinite(p.width) && Number.isFinite(p.height);
+            if (hasRatioPosition || hasLegacyPosition || hasSize) {
+                preferredPanelWidth = hasSize ? Math.max(PANEL_MIN_WIDTH, p.width) : panel.offsetWidth;
+                preferredPanelHeight = hasSize ? Math.max(PANEL_MIN_HEIGHT, p.height) : panel.offsetHeight;
+                let geometry;
+                if (hasRatioPosition) {
+                    panelXRatio = clampRatio(p.xRatio, 0.5);
+                    panelYRatio = clampRatio(p.yRatio, 0.5);
+                    geometry = panelGeometryFromRatios(
+                        panelXRatio, panelYRatio, preferredPanelWidth, preferredPanelHeight,
+                        window.innerWidth, window.innerHeight
+                    );
+                } else {
+                    const x = hasLegacyPosition ? p.x : window.innerWidth - preferredPanelWidth - 20;
+                    const y = hasLegacyPosition ? p.y : window.innerHeight - preferredPanelHeight - 146;
+                    geometry = clampPanelGeometry(
+                        x, y, preferredPanelWidth, preferredPanelHeight, window.innerWidth, window.innerHeight
+                    );
+                    const ratios = panelRatiosFromGeometry(
+                        geometry.x, geometry.y, geometry.width, geometry.height,
+                        window.innerWidth, window.innerHeight, 0.5, 0.5
+                    );
+                    panelXRatio = ratios.xRatio;
+                    panelYRatio = ratios.yRatio;
+                    savePanelPreference();
+                }
+                applyPanelGeometry(geometry);
             }
         }).catch(e => reviveIfDead(e));
         window.addEventListener('resize', keepPanelInViewport);
@@ -587,26 +641,56 @@
         syncCollectionDialogGeometry();
     }
 
-    let viewportPersistTimer = null;
     function keepPanelInViewport() {
         if (!panel || !panel.classList.contains('sized')) {
             syncCollectionDialogGeometry();
             return;
         }
+        if (Number.isFinite(panelXRatio) && Number.isFinite(panelYRatio)) {
+            applyPanelGeometry(panelGeometryFromRatios(
+                panelXRatio,
+                panelYRatio,
+                preferredPanelWidth == null ? panelWidth : preferredPanelWidth,
+                preferredPanelHeight == null ? panelHeight : preferredPanelHeight,
+                window.innerWidth,
+                window.innerHeight
+            ));
+            return;
+        }
         applyPanelGeometry(clampPanelGeometry(
             posX, posY, panelWidth, panelHeight, window.innerWidth, window.innerHeight
         ));
-        if (viewportPersistTimer) clearTimeout(viewportPersistTimer);
-        viewportPersistTimer = setTimeout(persist, 150);
     }
 
-    function persist() {
-        if (posX == null || posY == null || panelWidth == null || panelHeight == null) return;
+    function savePanelPreference() {
+        if (!Number.isFinite(panelXRatio) || !Number.isFinite(panelYRatio) ||
+            preferredPanelWidth == null || preferredPanelHeight == null) return;
         try {
             chrome.storage.local.set({
-                [STORE_KEY]: { x: posX, y: posY, width: panelWidth, height: panelHeight }
+                [STORE_KEY]: {
+                    version: 2,
+                    xRatio: panelXRatio,
+                    yRatio: panelYRatio,
+                    width: preferredPanelWidth,
+                    height: preferredPanelHeight
+                }
             });
         } catch (e) { reviveIfDead(e); }
+    }
+
+    function persist(rememberSize) {
+        if (posX == null || posY == null || panelWidth == null || panelHeight == null) return;
+        const ratios = panelRatiosFromGeometry(
+            posX, posY, panelWidth, panelHeight,
+            window.innerWidth, window.innerHeight, panelXRatio, panelYRatio
+        );
+        panelXRatio = ratios.xRatio;
+        panelYRatio = ratios.yRatio;
+        if (rememberSize || preferredPanelWidth == null || preferredPanelHeight == null) {
+            preferredPanelWidth = panelWidth;
+            preferredPanelHeight = panelHeight;
+        }
+        savePanelPreference();
     }
 
     function ensureFrame() {
@@ -941,7 +1025,7 @@
             if (!dragging) return;
             dragging = false;
             el.classList.remove('dragging');
-            persist();
+            persist(false);
         };
         handle.addEventListener('pointerup', end);
         handle.addEventListener('pointercancel', end);
@@ -979,7 +1063,7 @@
             if (!resizing) return;
             resizing = false;
             el.classList.remove('resizing');
-            persist();
+            persist(true);
         };
         handle.addEventListener('pointerup', end);
         handle.addEventListener('pointercancel', end);
@@ -1058,6 +1142,8 @@
             updateMiniUI: updateMiniUI,
             bridgeDecision: bridgeDecision,
             clampPanelGeometry: clampPanelGeometry,
+            panelRatiosFromGeometry: panelRatiosFromGeometry,
+            panelGeometryFromRatios: panelGeometryFromRatios,
             getCurrentBvid: getCurrentBvid,
             probeCollection: probeCollection,
             formatCollectionError: formatCollectionError,

@@ -124,6 +124,35 @@ function makeCtx(opts) {
     ok(g.x === 4 && g.y === 446 && g.width === 400 && g.height === 350,
         '越界位置被钳制到完整可见范围');
 
+    const ratiosFrom = ctx.__api().panelRatiosFromGeometry;
+    const geometryFrom = ctx.__api().panelGeometryFromRatios;
+    let ratios = ratiosFrom(656, 496, 340, 300, 1000, 800);
+    ok(ratios.xRatio === 1 && ratios.yRatio === 1,
+        '右下角在可移动区域内保存为比例 1,1');
+    g = geometryFrom(ratios.xRatio, ratios.yRatio, 340, 300, 1600, 900);
+    ok(g.x === 1256 && g.y === 596 && g.width === 340 && g.height === 300,
+        '视口放大后右下角位置仍保持在右下角');
+    g = geometryFrom(0.5, 0.5, 400, 350, 1000, 800);
+    ok(g.x === 300 && g.y === 225,
+        '比例 0.5,0.5 使任意尺寸面板保持居中');
+    const constrained = geometryFrom(0.73, 0.21, 500, 600, 320, 400);
+    const restored = geometryFrom(0.73, 0.21, 500, 600, 1600, 1000);
+    ok(constrained.width === 312 && constrained.height === 392 &&
+        restored.width === 500 && restored.height === 600,
+        '临时小视口只约束显示尺寸，原始比例和期望尺寸可在大视口恢复');
+    ratios = ratiosFrom(217, 133, 360, 420, 1280, 720);
+    g = geometryFrom(ratios.xRatio, ratios.yRatio, 360, 420, 1280, 720);
+    ok(Math.abs(g.x - 217) < 0.0001 && Math.abs(g.y - 133) < 0.0001,
+        '任意位置经过比例换算后可无损还原');
+    const viewportHandler = code.slice(
+        code.indexOf('function keepPanelInViewport()'),
+        code.indexOf('function savePanelPreference()')
+    );
+    ok(!/storage\.local\.set|setTimeout\s*\(\s*persist/.test(viewportHandler),
+        '视口变化只更新显示位置，不覆盖用户保存的位置');
+    ok(code.includes('version: 2') && code.includes('xRatio: panelXRatio') && code.includes('yRatio: panelYRatio'),
+        '面板位置使用带版本号的相对比例格式持久化');
+
     console.log('\n[content.js 合集检测与 SPA 竞态保护]');
     const bvidA = 'BV1ABCDEF123';
     const bvidB = 'BV1ABCDEF124';

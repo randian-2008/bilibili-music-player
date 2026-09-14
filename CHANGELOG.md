@@ -2,6 +2,14 @@
 
 本文件记录项目自首次公开发布以来的重要用户可见变化。公开前的内部迭代保留在 Git 提交历史中，不再作为正式版本逐项列出。
 
+## [2.8.5] - 2026-09-14
+
+### 修复
+
+- 面板位置改为按可移动区域的横纵比例保存，在窗口缩放、分屏或切换显示尺寸后仍保持用户选择的相对位置。
+- 窗口尺寸变化时只临时调整面板位置和显示尺寸，不再覆盖用户保存的位置与期望尺寸。
+- 兼容旧版绝对坐标数据，并在读取后自动迁移到新版位置格式。
+
 ## [2.8.4] - 2026-08-26
 
 ### 改进
@@ -181,6 +189,7 @@
 - 建立包含 146 项断言的自动化测试与 GitHub Actions CI。
 - 采用 GNU GPL v3.0 或更高版本开源。
 
+[2.8.5]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.5
 [2.8.4]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.4
 [2.8.3]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.3
 [2.8.2]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.2

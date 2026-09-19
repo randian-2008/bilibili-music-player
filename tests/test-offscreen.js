@@ -80,6 +80,15 @@ function makeCtx(opts) {
             Promise.resolve().then(() => cb && cb({ ok: true }));
             return undefined;
         }
+        if (payload && payload.cmd === 'patchPlayerState') {
+            const state = Object.assign({ playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' }, store.bpl_state || {});
+            if (!payload.context || !Object.prototype.hasOwnProperty.call(payload.context, 'trackId') || payload.context.trackId === state.trackId) {
+                Object.assign(state, payload.patch || {});
+                store.bpl_state = state;
+            }
+            Promise.resolve().then(() => cb && cb({ ok: true, state }));
+            return undefined;
+        }
         if (cb && payload && payload.resolveAudio) {
             Promise.resolve().then(() => Promise.resolve(resolveAudio(payload.resolveAudio)).then(cb));
             return undefined;
@@ -549,6 +558,54 @@ async function testRecoveryAndCancellation() {
     const playerError = ctx.__sent.find(m => m && m.cmd === 'relay' && m.data && m.data.type === 'playerError');
     ok(ctx.__audio.src === '' && (await ctx.pGetState()).playing === false && !!playerError,
         '自恢复最多重试三次，最终停止并广播可读错误');
+
+    let mediaFailure = false;
+    ctx = makeCtx({
+        store: setupPlaylist(1),
+        resolveAudioResponder: () => ({ ok: true, urls: [mediaFailure ? 'https://cdn/broken.m4s' : 'https://cdn/initial.m4s'] }),
+        playFailUrls: ['https://cdn/broken.m4s'], fetchFailUrls: ['https://cdn/broken.m4s']
+    });
+    await ctx.pPlayIndex(0);
+    mediaFailure = true;
+    ctx.__audio.error = { code: 2, message: 'network' };
+    ctx.__audio.ls.error.slice().forEach(fn => fn());
+    await ticks(100);
+    ok(ctx.__resolveAudioCalls() === 4 && ctx.__audio.src === '' && !ctx.__store.bpl_state.playing &&
+        ctx.__sent.some(msg => msg.data && msg.data.type === 'playerError'),
+        'CDN全部失败清空src后仍完成三轮恢复并停止报错');
+
+    ctx = makeCtx({ store: setupPlaylist(1) });
+    await Promise.all([ctx.pSetState({ mode: 'shuffle' }), ctx.pSetState({ playing: true })]);
+    ok(ctx.__store.bpl_state.mode === 'shuffle' && ctx.__store.bpl_state.playing,
+        '并发模式与播放状态补丁不会互相覆盖');
+
+    let elapsed = 0;
+    const slowStore = setupPlaylist(1);
+    Object.assign(slowStore.bpl_playlists[0].items[0], { chartSource: 'qq', matchState: 'pending', bvid: '' });
+    ctx = makeCtx({ store: slowStore,
+        chartMatchResponder(_payload, data) {
+            elapsed += 20000;
+            Object.assign(data.bpl_playlists[0].items[0], { bvid: 'BV1ar421b77b', matchState: 'matched' });
+            return { ok: true };
+        },
+        resolveAudioResponder() { elapsed += 6000; return { ok: true, urls: ['https://cdn/valid.m4s'] }; }
+    });
+    ctx.Date = class extends Date { static now() { return Date.now() + elapsed; } };
+    const slowResult = await ctx.pPlayIndex(0);
+    ok(slowResult.ok && ctx.__audio.playCalls === 1, '慢匹配和解析完成后仍保留完整媒体起播预算');
+
+    const reorderStore = setupPlaylist(2);
+    Object.assign(reorderStore.bpl_playlists[0].items[0], { chartSource: 'qq', matchState: 'pending', bvid: '' });
+    ctx = makeCtx({ store: reorderStore,
+        chartMatchResponder(_payload, data) {
+            Object.assign(data.bpl_playlists[0].items[0], { bvid: 'BV1ar421b77b', matchState: 'matched' });
+            data.bpl_playlists[0].items.reverse();
+            return { ok: true };
+        }
+    });
+    await ctx.pPlayIndex(0);
+    ok(ctx.__store.bpl_state.trackId === 'item0' && ctx.__store.bpl_state.index === 1,
+        '等待匹配期间排序变化后按稳定条目ID播放');
 }
 
 (async () => {

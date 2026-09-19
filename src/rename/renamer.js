@@ -11,6 +11,8 @@
     const MAX_RULE_COUNT = 32;
     const MAX_PATTERN_LENGTH = 256;
     const MAX_REPLACEMENT_LENGTH = 200;
+    const MAX_RULE_STATES = 512;
+    const MAX_RULE_STEPS = 25000;
     const ALLOWED_FLAGS = /^[gim]*$/;
     const TITLE_QUOTE_PAIRS = [
         ['\u300A', '\u300B'],
@@ -338,9 +340,160 @@
         });
     }
 
-    function looksUnsafePattern(pattern) {
-        // The extension only accepts static replacement expressions. Reject common catastrophic forms.
-        return /\(\?[=!<]/.test(pattern) || /\\[1-9]/.test(pattern) || /\([^)]*[+*][^)]*\)[+*]/.test(pattern);
+    function compilePattern(pattern, flags) {
+        // Parse a positive syntax subset, then match state/position pairs once.
+        // Native RegExp only tests one validated character atom, never a user-supplied whole expression.
+        let cursor = 0;
+        const fail = () => { throw new Error('unsupported rule pattern'); };
+        const escape = inClass => {
+            const start = cursor++;
+            const kind = pattern[cursor++];
+            if (!kind) fail();
+            if (kind === 'x' || kind === 'u') {
+                const size = kind === 'x' ? 2 : 4;
+                if (!new RegExp('^[0-9a-fA-F]{' + size + '}$').test(pattern.slice(cursor, cursor + size))) fail();
+                cursor += size;
+            } else if (!'dDsSwWfnrtv'.includes(kind) && !(inClass && kind === 'b') &&
+                !'^$\\.*+?()[]{}|/-'.includes(kind)) fail();
+            return pattern.slice(start, cursor);
+        };
+        const expression = nested => {
+            const branches = [[]];
+            while (cursor < pattern.length && pattern[cursor] !== ')') {
+                const ch = pattern[cursor];
+                if (ch === '|') { cursor++; branches.push([]); continue; }
+                let node;
+                if (ch === '(') {
+                    if (pattern.slice(cursor, cursor + 3) !== '(?:') fail();
+                    cursor += 3;
+                    node = expression(true);
+                    if (pattern[cursor++] !== ')') fail();
+                } else if (ch === '^' || ch === '$') {
+                    cursor++;
+                    node = { kind: ch };
+                } else {
+                    let atom;
+                    if (ch === '[') {
+                        const start = cursor++;
+                        if (pattern[cursor] === '^') cursor++;
+                        const contentStart = cursor;
+                        while (cursor < pattern.length && pattern[cursor] !== ']') {
+                            if (pattern[cursor] === '\\') escape(true);
+                            else {
+                                if (pattern[cursor] === '[') fail();
+                                cursor++;
+                            }
+                        }
+                        if (cursor === contentStart || pattern[cursor++] !== ']') fail();
+                        atom = pattern.slice(start, cursor);
+                    } else if (ch === '\\') atom = escape(false);
+                    else {
+                        if ('*+?{}]'.includes(ch)) fail();
+                        atom = pattern[cursor++];
+                    }
+                    node = { kind: 'char', test: new RegExp('^(?:' + atom + ')$', flags.includes('i') ? 'i' : ''), min: 1, max: 1 };
+                    const quantifier = pattern[cursor];
+                    if (quantifier === '*' || quantifier === '+' || quantifier === '?') {
+                        cursor++;
+                        node.min = quantifier === '+' ? 1 : 0;
+                        node.max = quantifier === '?' ? 1 : Infinity;
+                    } else if (quantifier === '{') {
+                        const match = pattern.slice(cursor).match(/^\{(\d+)(?:,(\d*))?\}/);
+                        if (!match) fail();
+                        node.min = Number(match[1]);
+                        node.max = match[2] === undefined ? node.min : match[2] === '' ? Infinity : Number(match[2]);
+                        if (node.min > MAX_TITLE_LENGTH || node.max < node.min ||
+                            (node.max !== Infinity && node.max > MAX_TITLE_LENGTH)) fail();
+                        cursor += match[0].length;
+                    }
+                }
+                // Groups and anchors cannot be quantified. Lazy quantifiers are outside this subset too.
+                if ('*+?{'.includes(pattern[cursor] || '\0')) fail();
+                branches[branches.length - 1].push(node);
+            }
+            if (!nested && cursor !== pattern.length) fail();
+            return { kind: 'branches', branches: branches };
+        };
+        const tree = expression(false);
+        const states = [];
+        const add = state => {
+            if (states.length >= MAX_RULE_STATES) fail();
+            states.push(state);
+            return states.length - 1;
+        };
+        const compile = (node, next) => {
+            if (node.kind === 'branches') {
+                const alternatives = node.branches.map(branch => {
+                    let start = next;
+                    for (let i = branch.length - 1; i >= 0; i--) start = compile(branch[i], start);
+                    return start;
+                });
+                let start = alternatives.pop();
+                while (alternatives.length) start = add({ kind: 'split', first: alternatives.pop(), next: start });
+                return start;
+            }
+            if (node.kind !== 'char') return add({ kind: node.kind, next: next });
+            let start = next;
+            if (node.max === Infinity) {
+                const loop = add({ kind: 'split', first: null, next: next });
+                states[loop].first = add({ kind: 'char', test: node.test, next: loop });
+                start = loop;
+            } else {
+                for (let i = node.min; i < node.max; i++) {
+                    start = add({ kind: 'split', first: add({ kind: 'char', test: node.test, next: start }), next: start });
+                }
+            }
+            for (let i = 0; i < node.min; i++) start = add({ kind: 'char', test: node.test, next: start });
+            return start;
+        };
+        const start = compile(tree, add({ kind: 'end' }));
+        return {
+            replace(input, replacement, budget) {
+                const source = input.slice(0, MAX_TITLE_LENGTH), memo = new Map();
+                const multiline = flags.includes('m'), global = flags.includes('g');
+                const lineBreak = ch => ch === '\n' || ch === '\r' || ch === '\u2028' || ch === '\u2029';
+                const match = (stateId, position) => {
+                    const key = stateId * (source.length + 1) + position;
+                    if (memo.has(key)) return memo.get(key);
+                    if (--budget.remaining < 0) throw new Error('rule work limit');
+                    const state = states[stateId];
+                    let end = -1;
+                    if (state.kind === 'end') end = position;
+                    else if (state.kind === 'char') {
+                        if (position < source.length && state.test.test(source[position])) end = match(state.next, position + 1);
+                    } else if (state.kind === 'split') {
+                        end = match(state.first, position);
+                        if (end < 0) end = match(state.next, position);
+                    } else if (state.kind === '^') {
+                        if (!position || multiline && lineBreak(source[position - 1])) end = match(state.next, position);
+                    } else if (state.kind === '$') {
+                        if (position === source.length || multiline && lineBreak(source[position])) end = match(state.next, position);
+                    }
+                    memo.set(key, end);
+                    return end;
+                };
+                let output = '', copied = 0;
+                for (let position = 0; position <= source.length; position++) {
+                    const end = match(start, position);
+                    if (end < 0) continue;
+                    const insert = replacement.replace(/\$([$&`'])/g, (_, token) =>
+                        token === '$' ? '$' : token === '&' ? source.slice(position, end) :
+                            token === '`' ? source.slice(0, position) : source.slice(end));
+                    output = (output + source.slice(copied, position) + insert).slice(0, MAX_TITLE_LENGTH);
+                    copied = end;
+                    if (!global || output.length === MAX_TITLE_LENGTH) break;
+                    // Empty matches advance by one UTF-16 code unit, as with RegExp without the u flag.
+                    position = end > position ? end - 1 : position;
+                }
+                return (output + source.slice(copied)).slice(0, MAX_TITLE_LENGTH);
+            }
+        };
+    }
+
+    function replaceWithRule(input, rule, budget) {
+        if (budget.remaining <= 0) return input;
+        try { return rule.matcher.replace(input, rule.replacement, budget); }
+        catch (_) { return input; } // Exhausted user-rule work never interrupts the default policy.
     }
 
     function normalizeRules(value) {
@@ -354,9 +507,9 @@
             const replacement = typeof raw.replace === 'string' ? raw.replace : '';
             const scope = raw.scope === 'title' ? 'title' : 'segment';
             if (!pattern || pattern.length > MAX_PATTERN_LENGTH || replacement.length > MAX_REPLACEMENT_LENGTH ||
-                !ALLOWED_FLAGS.test(flags) || looksUnsafePattern(pattern)) continue;
+                !ALLOWED_FLAGS.test(flags) || new Set(flags).size !== flags.length) continue;
             try {
-                filters.push({ scope: scope, regex: new RegExp(pattern, flags), replacement: replacement });
+                filters.push({ scope: scope, matcher: compilePattern(pattern, flags), replacement: replacement });
             } catch (_) {
                 // Invalid user rules are ignored individually.
             }
@@ -389,23 +542,23 @@
         return rulesCache;
     }
 
-    function applyTitleRules(title, rules) {
+    function applyTitleRules(title, rules, budget) {
         let full = title;
         for (const rule of rules.filters) {
-            if (rule.scope === 'title') full = full.replace(rule.regex, rule.replacement);
+            if (rule.scope === 'title') full = replaceWithRule(full, rule, budget);
         }
         return full;
     }
 
-    function applyRules(title, groups, rules, titleRulesApplied) {
-        const full = titleRulesApplied ? title : applyTitleRules(title, rules);
+    function applyRules(title, groups, rules, titleRulesApplied, budget) {
+        const full = titleRulesApplied ? title : applyTitleRules(title, rules, budget);
         let next = splitTitle(full).map(stripLeadingMetadata).filter(Boolean);
         if (next.length > 1) {
             next = next.filter(segment => !/^#?\d{1,3}$/.test(segment));
         }
         for (const rule of rules.filters) {
             if (rule.scope !== 'segment') continue;
-            next = next.map(segment => cleanSegment(segment.replace(rule.regex, rule.replacement))).filter(Boolean);
+            next = next.map(segment => cleanSegment(replaceWithRule(segment, rule, budget))).filter(Boolean);
         }
         groups.push(next.length ? next : splitTitle(title).map(stripLeadingMetadata).filter(Boolean));
     }
@@ -429,12 +582,13 @@
         const rules = options.rules == null ? await loadRules() : normalizeRules(options.rules);
         const groups = [];
         const originals = [];
+        const budgets = source.map(() => ({ remaining: MAX_RULE_STEPS }));
         for (const item of source) {
             const original = text(item && item.title);
             originals.push(original);
         }
-        const preparedTitles = originals.map(original =>
-            applyTitleRules(original.slice(0, MAX_TITLE_LENGTH), rules));
+        const preparedTitles = originals.map((original, index) =>
+            applyTitleRules(original.slice(0, MAX_TITLE_LENGTH), rules, budgets[index]));
         const context = buildTitleContext(preparedTitles);
         for (let index = 0; index < originals.length; index++) {
             const original = originals[index];
@@ -443,7 +597,7 @@
             const candidate = selectTitleCandidate(structural, context);
             const prepared = candidate || removeCommonQuoted(structural, context);
             const local = [];
-            applyRules(prepared, local, rules, true);
+            applyRules(prepared, local, rules, true, budgets[index]);
             groups.push(local[0] && local[0].length ? local[0] : [stripLeadingMetadata(original) || original]);
         }
         // Detect common prefixes before dropping long candidates. This preserves a

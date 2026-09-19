@@ -20,10 +20,13 @@ npm run package:windows
 
 该命令会重建项目外的 `release/` 目录；不要提交 ZIP、解压后的发布目录或 Chrome 自动生成的 `_metadata/`。
 
+更新脚本或发布清单的改动还需在 Windows 运行 `npm run test:update`。该测试在隔离目录验证真实 ZIP、校验和、替换与回滚，不会更新开发目录。源码检出应通过 Git 更新，不使用 `update.bat`。
+
 ## 变更原则
 
 - 保持 `src/background/background.js`、`src/player/offscreen.js`、`src/content/content.js` 与 `src/panel/sidepanel.*` 的职责边界。整体架构见 [`docs/architecture.md`](docs/architecture.md)。
 - 调整播放、存储、桥接消息或主题语义变量时，更新相应的 `tests/test-*.js`。
+- 条目命令携带稳定的播放列表和条目 ID；网络准备与短暂存储提交分开，迟到响应不能覆盖新的用户操作。
 - UI 改动请同时检查停止态、播放态、窄面板和可调整尺寸后的长列表；涉及外观时附截图会提高审查效率。
 - 不要在代码、Issue、PR 或测试样例中提交 Cookie、授权信息、个人播放链接或完整诊断日志。
 - 保持改动聚焦，避免混合无关格式化、重命名和功能变更。

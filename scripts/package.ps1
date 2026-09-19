@@ -3,6 +3,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1') -Force
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Archive/Microsoft.PowerShell.Archive.psd1') -Force
 $projectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path (Split-Path $projectRoot -Parent) 'release'
@@ -10,9 +12,30 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 $releaseDir = [IO.Path]::GetFullPath((Join-Path $OutputRoot 'bilibili-music-player'))
 
-if ((Split-Path $releaseDir -Leaf) -ne 'bilibili-music-player' -or
-    -not $releaseDir.StartsWith($OutputRoot, [StringComparison]::OrdinalIgnoreCase)) {
+$comparison = [StringComparison]::OrdinalIgnoreCase
+$sourcePrefix = $projectRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+$releasePrefix = $releaseDir.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+if ($releaseDir.Equals($projectRoot, $comparison) -or
+    $releaseDir.StartsWith($sourcePrefix, $comparison) -or
+    $projectRoot.StartsWith($releasePrefix, $comparison)) {
+    throw "The release directory must not overlap the source directory: $releaseDir"
+}
+if ((Split-Path $releaseDir -Leaf) -ne 'bilibili-music-player') {
     throw "Unsafe release directory: $releaseDir"
+}
+# Lexical checks alone do not protect a source directory reached through a junction.
+foreach ($start in @($releaseDir, $projectRoot)) {
+    $pathToCheck = $start
+    while ($pathToCheck) {
+        if ((Test-Path -LiteralPath $pathToCheck) -and
+            ((Get-Item -LiteralPath $pathToCheck -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "The package path must not pass through a junction or symbolic link: $pathToCheck"
+        }
+        $pathToCheck = Split-Path -Parent $pathToCheck
+    }
+}
+if (Test-Path -LiteralPath (Join-Path $releaseDir '.git')) {
+    throw "The release destination contains a Git checkout and cannot be replaced: $releaseDir"
 }
 
 & npm.cmd --prefix $projectRoot test
@@ -69,6 +92,7 @@ foreach ($file in $packagedFiles) {
     $releaseHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $releaseDir $file)).Hash
     if ($sourceHash -ne $releaseHash) { throw "Release hash mismatch: $file" }
 }
+& (Join-Path $projectRoot 'scripts/update.ps1') -InstallRoot $releaseDir -ValidateOnly
 
 if (Test-Path -LiteralPath $zipPath) {
     Remove-Item -LiteralPath $zipPath -Force

@@ -81,7 +81,7 @@ function renderBootInfo() {
     if (!el) return;
     const b = bootCache;
     if (!b || !b.at) {
-        el.textContent = 'offscreen 诊断：无启动信号（脚本可能从未执行——待修根因，本版本无兜底）';
+        el.textContent = 'offscreen 诊断：暂无启动记录，请尝试播放后查看日志';
         el.className = 'boot bad';
         return;
     }
@@ -115,7 +115,7 @@ function openLog(open) {
 function exportLog() {
     const bootLine = '【offscreen 诊断】' + (bootCache && bootCache.at
         ? JSON.stringify(bootCache)
-        : '无 bpl_boot 记录：offscreen 脚本很可能从未执行（本环境由页内备用引擎播放）');
+        : '无 bpl_boot 记录：后台音频文档尚无启动记录');
     const lines = [bootLine, '================================'].concat(
         logCache.map(e => e.s + ' [' + e.level + '][' + e.scope + '] ' + e.msg)
     );
@@ -139,10 +139,8 @@ if (logEl) {
 
 function send(cmd, extra) {
     const payload = Object.assign({ target: 'bg', cmd }, extra || {});
-    const timeoutMs = (cmd === 'rematchSource' || cmd === 'repairSource') ? 90000
-        : (cmd === 'matchChartItem' ? 120000
-        : ((cmd === 'playChartItem' || cmd === 'matchManualItem') ? 45000
-            : (({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 32000 : 10000)));
+    const timeoutMs = ['rematchSource', 'repairSource', 'matchChartItem', 'playChartItem', 'matchManualItem'].includes(cmd)
+        ? 150000 : (({ toggle: 1, next: 1, prev: 1, playIndex: 1 })[cmd] ? 120000 : 10000);
     const report = r => {
         if (r && r.ok === false && r.error) BPLLog.error('ui', cmd + ' 失败：' + r.error);
         else if (!r) BPLLog.warn('ui', cmd + '：后台无响应（超时）');
@@ -283,7 +281,7 @@ function render() {
                 (rematchable ? '<button type="button" class="source-rematch" data-rematch="' + esc(s.id) +
                     '" title="重新匹配音源" aria-label="重新匹配音源"' + (rematching ? ' disabled' : '') + '>' +
                     SOURCE_REMATCH_ICON + '</button>' : '') + '</span>';
-            return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '">' +
+            return '<div class="item' + (isPlaying ? ' playing' : '') + '" data-i="' + i + '" data-id="' + esc(s.id) + '">' +
                 '<span class="chk"></span>' +
                 coverHtml +
                 '<div class="t"><div class="track"><span class="txt">' + esc(s.title) + '</span></div></div>' +
@@ -405,6 +403,7 @@ function updateProgress() {
 }
 
 async function refresh() {
+    await send('recoverMatchTasks');
     const r = await chrome.storage.local.get(['bpl_playlists', 'bpl_active', 'bpl_state']);
     playlists = r.bpl_playlists || [];
     activeId = r.bpl_active || (playlists[0] && playlists[0].id) || null;
@@ -446,7 +445,7 @@ function renameItem(i) {
         if (v && v !== s.title) {
             s.title = v;
             render();
-            send('renameItem', { index: i, title: v });
+            send('renameItem', { playlistId: pl.id, itemId: s.id, title: v });
         } else {
             render();
         }
@@ -546,8 +545,10 @@ $('#plSelect').addEventListener('change', e => send('setActive', { id: e.target.
 const manualItemDialog = $('#manualItemDialog');
 const manualItemForm = $('#manualItemForm');
 const manualItemTitle = $('#manualItemTitle');
+let manualItemPlaylistId = null;
 function openManualItemDialog() {
     if (!activePlaylist()) { toast('请先创建或选择一个播放列表'); return; }
+    manualItemPlaylistId = activeId;
     manualItemTitle.value = '';
     if (typeof manualItemDialog.showModal === 'function') manualItemDialog.showModal();
     else manualItemDialog.setAttribute('open', '');
@@ -564,7 +565,7 @@ manualItemForm.addEventListener('submit', e => {
     const title = String(manualItemTitle.value || '').trim();
     if (!title) { manualItemTitle.focus(); return; }
     closeManualItemDialog();
-    send('addManualItem', { title: title.slice(0, 200) }).then(result => {
+    send('addManualItem', { playlistId: manualItemPlaylistId, title: title.slice(0, 200) }).then(result => {
         if (!result || result.ok === false) toast((result && result.error) || '添加条目失败');
     });
 });
@@ -637,7 +638,7 @@ menu.addEventListener('click', e => {
     } else if (act === 'export-json') {
         exportAs('json');
     } else if (act === 'clear') {
-        if (pl.items.length && confirm('清空播放列表「' + pl.name + '」？')) send('clear');
+        if (pl.items.length && confirm('清空播放列表「' + pl.name + '」？')) send('clear', { playlistId: pl.id });
     } else if (act === 'delete') {
         if (confirm('删除播放列表「' + pl.name + '」及其所有条目？')) send('deletePlaylist', { id: pl.id });
     }
@@ -693,27 +694,36 @@ chrome.storage.local.get(['bpl_volume', 'bpl_mute']).then(r => {
 const box = $('#list');
 
 let selMode = false;
+let selectionPlaylistId = null;
 const selected = new Set();
 function enterSelMode(firstIdx) {
     selMode = true;
+    selectionPlaylistId = activeId;
     selected.clear();
-    if (firstIdx != null) selected.add(firstIdx);
+    const item = activePlaylist() && activePlaylist().items[firstIdx];
+    if (item) selected.add(item.id);
     refreshSelUI();
 }
 function exitSelMode() {
     selMode = false;
+    selectionPlaylistId = null;
     selected.clear();
     $('#selMenu').classList.add('hidden');
     refreshSelUI();
 }
 function toggleSel(i) {
-    if (selected.has(i)) selected.delete(i); else selected.add(i);
+    const item = activePlaylist() && activePlaylist().items[i];
+    if (!item || selectionPlaylistId !== activeId) return;
+    if (selected.has(item.id)) selected.delete(item.id); else selected.add(item.id);
     refreshSelUI();
 }
 function refreshSelUI() {
+    if (selMode && selectionPlaylistId !== activeId) { exitSelMode(); return; }
+    const existing = new Set((activePlaylist() && activePlaylist().items || []).map(item => item.id));
+    for (const id of selected) if (!existing.has(id)) selected.delete(id);
     box.classList.toggle('selmode', selMode);
     box.querySelectorAll('.item').forEach(el => {
-        const on = selected.has(+el.dataset.i);
+        const on = selected.has(el.dataset.id);
         el.classList.toggle('selected', on);
         const chk = el.querySelector('.chk');
         if (chk) chk.classList.toggle('checked', on);
@@ -731,7 +741,8 @@ function findTargetIndex(clientY) {
         const r = el.getBoundingClientRect();
         if (clientY <= r.top + r.height / 2) return +el.dataset.i;
     }
-    return items.length ? +items[items.length - 1].dataset.i : null;
+    // The position below the final row means append, not insert before it.
+    return items.length ? -1 : null;
 }
 function removeDragListeners() {
     window.removeEventListener('pointermove', dragMove);
@@ -762,7 +773,7 @@ function dragMove(e) {
         drag.el.style.transform = 'translateY(' + dy + 'px)';
         const target = findTargetIndex(e.clientY);
         box.querySelectorAll('.item.drag-over').forEach(x => x.classList.remove('drag-over'));
-        if (target != null && target !== drag.from) {
+        if (target != null && target >= 0 && target !== drag.from) {
             const tEl = box.querySelector('.item[data-i="' + target + '"]');
             if (tEl) tEl.classList.add('drag-over');
         }
@@ -772,19 +783,18 @@ function dragUp(e) {
     removeDragListeners();
     if (!drag) return;
     const wasMoved = drag.moved, from = drag.from;
-    let reordered = false;
     if (wasMoved) {
         const target = findTargetIndex(e.clientY);
         if (target != null && target !== from) {
             lastDrop = Date.now();
-            const pl = playlists.find(p => p.id === activeId);
-            if (pl) {
-                const insertAt = from < target ? target - 1 : target;
-                const mv = pl.items.splice(from, 1)[0];
-                pl.items.splice(insertAt, 0, mv);
-                reordered = true;
+            const pl = playlists.find(p => p.id === drag.playlistId);
+            const targetItem = pl && pl.items[target];
+            if (activeId === drag.playlistId && pl && (target === -1 || targetItem)) {
+                send('moveItem', {
+                    playlistId: drag.playlistId, itemId: drag.itemId,
+                    beforeItemId: targetItem ? targetItem.id : null
+                });
             }
-            send('moveItem', { from: from, to: target });
         }
     }
     box.classList.remove('drag-on');
@@ -792,11 +802,6 @@ function dragUp(e) {
     drag.el.classList.remove('dragging');
     drag.el.style.transform = '';
     drag = null;
-    if (reordered) {
-        const sc = box.scrollTop;
-        render();
-        box.scrollTop = sc;
-    }
 }
 function dragCancel() {
     removeDragListeners();
@@ -827,7 +832,7 @@ box.addEventListener('pointerdown', e => {
         // 按下即收预览并取消未触发的放大计时：避免“按住准备拖拽”时大图弹出
         if (popTimer) { clearTimeout(popTimer); popTimer = null; }
         hideCoverPop();
-        drag = { from: +it.dataset.i, el: it, startY: e.clientY, moved: false };
+        drag = { from: +it.dataset.i, itemId: it.dataset.id, playlistId: activeId, el: it, startY: e.clientY, moved: false };
         window.addEventListener('pointermove', dragMove);
         window.addEventListener('pointerup', dragUp);
         window.addEventListener('pointercancel', dragCancel);
@@ -835,8 +840,13 @@ box.addEventListener('pointerdown', e => {
     }
     if (!selMode && !cover && !e.target.closest('.ibtn')) {
         lpStart = { x: e.clientX, y: e.clientY };
-        const idx = +it.dataset.i;
-        lpTimer = setTimeout(() => { lpTimer = null; lpSupp = true; enterSelMode(idx); }, 500);
+        const playlistId = activeId, itemId = it.dataset.id;
+        lpTimer = setTimeout(() => {
+            lpTimer = null;
+            const pl = activePlaylist();
+            const idx = pl && pl.id === playlistId ? pl.items.findIndex(item => item.id === itemId) : -1;
+            if (idx >= 0) { lpSupp = true; enterSelMode(idx); }
+        }, 500);
     }
 });
 box.addEventListener('pointermove', e => {
@@ -931,7 +941,7 @@ box.addEventListener('click', e => {
         });
         return;
     }
-    act('playIndex', { index: i, playlistId: activeId });
+    act('playIndex', { index: i, itemId: item && item.id, playlistId: activeId });
 });
 
 box.addEventListener('mouseover', e => {
@@ -990,14 +1000,14 @@ function openSelMenu(action) {
     selMenu.scrollTop = 0;
     positionSelectionMenu();
 }
-function selIndices() { return [...selected].sort((a, b) => a - b); }
+function selItemIds() { return [...selected]; }
 $('#selMoveBtn').addEventListener('click', () => openSelMenu('move'));
 $('#selCopyBtn').addEventListener('click', () => openSelMenu('copy'));
 $('#selDelBtn').addEventListener('click', () => {
-    const indices = selIndices();
-    if (!indices.length) return;
-    if (confirm('删除选中的 ' + indices.length + ' 个条目？')) {
-        send('batchRemove', { indices: indices }).then(() => { exitSelMode(); refresh(); });
+    const itemIds = selItemIds(), playlistId = selectionPlaylistId;
+    if (!itemIds.length) return;
+    if (confirm('删除选中的 ' + itemIds.length + ' 个条目？')) {
+        send('batchRemove', { playlistId, itemIds }).then(() => { exitSelMode(); refresh(); });
     }
 });
 $('#selCancelBtn').addEventListener('click', exitSelMode);
@@ -1006,10 +1016,10 @@ $('#selMenu').addEventListener('click', e => {
     const d = e.target.closest('[data-plid]');
     $('#selMenu').classList.add('hidden');
     if (!d) return;
-    const indices = selIndices();
-    if (!indices.length) return;
+    const itemIds = selItemIds(), playlistId = selectionPlaylistId;
+    if (!itemIds.length) return;
     const cmd = selAction === 'move' ? 'batchMove' : 'batchCopy';
-    send(cmd, { indices: indices, toId: d.dataset.plid }).then(() => { exitSelMode(); refresh(); });
+    send(cmd, { playlistId, itemIds, toId: d.dataset.plid }).then(() => { exitSelMode(); refresh(); });
 });
 $('#selMenu').addEventListener('wheel', e => e.stopPropagation(), { passive: true });
 document.addEventListener('click', e => {

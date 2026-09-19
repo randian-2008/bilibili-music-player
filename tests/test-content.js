@@ -107,10 +107,11 @@ function makeCtx(opts) {
     ok(bd('https://evil.com', 'toggle') === 'reject-http', '网页源播放命令拒绝');
     ok(bd('https://evil.com', 'deletePlaylist') === 'reject-http', '网页源通用命令拒绝');
     ok(bd('chrome-extension://id', 'toggle') === 'player', '扩展源播放命令放行(player)');
-    ok(bd('null', 'toggle') === 'player', 'null 源播放命令放行(兼容个别环境)');
+    ok(bd('null', 'toggle') === 'player', 'null 源播放命令由监听器进一步校验真实面板窗口');
     ok(bd('chrome-extension://id', 'deletePlaylist') === 'forward', '扩展源通用命令放行(forward)');
     ok(bd('null', 'deletePlaylist') === 'reject-origin', 'null 源通用命令拒绝(堵越权)');
     ok(bd('chrome-extension://other', 'clear') === 'reject-origin', '其他扩展源通用命令拒绝');
+    ok(bd('chrome-extension://other', 'toggle') === 'reject-origin', '其他扩展源播放命令拒绝');
 
     console.log('\n[content.js 面板尺寸与视口边界]');
     const clamp = ctx.__api().clampPanelGeometry;

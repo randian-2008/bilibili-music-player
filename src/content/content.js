@@ -28,6 +28,7 @@
     let built = false;
     let posX = null, posY = null, panelWidth = null, panelHeight = null;
     let panelXRatio = null, panelYRatio = null, preferredPanelWidth = null, preferredPanelHeight = null;
+    let panelPreferenceRevision = 0, panelInteraction = false, pendingPanelPreference = null;
     let collectionProbeBvid = '';
     let collectionProbeAt = 0;
     let collectionProbeInFlight = false;
@@ -56,6 +57,7 @@
     }
 
     function clampRatio(value, fallback) {
+        if (value == null) return fallback;
         const n = Number(value);
         if (!Number.isFinite(n)) return fallback;
         return Math.max(0, Math.min(n, 1));
@@ -177,7 +179,7 @@
         });
     }
     // 命令路由：offscreen 是唯一音频宿主（按产品决策放弃一切兜底）。播放命令一律经后台转发给 offscreen 文档。
-    function handlePlayerCmd(payload) { return sendBgPlayer(payload, LONG_PLAYER_CMDS[payload && payload.cmd] ? 32000 : 10000); }
+    function handlePlayerCmd(payload) { return sendBgPlayer(payload, LONG_PLAYER_CMDS[payload && payload.cmd] ? 120000 : 10000); }
     // =================================================================================
 
     const PLAY_D = 'M8 5v14l11-7z';
@@ -581,40 +583,15 @@
             }
         }).catch(e => reviveIfDead(e));
 
-        // 恢复面板在可移动区域内的相对位置与用户尺寸。开合状态仍不持久化。
-        chrome.storage.local.get(STORE_KEY).then(r => {
-            const p = (r && r[STORE_KEY]) || {};
-            const hasRatioPosition = Number.isFinite(p.xRatio) && Number.isFinite(p.yRatio);
-            const hasLegacyPosition = Number.isFinite(p.x) && Number.isFinite(p.y);
-            const hasSize = Number.isFinite(p.width) && Number.isFinite(p.height);
-            if (hasRatioPosition || hasLegacyPosition || hasSize) {
-                preferredPanelWidth = hasSize ? Math.max(PANEL_MIN_WIDTH, p.width) : panel.offsetWidth;
-                preferredPanelHeight = hasSize ? Math.max(PANEL_MIN_HEIGHT, p.height) : panel.offsetHeight;
-                let geometry;
-                if (hasRatioPosition) {
-                    panelXRatio = clampRatio(p.xRatio, 0.5);
-                    panelYRatio = clampRatio(p.yRatio, 0.5);
-                    geometry = panelGeometryFromRatios(
-                        panelXRatio, panelYRatio, preferredPanelWidth, preferredPanelHeight,
-                        window.innerWidth, window.innerHeight
-                    );
-                } else {
-                    const x = hasLegacyPosition ? p.x : window.innerWidth - preferredPanelWidth - 20;
-                    const y = hasLegacyPosition ? p.y : window.innerHeight - preferredPanelHeight - 146;
-                    geometry = clampPanelGeometry(
-                        x, y, preferredPanelWidth, preferredPanelHeight, window.innerWidth, window.innerHeight
-                    );
-                    const ratios = panelRatiosFromGeometry(
-                        geometry.x, geometry.y, geometry.width, geometry.height,
-                        window.innerWidth, window.innerHeight, 0.5, 0.5
-                    );
-                    panelXRatio = ratios.xRatio;
-                    panelYRatio = ratios.yRatio;
-                    savePanelPreference();
-                }
-                applyPanelGeometry(geometry);
-            }
-        }).catch(e => reviveIfDead(e));
+        // 所有标签页共享位置；读取旧格式时只转换显示，下一次实际拖动才写回，避免迁移互相覆盖。
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area !== 'local' || !changes[STORE_KEY]) return;
+            panelPreferenceRevision++;
+            const value = changes[STORE_KEY].newValue || {};
+            if (panelInteraction) pendingPanelPreference = value;
+            else restorePanelPreference(value);
+        });
+        refreshPanelPreference();
         window.addEventListener('resize', keepPanelInViewport);
         updateAddBtn();
         updateMiniUI();
@@ -626,6 +603,61 @@
         mini.classList.toggle('playing', !!playerState.playing);
         const p = miniPlay && miniPlay.querySelector('path');
         if (p) p.setAttribute('d', playerState.playing ? PAUSE_D : PLAY_D);
+    }
+
+    function restorePanelPreference(p) {
+        const hasRatioPosition = Number.isFinite(p.xRatio) && Number.isFinite(p.yRatio);
+        const hasLegacyPosition = Number.isFinite(p.x) && Number.isFinite(p.y);
+        const hasSize = Number.isFinite(p.width) && Number.isFinite(p.height);
+        if (!hasRatioPosition && !hasLegacyPosition && !hasSize) return;
+        preferredPanelWidth = hasSize ? Math.max(PANEL_MIN_WIDTH, p.width) : panel.offsetWidth || 340;
+        preferredPanelHeight = hasSize ? Math.max(PANEL_MIN_HEIGHT, p.height) : panel.offsetHeight || 540;
+        let geometry;
+        if (hasRatioPosition) {
+            panelXRatio = clampRatio(p.xRatio, 0.5);
+            panelYRatio = clampRatio(p.yRatio, 0.5);
+            geometry = panelGeometryFromRatios(
+                panelXRatio, panelYRatio, preferredPanelWidth, preferredPanelHeight,
+                window.innerWidth, window.innerHeight
+            );
+        } else {
+            geometry = clampPanelGeometry(
+                hasLegacyPosition ? p.x : window.innerWidth - preferredPanelWidth - 20,
+                hasLegacyPosition ? p.y : window.innerHeight - preferredPanelHeight - 146,
+                preferredPanelWidth, preferredPanelHeight, window.innerWidth, window.innerHeight
+            );
+            const ratios = panelRatiosFromGeometry(
+                geometry.x, geometry.y, geometry.width, geometry.height,
+                window.innerWidth, window.innerHeight, 0.5, 0.5
+            );
+            panelXRatio = ratios.xRatio;
+            panelYRatio = ratios.yRatio;
+        }
+        applyPanelGeometry(geometry);
+    }
+
+    function refreshPanelPreference() {
+        const revision = panelPreferenceRevision;
+        chrome.storage.local.get(STORE_KEY).then(values => {
+            if (revision !== panelPreferenceRevision || panelInteraction) return;
+            restorePanelPreference(values && values[STORE_KEY] || {});
+        }).catch(e => reviveIfDead(e));
+    }
+
+    function beginPanelInteraction() {
+        panelPreferenceRevision++;
+        panelInteraction = true;
+        pendingPanelPreference = null;
+    }
+
+    function finishPanelInteraction(changed, rememberSize) {
+        panelPreferenceRevision++;
+        panelInteraction = false;
+        const pending = pendingPanelPreference;
+        pendingPanelPreference = null;
+        if (changed) persist(rememberSize);
+        else if (pending) restorePanelPreference(pending);
+        else refreshPanelPreference();
     }
 
     function applyPanelGeometry(g) {
@@ -674,7 +706,7 @@
                     width: preferredPanelWidth,
                     height: preferredPanelHeight
                 }
-            });
+            }).catch(e => reviveIfDead(e));
         } catch (e) { reviveIfDead(e); }
     }
 
@@ -706,7 +738,7 @@
             setThemePickerOpen(false);
             closeCollectionDialog();
         }
-        if (panelOpen) { ensureFrame(); updateAddBtn(); }
+        if (panelOpen) { refreshPanelPreference(); ensureFrame(); updateAddBtn(); }
     }
 
     function updateAddBtn() {
@@ -1000,6 +1032,7 @@
             if (e.button !== 0) return;
             e.preventDefault();
             dragging = true;
+            beginPanelInteraction();
             sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect();
             const g = clampPanelGeometry(
@@ -1021,11 +1054,11 @@
                 window.innerHeight
             ));
         });
-        const end = () => {
+        const end = e => {
             if (!dragging) return;
             dragging = false;
             el.classList.remove('dragging');
-            persist(false);
+            finishPanelInteraction(e.type !== 'pointercancel' && (posX !== ox || posY !== oy), false);
         };
         handle.addEventListener('pointerup', end);
         handle.addEventListener('pointercancel', end);
@@ -1039,6 +1072,7 @@
             e.preventDefault();
             e.stopPropagation();
             resizing = true;
+            beginPanelInteraction();
             sx = e.clientX; sy = e.clientY;
             const r = el.getBoundingClientRect();
             const g = clampPanelGeometry(
@@ -1059,11 +1093,12 @@
             const height = Math.max(minHeight, Math.min(startHeight + e.clientY - sy, maxHeight));
             applyPanelGeometry({ x: ox, y: oy, width: width, height: height });
         });
-        const end = () => {
+        const end = e => {
             if (!resizing) return;
             resizing = false;
             el.classList.remove('resizing');
-            persist(true);
+            finishPanelInteraction(e.type !== 'pointercancel' &&
+                (panelWidth !== startWidth || panelHeight !== startHeight), true);
         };
         handle.addEventListener('pointerup', end);
         handle.addEventListener('pointercancel', end);
@@ -1096,13 +1131,13 @@
     });
 
     // 桥接来源决策（抽成纯函数便于单测）：
-    //   'player'        播放命令：危害仅为控制播放，任意非网页源放行（兼容个别环境扩展 iframe 源被序列化为 'null'）
+    //   'player'        播放命令：扩展自身源，或来源为 null 的真实面板 iframe
     //   'forward'       通用命令（播放列表增删改/openTab 等）：仅扩展自身源放行
     //   'reject-http'   网页源（http/https，浏览器设定、不可伪造）一律拒绝
     //   'reject-origin' 非扩展源发起的通用命令拒绝——堵住“只拒 http(s)+任意透传”的越权面
     function bridgeDecision(origin, cmd) {
         if (typeof origin === 'string' && /^https?:\/\//.test(origin)) return 'reject-http';
-        if (cmd && PLAYER_CMDS[cmd]) return 'player';
+        if (cmd && PLAYER_CMDS[cmd] && (origin === EXT_ORIGIN || origin === 'null')) return 'player';
         if (origin !== EXT_ORIGIN) return 'reject-origin';
         return 'forward';
     }
@@ -1110,10 +1145,11 @@
     window.addEventListener('message', e => {
         const d = e.data;
         if (!d || d.bplBridge !== 'req') return;
+        // null origin 也可能来自网页创建的 sandbox iframe，必须同时绑定窗口身份。
+        if (!frameLoaded || !pframe || !pframe.contentWindow || e.source !== pframe.contentWindow) return;
         const payload = d.payload;
         const decision = bridgeDecision(e.origin, payload && payload.cmd);
         if (decision === 'reject-http') return;
-        if (!frameLoaded || !pframe || !pframe.contentWindow) return;
         if (!loggedBridgeOrigin) { loggedBridgeOrigin = true; BPLLog.info('content', '桥接首个请求 origin=' + e.origin + ' → ' + decision); }
         const respond = res => {
             try { pframe.contentWindow.postMessage({ bplBridge: 'res', id: d.id, result: res }, '*'); } catch (_) {}

@@ -18,6 +18,7 @@ const CHART_AUTO_MATCH_DELAY_MS = 8000;
 const CHART_MATCH_TIMEOUT_MS = 12000;
 const CHART_NETWORK_TIMEOUT_MS = 12000;
 const chartMatchInflight = new Map();
+const chartImportInflight = new Map();
 const sourceRematchInflight = new Map();
 const DEFINITIVE_UNAVAILABLE_CODES = new Set([-404, 62002]);
 let chartAutoMatchTask = null;
@@ -72,14 +73,54 @@ async function getState() {
     st.mode = normalizeMode(st);
     return st;
 }
-async function saveState(s) { await chrome.storage.local.set({ bpl_state: s }); }
+// All read/modify/write operations on player state share this queue. Offscreen
+// reports patches; it never persists an independently read snapshot.
+let playerStateMutationChain = Promise.resolve();
+function withPlayerStateMutation(fn) {
+    const task = playerStateMutationChain.then(fn, fn);
+    playerStateMutationChain = task.then(() => {}, () => {});
+    return task;
+}
+function patchPlayerState(patch, context) {
+    return withPlayerStateMutation(async () => {
+        const state = await getState();
+        if (context && Object.prototype.hasOwnProperty.call(context, 'trackId') &&
+            state.trackId !== context.trackId) return { ok: true, stale: true, state };
+        const next = Object.assign({}, state);
+        for (const key of ['playlistId', 'trackId', 'index', 'playing', 'mode']) {
+            if (patch && Object.prototype.hasOwnProperty.call(patch, key)) next[key] = patch[key];
+        }
+        if (patch && patch.trackId) {
+            const playlist = findPl(await getPlaylists(), next.playlistId);
+            const index = playlist ? playlist.items.findIndex(item => item.id === patch.trackId) : -1;
+            if (index < 0) return { ok: true, stale: true, state };
+            next.index = index;
+        }
+        next.mode = normalizeMode(next);
+        await chrome.storage.local.set({ bpl_state: next });
+        return { ok: true, state: next };
+    });
+}
 function findPl(lists, id) { return lists.find(p => p.id === id); }
+function selectedItemIndices(playlist, itemIds) {
+    if (!Array.isArray(itemIds)) return [];
+    const ids = new Set(itemIds.filter(id => typeof id === 'string'));
+    return playlist.items.map((item, index) => ids.has(item.id) ? index : -1).filter(index => index >= 0);
+}
+function resetMatchingState(item) {
+    if (item.matchState !== 'matching') return false;
+    item.matchState = item.bvid ? 'matched' : 'pending';
+    delete item.matchStartedAt;
+    delete item.matchError;
+    return true;
+}
 function positionMatchesItem(pos, it) {
     if (!pos || !it) return false;
     if (pos.trackId && it.id) return pos.trackId === it.id;
     return pos.bvid === it.bvid && (pos.cid || 0) === (it.cid || 0);
 }
 async function reconcileStoredState(lists) {
+    return await withPlayerStateMutation(async () => {
     const st = await getState();
     const before = JSON.stringify(st);
     let trackRemoved = false;
@@ -106,9 +147,10 @@ async function reconcileStoredState(lists) {
         st.playing = false;
         st.index = Math.max(0, Math.min(st.index, Math.max(0, pl.items.length - 1)));
     }
-    if (before !== JSON.stringify(st)) await saveState(st);
+    if (before !== JSON.stringify(st)) await chrome.storage.local.set({ bpl_state: st });
     if (trackRemoved) await chrome.storage.local.set({ bpl_position: null });
     return { state: st, trackRemoved };
+    });
 }
 function normUrl(u) {
     u = String(u || '');
@@ -121,6 +163,63 @@ const NETWORK_RETRY_DELAY_MS = 250;
 // contexts in quick succession. Manual retry deliberately bypasses this gate.
 const CHART_MATCH_FAILURE_COOLDOWN_MS = 15000;
 const CHART_MANUAL_RETRY_LIMIT = 10;
+const MATCH_OPERATION_TIMEOUT_MS = 105000;
+const MATCH_PLAY_OPERATION_TIMEOUT_MS = 140000;
+const MEDIA_PROBE_TIMEOUT_MS = 12000;
+let backgroundPlayIntent = 0;
+function beginBackgroundPlayIntent() { return ++backgroundPlayIntent; }
+function currentBackgroundPlayIntent(intent) { return intent === backgroundPlayIntent; }
+function matchIdentity(item) {
+    return [item.matchOrigin || '', item.chartSource || '', item.chartId || '',
+        item.sourceRank || '', item.sourceTitle || '', item.sourceArtist || '',
+        item.matchTargetTitle || '', item.matchTargetArtist || '', Number(item.matchRevision) || 0].join('|');
+}
+function matchTimeoutError() {
+    const error = new Error('匹配音源超时，请稍后重试');
+    error.name = 'TimeoutError';
+    error.transient = true;
+    return error;
+}
+function assertMatchDeadline(deadline) {
+    if (Date.now() >= deadline) throw matchTimeoutError();
+}
+// Each phase consumes the same operation budget. Ignore a late resolution even
+// if the event loop delivers it before the timer callback. Callers commit only
+// after this promise succeeds, so abandoned requests cannot save a new source.
+function matchBeforeDeadline(deadline, operation) {
+    return new Promise((resolve, reject) => {
+        let settled = false;
+        let timer = null;
+        const finish = (fn, value) => {
+            if (settled) return;
+            settled = true;
+            if (timer) clearTimeout(timer);
+            fn(value);
+        };
+        if (Date.now() >= deadline) { reject(matchTimeoutError()); return; }
+        timer = setTimeout(() => finish(reject, matchTimeoutError()), deadline - Date.now());
+        Promise.resolve().then(() => {
+            assertMatchDeadline(deadline);
+            return operation();
+        }).then(value => {
+            if (Date.now() >= deadline) finish(reject, matchTimeoutError());
+            else finish(resolve, value);
+        }, error => finish(reject, error));
+    });
+}
+async function verifyCandidateMedia(urls, deadline) {
+    const result = await matchBeforeDeadline(deadline, () => sendToOffscreen({ cmd: 'probeAudio', urls,
+        timeoutMs: Math.min(MEDIA_PROBE_TIMEOUT_MS, deadline - Date.now()) }));
+    if (result && result.ok) return;
+    const error = new Error(result && result.error || '候选音频无法播放');
+    error.transient = !!(result && (result.transient || result.cancelled || result._transport));
+    throw error;
+}
+function isTransientMatchError(error) {
+    return !!(error && (error.transient || error.name === 'TimeoutError' ||
+        error.name === 'TypeError' || Number(error.status) === 408 ||
+        Number(error.status) === 429 || Number(error.status) >= 500));
+}
 // Bilibili may temporarily reject extension-originated search requests with
 // HTTP 412. Retry only the search request itself, with a short backoff, so a
 // single user action can recover without turning a rejection into a request
@@ -377,27 +476,29 @@ async function mutateChartItem(playlistId, itemId, updater) {
     });
     return updated;
 }
-async function performChartMatch(playlistId, itemId, manual, verifyPlayable) {
+async function performChartMatch(playlistId, itemId, manual, verifyPlayable, operationDeadline) {
+    const deadline = operationDeadline || Date.now() + MATCH_OPERATION_TIMEOUT_MS;
     const lists = await getPlaylists();
     const playlist = findPl(lists, playlistId);
     const snapshot = playlist && playlist.items.find(item => item.id === itemId);
     if (!snapshot || !isMatchItem(snapshot)) return { ok: false, cancelled: true, error: '待匹配条目不存在' };
-    if (snapshot.matchState === 'matched' && snapshot.bvid) return { ok: true, matched: true, itemId: itemId };
+    const alreadyMatched = snapshot.matchState === 'matched' && snapshot.bvid;
+    if (alreadyMatched && !(manual && verifyPlayable)) return { ok: true, matched: true, itemId: itemId };
     if (!manual && snapshot.matchState === 'failed' && snapshot.matchFailedAt &&
         Date.now() - Number(snapshot.matchFailedAt) < CHART_MATCH_FAILURE_COOLDOWN_MS) {
         return { ok: false, throttled: true, itemId: itemId,
             error: snapshot.matchError || '自动匹配暂未成功，请稍后手动重试' };
     }
 
-    const sourceIdentity = [snapshot.matchOrigin || '', snapshot.chartSource || '', snapshot.chartId || '',
-        snapshot.sourceRank || '', snapshot.sourceTitle || '', snapshot.sourceArtist || '',
-        snapshot.matchTargetTitle || '', snapshot.matchTargetArtist || ''].join('|');
-    await mutateChartItem(playlistId, itemId, item => {
+    const sourceIdentity = matchIdentity(snapshot);
+    const started = await mutateChartItem(playlistId, itemId, item => {
+        if (matchIdentity(item) !== sourceIdentity) return false;
         item.matchState = 'matching';
         item.matchStartedAt = Date.now();
         item.matchAttempts = (Number(item.matchAttempts) || 0) + 1;
         delete item.matchError;
     });
+    if (!started) return { ok: false, cancelled: true, error: '待匹配条目已发生变化' };
 
     try {
         const excludedCandidates = new Set();
@@ -406,22 +507,30 @@ async function performChartMatch(playlistId, itemId, manual, verifyPlayable) {
         let verified = null;
         let lastCandidateError = null;
         for (let attempt = 0; attempt < retryLimit; attempt++) {
+            assertMatchDeadline(deadline);
             let current = null;
             try {
                 // 每一轮都重新发起一次搜索，只采用这一轮的最佳结果。
                 // 不把一次搜索返回的多个候选当作同一轮的重试。
-                current = await searchBiliChartItem(snapshot, !!manual, excludedCandidates);
+                // A manual request may join an automatic search. Validate its
+                // existing result first; only a failed source needs a fresh search.
+                current = alreadyMatched && attempt === 0
+                    ? { bvid: snapshot.bvid, title: snapshot.title, pic: snapshot.pic,
+                        author: snapshot.owner, duration: snapshot.duration, score: snapshot.matchScore }
+                    : await matchBeforeDeadline(deadline, () => searchBiliChartItem(snapshot, !!manual, excludedCandidates));
                 if (!current || !isValidBvid(current.bvid)) throw new Error('没有找到可信的B站视频');
                 candidate = current;
                 if (!(manual && verifyPlayable)) break;
-                const resolved = await resolveCid(current.bvid, 1);
+                const resolved = await matchBeforeDeadline(deadline, () => resolveCid(current.bvid, 1));
                 if (!resolved || !resolved.cid) throw new Error('候选视频没有可播放的分P');
-                const urls = await getAudioUrls(current.bvid, resolved.cid);
+                const urls = await matchBeforeDeadline(deadline, () => getAudioUrls(current.bvid, resolved.cid));
                 if (!urls || !urls.length) throw new Error('候选视频没有公开音频流');
+                await verifyCandidateMedia(urls, deadline);
                 verified = { candidate: current, resolved: resolved };
                 break;
             } catch (candidateError) {
                 lastCandidateError = candidateError;
+                if (isTransientMatchError(candidateError)) throw candidateError;
                 if (current && current.bvid) excludedCandidates.add(current.bvid);
                 BPLLog.info('chart', '第 ' + (attempt + 1) + '/' + retryLimit + ' 次匹配失败' +
                     (current && current.bvid ? '[' + current.bvid + ']' : '') + '：' +
@@ -443,9 +552,8 @@ async function performChartMatch(playlistId, itemId, manual, verifyPlayable) {
         }
         const matcher = globalThis.BPLChartMatcher;
         const changed = await mutateChartItem(playlistId, itemId, item => {
-            const currentIdentity = [item.matchOrigin || '', item.chartSource || '', item.chartId || '',
-                item.sourceRank || '', item.sourceTitle || '', item.sourceArtist || '',
-                item.matchTargetTitle || '', item.matchTargetArtist || ''].join('|');
+            assertMatchDeadline(deadline);
+            const currentIdentity = matchIdentity(item);
             if (currentIdentity !== sourceIdentity) return false;
             item.bvid = candidate.bvid;
             item.cid = verified && verified.resolved ? (Number(verified.resolved.cid) || 0) : 0;
@@ -475,6 +583,7 @@ async function performChartMatch(playlistId, itemId, manual, verifyPlayable) {
     } catch (error) {
         const message = String(error && error.message || error || '匹配失败');
         await mutateChartItem(playlistId, itemId, item => {
+            if (matchIdentity(item) !== sourceIdentity) return false;
             item.matchState = 'failed';
             item.matchError = message;
             item.matchFailedAt = Date.now();
@@ -488,9 +597,20 @@ async function performChartMatch(playlistId, itemId, manual, verifyPlayable) {
 async function matchChartItem(playlistId, itemId, manual, verifyPlayable) {
     const key = chartItemKey(playlistId, itemId);
     const existing = chartMatchInflight.get(key);
-    if (existing) return await existing;
-    const task = performChartMatch(playlistId, itemId, manual, verifyPlayable)
-        .finally(() => chartMatchInflight.delete(key));
+    const needsVerification = !!(manual && verifyPlayable);
+    if (existing && (!needsVerification || existing.verifiesPlayback)) return await existing;
+    const deadline = Date.now() + MATCH_OPERATION_TIMEOUT_MS;
+    const run = async () => {
+        if (existing) {
+            await matchBeforeDeadline(deadline, () => existing);
+            // A renamed pending item also invalidates its queued verification.
+            if (chartMatchInflight.get(key) !== task) return { ok: false, cancelled: true };
+        }
+        return await performChartMatch(playlistId, itemId, manual, verifyPlayable, deadline);
+    };
+    const task = run().catch(error => ({ ok: false, error: String(error.message || error), itemId }))
+        .finally(() => { if (chartMatchInflight.get(key) === task) chartMatchInflight.delete(key); });
+    task.verifiesPlayback = needsVerification;
     chartMatchInflight.set(key, task);
     return await task;
 }
@@ -506,6 +626,8 @@ async function matchNextChartItem(playlistId) {
     return item ? await matchChartItem(playlist.id, item.id, false) : { ok: true, idle: true };
 }
 async function playChartItem(playlistId, itemId) {
+    const playbackDeadline = Date.now() + MATCH_PLAY_OPERATION_TIMEOUT_MS;
+    const intent = beginBackgroundPlayIntent();
     let lists = await getPlaylists();
     let playlist = findPl(lists, playlistId);
     let index = playlist ? playlist.items.findIndex(item => item.id === itemId) : -1;
@@ -520,7 +642,8 @@ async function playChartItem(playlistId, itemId) {
         item = index >= 0 ? playlist.items[index] : null;
     }
     if (!item || !item.bvid) return { ok: false, error: '匹配音源失败' };
-    return await sendToOffscreen({ cmd: 'playIndex', index: index, playlistId: playlistId });
+    if (!currentBackgroundPlayIntent(intent)) return { ok: true, cancelled: true };
+    return await sendToOffscreen({ cmd: 'playIndex', index: index, itemId: item.id, playlistId: playlistId, _intentId: intent, playbackDeadline });
 }
 
 async function setSourceUnavailable(playlistId, itemId, bvid, message) {
@@ -594,6 +717,9 @@ function replacementResolvedPage(item, resolved) {
 }
 
 async function performSourceRematch(playlistId, itemId) {
+    const playbackDeadline = Date.now() + MATCH_PLAY_OPERATION_TIMEOUT_MS;
+    const intent = beginBackgroundPlayIntent();
+    const deadline = Date.now() + MATCH_OPERATION_TIMEOUT_MS;
     let lists = await getPlaylists();
     let playlist = findPl(lists, playlistId);
     let item = playlist && playlist.items.find(entry => entry.id === itemId);
@@ -603,9 +729,12 @@ async function performSourceRematch(playlistId, itemId) {
     const originalBvid = item.bvid;
     const originalTitle = item.title;
     if (item.sourceUnavailable && !matchOrigin(item)) {
-        const recheck = await checkBiliSource(originalBvid);
+        let recheck;
+        try { recheck = await matchBeforeDeadline(deadline, () => checkBiliSource(originalBvid)); }
+        catch (error) { return { ok: false, error: String(error.message || error) }; }
         if (recheck.available) {
             await mutatePlaylistItem(playlistId, itemId, current => {
+                assertMatchDeadline(deadline);
                 if (current.bvid !== originalBvid) return false;
                 delete current.sourceUnavailable;
                 delete current.sourceUnavailableAt;
@@ -615,23 +744,30 @@ async function performSourceRematch(playlistId, itemId) {
             playlist = findPl(lists, playlistId);
             const index = playlist ? playlist.items.findIndex(entry => entry.id === itemId) : -1;
             if (index < 0) return { ok: false, error: '条目已发生变化' };
-            const played = await sendToOffscreen({ cmd: 'playIndex', index, playlistId });
+            if (!currentBackgroundPlayIntent(intent)) return { ok: true, cancelled: true, recovered: true };
+            const played = await sendToOffscreen({ cmd: 'playIndex', index, itemId, playlistId, _intentId: intent, playbackDeadline });
             return Object.assign({}, played, { recovered: true });
         }
         if (!recheck.unavailable) return { ok: false, error: '暂时无法确认原视频已失效，请稍后重试' };
     }
 
-    const ranked = await searchReplacementCandidates(item);
-    if (!ranked.length) return { ok: false, error: '没有找到足够相似的替代源' };
+    const searchItem = Object.assign({}, item, { matchHistory: extendedMatchHistory(item, originalBvid) });
     let lastError = null;
-    for (const entry of ranked) {
+    for (let attempt = 0; attempt < CHART_MANUAL_RETRY_LIMIT; attempt++) {
+        if (Date.now() >= deadline) { lastError = matchTimeoutError(); break; }
+        let entry = null;
         try {
-            let resolved = await resolveCid(entry.candidate.bvid, 1);
+            const ranked = await matchBeforeDeadline(deadline, () => searchReplacementCandidates(searchItem));
+            if (!ranked.length) break;
+            entry = ranked[0];
+            let resolved = await matchBeforeDeadline(deadline, () => resolveCid(entry.candidate.bvid, 1));
             resolved = replacementResolvedPage(item, resolved);
             if (!resolved.cid) throw new Error('候选视频没有可播放的分P');
-            await getAudioUrls(entry.candidate.bvid, resolved.cid);
+            const urls = await matchBeforeDeadline(deadline, () => getAudioUrls(entry.candidate.bvid, resolved.cid));
+            await verifyCandidateMedia(urls, deadline);
             const replacement = resolvedItemFields(resolved, entry.candidate.bvid, resolved.page && resolved.page.page || 1, entry.candidate);
             const changed = await mutatePlaylistItem(playlistId, itemId, current => {
+                assertMatchDeadline(deadline);
                 if (current.bvid !== originalBvid || !canRematchSource(current)) return false;
                 const title = current.title || originalTitle;
                 const target = sourceMatchTarget(current);
@@ -659,10 +795,13 @@ async function performSourceRematch(playlistId, itemId) {
             playlist = findPl(lists, playlistId);
             const index = playlist ? playlist.items.findIndex(current => current.id === itemId) : -1;
             if (index < 0) return { ok: false, error: '条目已发生变化' };
-            const played = await sendToOffscreen({ cmd: 'playIndex', index, playlistId });
+            if (!currentBackgroundPlayIntent(intent)) return { ok: true, cancelled: true, replaced: true, bvid: replacement.bvid };
+            const played = await sendToOffscreen({ cmd: 'playIndex', index, itemId, playlistId, _intentId: intent, playbackDeadline });
             return Object.assign({}, played, { replaced: true, bvid: replacement.bvid });
         } catch (error) {
             lastError = error;
+            if (!entry || isTransientMatchError(error) || Number(error.status) === 412) break;
+            searchItem.matchHistory = extendedMatchHistory(searchItem, entry.candidate.bvid);
             BPLLog.warn('repair', '替代候选不可播放[' + entry.candidate.bvid + ']：' + String(error && error.message || error));
         }
     }
@@ -866,6 +1005,7 @@ function restorePlaylistItem(raw) {
         item.matchTargetArtist = String(item.matchTargetArtist || '').trim();
         item.matchTargetDuration = Number(item.matchTargetDuration) || 0;
     }
+    resetMatchingState(item);
     item.matchHistory = normalizedMatchHistory(item);
     if (!item.matchHistory.length) delete item.matchHistory;
     if (!item.bvid) {
@@ -949,6 +1089,7 @@ async function getAudioUrls(bvid, cid) {
         const msg = (jDash && jDash.message) || (jMp4 && jMp4.message);
         BPLLog.error('bg', 'getAudioUrls[' + bvid + '/' + cid + '] 未获取到公开音频流：' + (msg || '未知'));
         const error = new Error('未获取到公开音频流' + (msg ? '：' + msg : '（接口未返回可用音频或该视频无音频）'));
+        if (isTransientMatchError(dashError) || isTransientMatchError(mp4Error)) error.transient = true;
         const responses = [jDash, jMp4].filter(Boolean);
         if (responses.length === 2 && responses.every(isDefinitiveUnavailableResponse)) error.sourceUnavailable = true;
         throw error;
@@ -1008,6 +1149,7 @@ async function repairResolvedItem(p, resolved) {
 
 async function migrate() {
     return await withPlaylistMutation(async () => {
+        return await withPlayerStateMutation(async () => {
         const r = await chrome.storage.local.get(['bpl_schema_version', 'bpl_playlists', 'bpl_list', 'bpl_state', 'bpl_active', 'bpl_position']);
         let lists = (r.bpl_playlists && r.bpl_playlists.length) ? r.bpl_playlists : null;
         let activeId = r.bpl_active || null;
@@ -1047,6 +1189,7 @@ async function migrate() {
             bpl_state: st
         });
         if (legacyList) await chrome.storage.local.remove('bpl_list');
+        });
     });
 }
 
@@ -1076,10 +1219,14 @@ let offscreenBroken = false;   // 测出上下文整体失效（Extension contex
 let lastRecreateAt = 0;        // 上次重建时刻：冷却闸，防止“损坏→重建→仍损坏”退化成新一轮踩踏
 const RECREATE_COOLDOWN_MS = 10000;
 const PORT_ACK_TIMEOUT_MS = 1200;
-const LONG_CMD_TIMEOUT_MS = 28000;
+// Matching (45s), source resolution (35s), media startup (25s), plus IPC margin.
+const LONG_CMD_TIMEOUT_MS = 110000;
 const FAST_CMD_TIMEOUT_MS = 7000;
 const LONG_PLAYER_CMDS = new Set(['playIndex', 'next', 'prev', 'toggle']);
-function commandTimeout(cmd) { return LONG_PLAYER_CMDS.has(cmd) ? LONG_CMD_TIMEOUT_MS : FAST_CMD_TIMEOUT_MS; }
+function commandTimeout(cmd) {
+    if (cmd === 'probeAudio') return MEDIA_PROBE_TIMEOUT_MS + 3000;
+    return LONG_PLAYER_CMDS.has(cmd) ? LONG_CMD_TIMEOUT_MS : FAST_CMD_TIMEOUT_MS;
+}
 function nextRequestId() {
     requestSeq = (requestSeq + 1) % 1000000;
     return Date.now().toString(36) + '-' + requestSeq.toString(36) + '-' + Math.random().toString(36).slice(2, 8);
@@ -1089,10 +1236,20 @@ async function hasOffscreen() {
     if (chrome.offscreen.hasDocument) {
         try { return await chrome.offscreen.hasDocument(); } catch (e) {}
     }
-    try {
-        const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
-        return !!(ctxs && ctxs.length);
-    } catch (e) { return false; }
+    if (typeof chrome.runtime.getContexts === 'function') {
+        try {
+            const ctxs = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+            return !!(ctxs && ctxs.length);
+        } catch (_) {}
+    }
+    // Chrome 109–115 has offscreen but no runtime.getContexts API.
+    if (typeof clients !== 'undefined' && typeof clients.matchAll === 'function') {
+        try {
+            const url = chrome.runtime.getURL(OFFSCREEN_PATH);
+            return (await clients.matchAll({ type: 'window', includeUncontrolled: true })).some(client => client.url === url);
+        } catch (_) {}
+    }
+    return false;
 }
 // 读取 bpl_boot 并翻译成一句确切死因——不再笼统报“静默”，而是区分到具体层级：
 //   loaded         offscreen.js 已加载（问题在下游命令通道）
@@ -1245,12 +1402,28 @@ function sendViaMessage(msg, timeout) {
 let offscreenFailCount = 0;
 function sendToOffscreen(msg) {
     const request = Object.assign({}, msg);
+    if (LONG_PLAYER_CMDS.has(request.cmd) || request.cmd === 'stop') {
+        if (request._intentId == null) request._intentId = beginBackgroundPlayIntent();
+        if (!currentBackgroundPlayIntent(request._intentId)) return Promise.resolve({ ok: true, cancelled: true });
+    }
     if (!request._requestId) request._requestId = nextRequestId();
-    return sendToOffscreenOnce(request, Date.now() + commandTimeout(request.cmd));
+    let deadline = Date.now() + commandTimeout(request.cmd);
+    if (Number.isFinite(request.playbackDeadline)) {
+        deadline = Math.min(deadline, request.playbackDeadline);
+        // Reserve time for the media result/state reply inside the original
+        // match RPC's 150s UI budget. Never restart a full playback budget.
+        request.deadline = deadline - 5000;
+        if (Date.now() >= request.deadline) {
+            return Promise.resolve({ ok: false, error: '匹配后的播放准备超时，请稍后重试', _transport: 'deadline' });
+        }
+        return matchBeforeDeadline(deadline, () => sendToOffscreenOnce(request, deadline))
+            .catch(error => ({ ok: false, error: error.name === 'TimeoutError'
+                ? '匹配后的播放准备超时，请稍后重试' : String(error.message || error), _transport: 'deadline' }));
+    }
+    return sendToOffscreenOnce(request, deadline);
 }
-// 识别“offscreen 上下文损坏”的错误签名：chrome.runtime 在、chrome.storage 未绑定（多见于升级
-// installed:update 瞬间建出的半残文档），或上下文整体失效。这类错误重建一次即可恢复，区别于
-// 业务错误（如播放列表为空，原样返回）与单纯无响应（走诊断路径）。
+// 对上下文失效或未捕获的 API 访问异常，允许一次有冷却期的重建尝试。
+// offscreen 没有 storage 本身是正常 API 限制；存储代理处理它，不会返回这里的错误。
 function isFatalContextError(r) {
     return !!(r && r.ok === false && r.error &&
         /Cannot read properties of undefined|Extension context invalidated|上下文失效|chrome\.storage/.test(r.error));
@@ -1269,9 +1442,11 @@ async function recreateOffscreen() {
 // 单次投递：优先 Port，只有未收到 ACK 才断开并走 sendMessage 兜底。
 async function trySendOnce(msg, deadline) {
     await ensureOffscreen();
+    if (msg._intentId != null && !currentBackgroundPlayIntent(msg._intentId)) return { ok: true, cancelled: true };
     let remaining = deadline - Date.now();
     if (remaining <= 0) return { ok: false, error: '音频操作超时', _transport: 'deadline' };
     if (await waitForPort(Math.min(2500, remaining))) {
+        if (msg._intentId != null && !currentBackgroundPlayIntent(msg._intentId)) return { ok: true, cancelled: true };
         remaining = deadline - Date.now();
         const attemptedPort = offscreenPort;
         const outcome = await sendViaPort(msg, remaining);
@@ -1286,6 +1461,7 @@ async function trySendOnce(msg, deadline) {
     }
     remaining = deadline - Date.now();
     if (remaining <= 0) return { ok: false, error: '音频模块通信超时', _transport: 'no-response' };
+    if (msg._intentId != null && !currentBackgroundPlayIntent(msg._intentId)) return { ok: true, cancelled: true };
     const fallback = await sendViaMessage(msg, remaining);
     if (fallback.kind === 'result') return fallback.value;
     return { ok: false, error: '音频模块通信失败：offscreen 无响应', _transport: 'no-response' };
@@ -1410,10 +1586,8 @@ if (chrome.windows && chrome.windows.onRemoved && typeof chrome.windows.onRemove
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg) return;
     if (msg.bplPing === 'offscreen-nostorage') {
-        // offscreen 自报上下文无 chrome.storage。v2.2.4 起这不再是故障：offscreen 的所有存储读写
-        // 已经由 background 代理（见 handleBg 的 storageGet/storageSet），音频播放不受影响。
-        // 故仅记一条提示，不标记损坏、不重建（现场实锤重建出来的文档同样没有 chrome.storage）。
-        BPLLog.warn('bg', 'offscreen 环境无 chrome.storage：已启用经 background 的存储代理（不影响播放）');
+        // offscreen 的扩展 API 仅有 runtime，代理存储属于正常跨上下文通信。
+        BPLLog.info('bg', 'offscreen 已启用 background 存储代理');
         return;
     }
     if (msg.bplPing === 'offscreen-boot' || msg.bplPing === 'offscreen-ready') {
@@ -1430,14 +1604,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 const PLAYLIST_MUTATION_CMDS = new Set([
-    'add', 'addManualItem', 'remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'moveItem', 'clear',
+    'addManualItem', 'remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'moveItem', 'clear',
     'createPlaylist', 'renamePlaylist', 'deletePlaylist', 'importPlaylist', 'setActive'
 ]);
+
+async function importChartPlaylist(msg, importedId) {
+    const adapter = chartAdapter(String(msg.sourceId || ''));
+    if (!adapter || typeof adapter.fetchChart !== 'function') return { ok: false, error: '不支持的榜单来源' };
+    let chart;
+    try { chart = await adapter.fetchChart(String(msg.chartId || ''), chartFetch, { limit: msg.limit }); }
+    catch (error) {
+        const message = String(error && error.message || error || '榜单读取失败');
+        BPLLog.warn('chart', '榜单读取失败：' + message);
+        return { ok: false, error: message };
+    }
+    const items = (chart.items || []).map(song => chartPlaceholder(chart, song));
+    if (!items.length) return { ok: false, error: '榜单没有可导入的歌曲' };
+    return await withPlaylistMutation(async () => {
+        const lists = await getPlaylists();
+        const prior = importedId && findPl(lists, importedId);
+        if (prior) return { ok: true, playlistId: prior.id, count: prior.items.length };
+        const id = importedId || genId();
+        const name = String(msg.name || '').trim() || chart.sourceName + ' - ' + chart.chartName;
+        lists.push({ id, name: name.slice(0, 100), items, chartSource: chart.sourceId, chartId: chart.chartId, chartName: chart.chartName });
+        await savePlaylists(lists);
+        await setActiveId(id);
+        await broadcastData();
+        return { ok: true, playlistId: id, count: items.length };
+    });
+}
 
 async function handleBg(msg, sender, mutationLocked) {
     // offscreen 的 bgResolveAudio 发 {target:'bg', resolveAudio:{...}}（历史形状，不带 cmd 字段）。
     // 必须在 switch(msg.cmd) 之前拦截，否则落入 default→{ok:false}，offscreen 报“无候选”且 bg 侧毫无日志。
     if (msg.resolveAudio) return await handleResolveAudio(msg.resolveAudio);
+    // Destructive edits from stale interfaces must never be interpreted against
+    // whichever playlist happens to be active when the queued operation runs.
+    if (['remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'moveItem', 'clear'].includes(msg.cmd) &&
+        !msg.playlistId) return { ok: false, error: '缺少播放列表标识，请刷新页面后重试' };
     if (!mutationLocked && PLAYLIST_MUTATION_CMDS.has(msg.cmd)) {
         return await withPlaylistMutation(() => handleBg(msg, sender, true));
     }
@@ -1450,41 +1654,47 @@ async function handleBg(msg, sender, mutationLocked) {
             return await openChartPickerWindow();
         }
         case 'importChart': {
-            const adapter = chartAdapter(String(msg.sourceId || ''));
-            if (!adapter || typeof adapter.fetchChart !== 'function') return { ok: false, error: '不支持的榜单来源' };
-            let chart;
-            try { chart = await adapter.fetchChart(String(msg.chartId || ''), chartFetch, { limit: msg.limit }); }
-            catch (error) {
-                const message = String(error && error.message || error || '榜单读取失败');
-                BPLLog.warn('chart', '榜单读取失败：' + message);
-                return { ok: false, error: message };
+            const requestId = /^chart-[a-zA-Z0-9-]{8,80}$/.test(msg.requestId || '') ? msg.requestId : '';
+            const importedId = requestId ? 'import-' + requestId : null;
+            const prior = importedId && findPl(await getPlaylists(), importedId);
+            if (prior) return { ok: true, playlistId: prior.id, count: prior.items.length };
+            if (requestId && chartImportInflight.has(requestId)) return await chartImportInflight.get(requestId);
+            const task = importChartPlaylist(msg, importedId);
+            if (requestId) chartImportInflight.set(requestId, task);
+            try { return await task; }
+            finally { if (requestId) chartImportInflight.delete(requestId); }
+        }
+        case 'patchPlayerState': {
+            if (sender && sender.url && sender.url !== chrome.runtime.getURL(OFFSCREEN_PATH)) {
+                return { ok: false, error: '来源不受信任' };
             }
-            const items = (chart.items || []).map(song => chartPlaceholder(chart, song));
-            if (!items.length) return { ok: false, error: '榜单没有可导入的歌曲' };
+            return await patchPlayerState(msg.patch || {}, msg.context || msg.guard);
+        }
+        case 'playerIntentChanged': {
+            if (sender && sender.url && sender.url !== chrome.runtime.getURL(OFFSCREEN_PATH)) {
+                return { ok: false, error: '来源不受信任' };
+            }
+            beginBackgroundPlayIntent();
+            return { ok: true };
+        }
+        case 'recoverMatchTasks': {
             return await withPlaylistMutation(async () => {
                 const lists = await getPlaylists();
-                const id = genId();
-                const requestedName = String(msg.name || '').trim();
-                const defaultName = chart.sourceName + ' - ' + chart.chartName;
-                lists.push({
-                    id: id,
-                    name: (requestedName || defaultName).slice(0, 100),
-                    items: items,
-                    chartSource: chart.sourceId,
-                    chartId: chart.chartId,
-                    chartName: chart.chartName
-                });
-                await savePlaylists(lists);
-                await setActiveId(id);
-                await broadcastData();
-                return { ok: true, playlistId: id, count: items.length };
+                let changed = false;
+                for (const playlist of lists) for (const item of playlist.items) {
+                    if (!chartMatchInflight.has(chartItemKey(playlist.id, item.id))) {
+                        changed = resetMatchingState(item) || changed;
+                    }
+                }
+                if (changed) { await savePlaylists(lists); await broadcastData(); }
+                return { ok: true };
             });
         }
         case 'matchChartItem': {
             return await matchChartItem(String(msg.playlistId || ''), String(msg.itemId || ''), !!msg.manual, !!msg.verifyPlayable);
         }
         case 'matchManualItem': {
-            return await matchChartItem(String(msg.playlistId || ''), String(msg.itemId || ''), true);
+            return await matchChartItem(String(msg.playlistId || ''), String(msg.itemId || ''), true, true);
         }
         case 'playChartItem': {
             return await playChartItem(String(msg.playlistId || ''), String(msg.itemId || ''));
@@ -1497,33 +1707,29 @@ async function handleBg(msg, sender, mutationLocked) {
             try { return await collectionSummary(msg.bvid); }
             catch (e) {
                 if (!e || e.code !== 'NOT_COLLECTION') {
-                    BPLLog.warn('bg', 'getCollection[' + (msg.bvid || '') + '] 失败：' + String((e && e.message) || e));
+                    BPLLog.warn('bg', 'getCollection[' + msg.bvid + '] 失败：' + String((e && e.message) || e));
                 }
                 return { ok: false, notCollection: !!(e && e.code === 'NOT_COLLECTION'), error: String((e && e.message) || e) };
             }
         }
         case 'importCollection': {
+            const targetId = msg.targetPlaylistId || await getActiveId();
             let value;
             try { value = await loadCollection(msg.bvid); }
             catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+            let importItems = value.items;
+            if (msg.smartRename && globalThis.BPLRenamer && typeof globalThis.BPLRenamer.renameItems === 'function') {
+                try {
+                    const renameSource = value.items.map(item => Object.assign({}, item, {
+                        title: String(item.renameTitle || item.title || item.bvid)
+                    }));
+                    importItems = await globalThis.BPLRenamer.renameItems(renameSource, { prefix: String(msg.renamePrefix || '') });
+                } catch (error) {
+                    BPLLog.warn('bg', 'smart rename failed; using source titles: ' + String(error && error.message || error));
+                }
+            }
             return await withPlaylistMutation(async () => {
                 const lists = await ensureDefaultPlaylist();
-                const rawItems = value.items;
-                let importItems = rawItems;
-                if (msg.smartRename && globalThis.BPLRenamer && typeof globalThis.BPLRenamer.renameItems === 'function') {
-                    try {
-                        const renameSource = rawItems.map(item => Object.assign({}, item, {
-                            title: String(item.renameTitle || item.title || item.bvid)
-                        }));
-                        importItems = await globalThis.BPLRenamer.renameItems(renameSource, {
-                            prefix: String(msg.renamePrefix || '')
-                        });
-                    } catch (renameError) {
-                        BPLLog.warn('bg', 'smart rename failed; using source titles: ' + String((renameError && renameError.message) || renameError));
-                    }
-                }
-                // `target` is reserved for the runtime message route (`target: 'bg'`).
-                // Older direct callers used it for the import mode, so keep that shape compatible.
                 const importTarget = msg.importTarget || msg.mode || (msg.target === 'new' ? 'new' : 'current');
                 const preparedItems = normalizeImportedItems(importItems);
                 if (importTarget === 'new') {
@@ -1536,7 +1742,6 @@ async function handleBg(msg, sender, mutationLocked) {
                     await broadcastData();
                     return { ok: true, added: preparedItems.length, dup: 0, count: preparedItems.length, playlistId: id };
                 }
-                const targetId = msg.targetPlaylistId || await getActiveId();
                 const pl = findPl(lists, targetId);
                 if (!pl) return { ok: false, error: '目标播放列表不存在' };
                 const existing = new Set(pl.items.map(collectionItemKey));
@@ -1548,44 +1753,37 @@ async function handleBg(msg, sender, mutationLocked) {
                     pl.items.push(item);
                     added++;
                 }
-                if (added) {
-                    await savePlaylists(lists);
-                    await broadcastData();
-                }
-                return { ok: true, added: added, dup: dup, count: preparedItems.length, playlistId: pl.id };
+                if (added) { await savePlaylists(lists); await broadcastData(); }
+                return { ok: true, added, dup, count: preparedItems.length, playlistId: pl.id };
             });
         }
         case 'add': {
-            const lists = await ensureDefaultPlaylist();
-            let activeId = await getActiveId();
-            let pl = findPl(lists, activeId);
-            if (!pl) { pl = lists[0]; await setActiveId(pl.id); }
+            const activeId = msg.playlistId || await getActiveId();
             const bvid = msg.bvid || (msg.item && msg.item.bvid);
             if (!bvid) return { ok: false };
             const page = msg.page || (msg.item && msg.item.page) || 1;
-            const fallback = {
-                title: msg.fallbackTitle,
-                pic: msg.fallbackPic,
-                owner: msg.fallbackOwner,
-                duration: msg.fallbackDuration
-            };
+            const fallback = { title: msg.fallbackTitle, pic: msg.fallbackPic, owner: msg.fallbackOwner, duration: msg.fallbackDuration };
             const it = Object.assign({}, (msg.item && msg.item.cid) ? msg.item : await buildItem(bvid, page, fallback));
             it.id = genId();
             it.pic = normUrl(it.pic);
-            if (pl.items.some(x => x.bvid === it.bvid && (x.cid || 0) === (it.cid || 0))) {
-                return { ok: true, dup: true };
-            }
-            pl.items.push(it);
-            await savePlaylists(lists);
-            await broadcastData();
-            return { ok: true, incomplete: !it.cid };
+            return await withPlaylistMutation(async () => {
+                const lists = await ensureDefaultPlaylist();
+                const pl = findPl(lists, activeId || await getActiveId());
+                if (!pl) return { ok: false, error: '目标播放列表不存在' };
+                if (pl.items.some(x => x.bvid === it.bvid && (x.cid || 0) === (it.cid || 0))) return { ok: true, dup: true };
+                pl.items.push(it);
+                await savePlaylists(lists);
+                await broadcastData();
+                return { ok: true, incomplete: !it.cid };
+            });
         }
         case 'addManualItem': {
             const title = String(msg.title || '').trim().slice(0, 200);
             if (!title) return { ok: false, error: '条目名称不能为空' };
             const lists = await ensureDefaultPlaylist();
-            let activeId = await getActiveId();
+            let activeId = msg.playlistId || await getActiveId();
             let pl = findPl(lists, activeId);
+            if (msg.playlistId && !pl) return { ok: false, error: '目标播放列表不存在' };
             if (!pl) { pl = lists[0]; await setActiveId(pl.id); }
             const item = {
                 id: genId(),
@@ -1649,9 +1847,7 @@ async function handleBg(msg, sender, mutationLocked) {
             return { ok: true };
         }
         case 'storageGet': {
-            // offscreen 存储代理（读）：现场实锤此 Edge 的 offscreen 文档 chrome.runtime 正常、
-            // chrome.storage 恒为 undefined（新建文档亦然）。offscreen 遂不再自持存储，读写经
-            // runtime 消息转发给 background（bg 的 chrome.storage 正常）。offscreen 只保留 <audio>。
+            // offscreen 经 runtime 请求存储，避免访问其上下文不开放的 storage API。
             const values = await chrome.storage.local.get(msg.keys);
             return { ok: true, values: values };
         }
@@ -1661,8 +1857,7 @@ async function handleBg(msg, sender, mutationLocked) {
             return { ok: true };
         }
         case 'logMerge': {
-            // 日志代理：无 chrome.storage 的上下文（即该 Edge 的 offscreen）经此把日志条目并入
-            // bg 侧的 bpl_log——否则 offscreen 的 [off] 日志会因写存储失败而整片静默，诊断失明。
+            // offscreen 通过代理把日志条目并入 background 侧的 bpl_log。
             const cur = (await chrome.storage.local.get('bpl_log')).bpl_log;
             let arr = Array.isArray(cur) ? cur : [];
             arr = arr.concat(Array.isArray(msg.entries) ? msg.entries : []);
@@ -1673,6 +1868,9 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'player': {
             const payload = Object.assign({}, msg.payload || {});
+            if (LONG_PLAYER_CMDS.has(payload.cmd) || payload.cmd === 'stop') {
+                payload._intentId = beginBackgroundPlayIntent();
+            }
             // 浏览中的播放列表(activeId)与正在播放的播放列表(state.playlistId)可以不同。
             // 显式点播必须携带用户点击的播放列表，否则 offscreen 会继续按旧播放列表解释同一个索引。
             if (payload.cmd === 'playIndex' && !payload.playlistId) payload.playlistId = await getActiveId();
@@ -1695,9 +1893,9 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'remove': {
             const lists = await getPlaylists();
-            const pl = findPl(lists, await getActiveId());
+            const pl = findPl(lists, msg.playlistId);
             if (!pl) return { ok: false };
-            const i = msg.index;
+            const i = pl.items.findIndex(item => item.id === msg.itemId);
             if (i >= 0 && i < pl.items.length) pl.items.splice(i, 1);
             await savePlaylists(lists);
             await reconcileStoredState(lists);
@@ -1706,10 +1904,23 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'renameItem': {
             const lists = await getPlaylists();
-            const pl = findPl(lists, await getActiveId());
-            if (pl && pl.items[msg.index]) {
+            const pl = findPl(lists, msg.playlistId);
+            const item = pl && pl.items.find(entry => entry.id === msg.itemId);
+            if (item) {
                 const t = String(msg.title || '').trim();
-                if (t) pl.items[msg.index].title = t.slice(0, 200);
+                if (t) {
+                    item.title = t.slice(0, 200);
+                    if (isManualItem(item) && !item.bvid && item.matchTargetTitle !== item.title) {
+                        item.matchTargetTitle = item.title;
+                        item.matchRevision = (Number(item.matchRevision) || 0) + 1;
+                        chartMatchInflight.delete(chartItemKey(pl.id, item.id));
+                        item.matchState = 'pending';
+                        item.matchAttempts = 0;
+                        delete item.matchStartedAt;
+                        delete item.matchError;
+                        delete item.matchFailedAt;
+                    }
+                }
                 await savePlaylists(lists);
                 await broadcastData();
             }
@@ -1717,9 +1928,9 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'batchRemove': {
             const lists = await getPlaylists();
-            const pl = findPl(lists, await getActiveId());
+            const pl = findPl(lists, msg.playlistId);
             if (!pl) return { ok: false };
-            const asc = [...new Set(msg.indices || [])].filter(i => i >= 0 && i < pl.items.length).sort((a, b) => a - b);
+            const asc = selectedItemIndices(pl, msg.itemIds);
             if (!asc.length) return { ok: true };
             for (let k = asc.length - 1; k >= 0; k--) pl.items.splice(asc[k], 1);
             await savePlaylists(lists);
@@ -1730,10 +1941,11 @@ async function handleBg(msg, sender, mutationLocked) {
         case 'batchCopy':
         case 'batchMove': {
             const lists = await getPlaylists();
-            const fromPl = findPl(lists, await getActiveId());
+            const fromPl = findPl(lists, msg.playlistId);
             const toPl = findPl(lists, msg.toId);
             if (!fromPl || !toPl) return { ok: false };
-            const asc = [...new Set(msg.indices || [])].filter(i => i >= 0 && i < fromPl.items.length).sort((a, b) => a - b);
+            if (fromPl.id === toPl.id) return { ok: false, error: '请选择不同的目标播放列表' };
+            const asc = selectedItemIndices(fromPl, msg.itemIds);
             if (!asc.length) return { ok: true };
             let added = 0;
             for (const i of asc) {
@@ -1741,6 +1953,7 @@ async function handleBg(msg, sender, mutationLocked) {
                 if (it && !toPl.items.some(x => samePlaylistContent(x, it))) {
                     const copy = Object.assign({}, it);
                     if (msg.cmd === 'batchCopy') copy.id = genId();
+                    resetMatchingState(copy);
                     toPl.items.push(copy);
                     added++;
                 }
@@ -1755,11 +1968,13 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'moveItem': {
             const lists = await getPlaylists();
-            const pl = findPl(lists, await getActiveId());
+            const pl = findPl(lists, msg.playlistId);
             if (!pl) return { ok: false };
-            const from = msg.from, to = msg.to;
+            const from = pl.items.findIndex(item => item.id === msg.itemId);
+            // Explicit null means append. Missing/stale IDs must not become an accidental move.
+            const to = msg.beforeItemId === null ? pl.items.length : pl.items.findIndex(item => item.id === msg.beforeItemId);
             if (from == null || to == null || from === to) return { ok: true };
-            if (from < 0 || from >= pl.items.length || to < 0 || to >= pl.items.length) return { ok: false };
+            if (from < 0 || from >= pl.items.length || to < 0 || to > pl.items.length) return { ok: false };
             const insertAt = from < to ? to - 1 : to;
             const [it] = pl.items.splice(from, 1);
             pl.items.splice(insertAt, 0, it);
@@ -1770,7 +1985,7 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'clear': {
             const lists = await getPlaylists();
-            const pl = findPl(lists, await getActiveId());
+            const pl = findPl(lists, msg.playlistId);
             if (!pl) return { ok: false };
             pl.items = [];
             await savePlaylists(lists);
@@ -1857,18 +2072,15 @@ chrome.commands.onCommand.addListener(async (command) => {
     }
 });
 
-// SW 生命周期日志：MV3 的 Service Worker 会被回收后重启，时间线上看到多次启动属正常；
-// 若“播放中 SW 重启且 offscreen 未重建”即可解释“播一会儿没声/状态丢”，故每次启动留痕。
+// SW 生命周期日志：回收后重启属正常，不意味着音频宿主也被销毁。
+// 保留启动记录，便于和 Port 重连、播放状态变化一同排查。
 function logSwStart(reason) {
     let v = '';
     try { v = (chrome.runtime.getManifest && chrome.runtime.getManifest().version) || ''; } catch (_) {}
     BPLLog.info('bg', 'Service Worker 启动(' + reason + ')' + (v ? ' v' + v : ''));
 }
-// 预热音频宿主：SW 启动即创建 offscreen，让 offscreen.js 在用户首次点播放之前就加载并连上 Port，
-// 彻底消除“首条命令撞上冷启动加载窗口”的竞态（踩踏的诱因之一）。失败不阻塞——惰性路径仍会补建。
-// 仅在 onStartup（浏览器启动，上下文稳定）与“非升级”的安装时预热。**升级（installed:update）时不预热**：
-// 那一刻旧上下文正在切换，此刻 createDocument 会建出 chrome.storage 未绑定的半残文档（现场实锤：
-// Port 能连但每条命令报 reading 'local'）。升级后改为等首条命令在稳定时刻惰性创建。
+// 浏览器启动和首次安装时预热，减少首次点播等待；失败仍由命令的惰性创建路径处理。
+// 升级时跳过预热，避免与旧扩展上下文的关闭重叠。此选择与 offscreen 的 storage API 限制无关。
 function prewarmOffscreen() { ensureOffscreen().catch(() => {}); }
 function runMigration(reason) {
     migrate()

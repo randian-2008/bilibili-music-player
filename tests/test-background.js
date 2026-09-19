@@ -47,19 +47,28 @@ function makeCtx(opts) {
     };
     let timerSeq = 0;
     const timers = new Map();
-    const fastSetTimeout = fn => {
-        const id = ++timerSeq;
-        const handle = setImmediate(() => {
-            if (!timers.has(id)) return;
+    let timerNow = 0, timerPump = null;
+    const pumpTimers = () => {
+        if (timerPump || !timers.size) return;
+        timerPump = setImmediate(() => {
+            timerPump = null;
+            const next = [...timers.entries()].sort((a, b) => a[1].due - b[1].due || a[0] - b[0])[0];
+            if (!next) return;
+            const [id, timer] = next;
             timers.delete(id);
-            fn();
+            timerNow = timer.due;
+            timer.fn();
+            // Promise continuations can cancel deadlines or schedule a shorter retry.
+            pumpTimers();
         });
-        timers.set(id, handle);
+    };
+    const fastSetTimeout = (fn, delay) => {
+        const id = ++timerSeq;
+        timers.set(id, { fn, due: timerNow + Math.max(0, Number(delay) || 0) });
+        pumpTimers();
         return id;
     };
     const fastClearTimeout = id => {
-        const handle = timers.get(id);
-        if (handle) clearImmediate(handle);
         timers.delete(id);
     };
     const sandbox = {
@@ -273,7 +282,7 @@ function makeCtx(opts) {
     }
     // 批量删除（删索引 1、3），当前播放索引 2 应左移 1 → 1
     ctx = seedBatch();
-    let r = await ctx.handleBg({ cmd: 'batchRemove', indices: [3, 1] }, null);
+    let r = await ctx.handleBg({ cmd: 'batchRemove', playlistId: 'plA', itemIds: ['item3', 'item1'] }, null);
     let pl = ctx.__store.bpl_playlists[0];
     ok(r.ok && pl.items.length === 3, 'batchRemove 删除后剩 3 首');
     ok(pl.items.map(x => x.bvid).join(',') === 'BV0,BV2,BV4', '剩余顺序正确 (' + pl.items.map(x => x.bvid).join(',') + ')');
@@ -282,20 +291,20 @@ function makeCtx(opts) {
 
     // 批量复制到 plB（不影响源）
     ctx = seedBatch();
-    r = await ctx.handleBg({ cmd: 'batchCopy', indices: [0, 2], toId: 'plB' }, null);
+    r = await ctx.handleBg({ cmd: 'batchCopy', playlistId: 'plA', itemIds: ['item0', 'item2'], toId: 'plB' }, null);
     let src = ctx.__store.bpl_playlists[0], dst = ctx.__store.bpl_playlists[1];
     ok(r.ok && src.items.length === 5 && dst.items.length === 2, 'batchCopy 源不变、目标+2');
     ok(dst.items.map(x => x.bvid).join(',') === 'BV0,BV2', '复制内容正确 (' + dst.items.map(x => x.bvid).join(',') + ')');
     ok(dst.items[0].id !== src.items[0].id && dst.items[1].id !== src.items[2].id, '复制歌曲生成新的稳定 ID');
 
     // 批量复制到 plB 两次 → 去重
-    r = await ctx.handleBg({ cmd: 'batchCopy', indices: [0, 2], toId: 'plB' }, null);
+    r = await ctx.handleBg({ cmd: 'batchCopy', playlistId: 'plA', itemIds: ['item0', 'item2'], toId: 'plB' }, null);
     dst = ctx.__store.bpl_playlists[1];
     ok(dst.items.length === 2, '重复复制去重 (' + dst.items.length + ')');
 
     // 批量移动到 plB（源删除）
     ctx = seedBatch();
-    r = await ctx.handleBg({ cmd: 'batchMove', indices: [1, 2], toId: 'plB' }, null);
+    r = await ctx.handleBg({ cmd: 'batchMove', playlistId: 'plA', itemIds: ['item1', 'item2'], toId: 'plB' }, null);
     src = ctx.__store.bpl_playlists[0]; dst = ctx.__store.bpl_playlists[1];
     ok(r.ok && src.items.length === 3 && dst.items.length === 2, 'batchMove 源-2、目标+2');
     ok(src.items.map(x => x.bvid).join(',') === 'BV0,BV3,BV4', '移动后源正确 (' + src.items.map(x => x.bvid).join(',') + ')');
@@ -303,21 +312,21 @@ function makeCtx(opts) {
         '移走正在播放歌曲后停止并清除断点');
 
     ctx = seedBatch();
-    r = await ctx.handleBg({ cmd: 'batchRemove', indices: [2] }, null);
+    r = await ctx.handleBg({ cmd: 'batchRemove', playlistId: 'plA', itemIds: ['item2'] }, null);
     ok(r.ok && ctx.__store.bpl_state.trackId === null && ctx.__store.bpl_state.playing === false,
         '删除正在播放歌曲后清除当前曲目身份');
 
     console.log('\n[background moveItem 拖拽排序]');
     // 向下拖：BV1 拖到 BV3 位置 → BV1 应落在 BV3 原位置
     ctx = seedBatch();
-    await ctx.handleBg({ cmd: 'moveItem', from: 1, to: 3 }, null);
+    await ctx.handleBg({ cmd: 'moveItem', playlistId: 'plA', itemId: 'item1', beforeItemId: 'item3' }, null);
     ok(ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') === 'BV0,BV2,BV1,BV3,BV4',
         '下拖落位准确 (' + ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') + ')');
     ok(ctx.__store.bpl_state.trackId === 'item2' && ctx.__store.bpl_state.index === 1,
         '下拖后按 trackId 保持当前歌曲');
     // 向上拖：BV3 拖到 BV1 位置 → BV3 应落在 BV1 原位置
     ctx = seedBatch();
-    await ctx.handleBg({ cmd: 'moveItem', from: 3, to: 1 }, null);
+    await ctx.handleBg({ cmd: 'moveItem', playlistId: 'plA', itemId: 'item3', beforeItemId: 'item1' }, null);
     ok(ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') === 'BV0,BV3,BV1,BV2,BV4',
         '上拖落位准确 (' + ctx.__store.bpl_playlists[0].items.map(x => x.bvid).join(',') + ')');
     ok(ctx.__store.bpl_state.trackId === 'item2' && ctx.__store.bpl_state.index === 3,
@@ -365,7 +374,7 @@ function makeCtx(opts) {
         chartPlaylist.items[0].sourceTitle === '晴天' && chartPlaylist.items[0].sourceArtist === '周杰伦' && chartPlaylist.items[0].sourceRank === 1,
         '占位条目只保存榜单排名、歌曲名和歌手，不混入 Apple 资源字段');
     ctx.__store.bpl_playlists.push({ id: 'chart-copy', name: '榜单副本', items: [] });
-    let chartCopy = await ctx.handleBg({ cmd: 'batchCopy', indices: [0, 1], toId: 'chart-copy' }, null);
+    let chartCopy = await ctx.handleBg({ cmd: 'batchCopy', playlistId: chartPlaylist.id, itemIds: chartPlaylist.items.map(item => item.id), toId: 'chart-copy' }, null);
     ok(chartCopy.ok && chartCopy.added === 2 && ctx.__store.bpl_playlists.find(playlist => playlist.id === 'chart-copy').items.length === 2,
         '未匹配条目可按榜单身份复制，不会因空 bvid 被错误判重');
     let chartMatch = await ctx.handleBg({ cmd: 'matchChartItem', playlistId: chartPlaylist.id, itemId: chartPlaylist.items[0].id }, null);
@@ -478,6 +487,12 @@ function makeCtx(opts) {
             return { code: 0, data: { result: [
                 { bvid: 'BV1MANUAL0001', title: '手动歌曲 官方MV', author: '音乐账号', pic: '//i0.hdslb.com/manual.jpg', duration: '3:40' }
             ] } };
+        }
+        if (String(url).includes('/x/web-interface/view') || String(url).includes('/x/player/pagelist')) {
+            return { code: 0, data: { cid: 1001, pages: [{ cid: 1001, page: 1, part: '手动歌曲' }] } };
+        }
+        if (String(url).includes('/x/player/playurl')) {
+            return { code: 0, data: { dash: { audio: [{ id: 30280, baseUrl: 'https://cdn/manual.m4s' }] } } };
         }
         return { code: 0, data: {} };
     }});
@@ -953,7 +968,7 @@ function makeCtx(opts) {
 
     console.log('\n[background 有界通信（分级预算 / ACK / 去重 requestId / 自愈）]');
     ctx = makeCtx();
-    ok(vm.runInContext('LONG_CMD_TIMEOUT_MS', ctx) === 28000 && vm.runInContext('FAST_CMD_TIMEOUT_MS', ctx) === 7000,
+    ok(vm.runInContext('LONG_CMD_TIMEOUT_MS', ctx) === 110000 && vm.runInContext('FAST_CMD_TIMEOUT_MS', ctx) === 7000,
         '播放取源与快速控制使用不同响应预算');
 
     // 未 ACK 的 Port 主动断开；sendMessage 复用同一 requestId，offscreen 可据此去重。

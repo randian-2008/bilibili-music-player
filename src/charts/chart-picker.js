@@ -12,6 +12,18 @@
     const statusEl = $('#sourceStatus');
     let sources = [];
     let busy = false;
+    let importAttempt = null;
+
+    function resetImportAttempt() { importAttempt = null; }
+    function importRequestId(options) {
+        const key = JSON.stringify(options);
+        if (!importAttempt || importAttempt.key !== key) {
+            const id = globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function'
+                ? globalThis.crypto.randomUUID() : Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+            importAttempt = { key, id: 'chart-' + id };
+        }
+        return importAttempt.id;
+    }
 
     const theme = globalThis.BPLTheme;
     if (theme) {
@@ -29,11 +41,18 @@
                 clearTimeout(timer);
                 resolve(value);
             };
-            const timer = setTimeout(() => finish({ ok: false, error: '后台响应超时' }), 20000);
+            // 超时只表示未收到结果，后台可能仍在创建列表。重试必须保留同一个请求 ID。
+            const timer = setTimeout(() => finish({ ok: false, uncertain: true, error: '后台响应超时，可重试确认导入结果' }),
+                cmd === 'importChart' ? 35000 : 20000);
             try {
-                chrome.runtime.sendMessage(Object.assign({ target: 'bg', cmd }, extra || {}), finish);
+                chrome.runtime.sendMessage(Object.assign({ target: 'bg', cmd }, extra || {}), result => {
+                    const lastError = chrome.runtime.lastError;
+                    finish(lastError || !result
+                        ? { ok: false, uncertain: true, error: lastError && lastError.message || '后台未返回结果，请重试' }
+                        : result);
+                });
             } catch (error) {
-                finish({ ok: false, error: String(error && error.message || error) });
+                finish({ ok: false, uncertain: true, error: String(error && error.message || error) });
             }
         });
     }
@@ -79,29 +98,33 @@
         $('#cancelBtn').disabled = value;
     }
 
-    sourceSelect.addEventListener('change', updateCategories);
-    categorySelect.addEventListener('change', updateCharts);
-    chartSelect.addEventListener('change', updateChartName);
+    sourceSelect.addEventListener('change', () => { resetImportAttempt(); updateCategories(); });
+    categorySelect.addEventListener('change', () => { resetImportAttempt(); updateCharts(); });
+    chartSelect.addEventListener('change', () => { resetImportAttempt(); updateChartName(); });
+    limitSelect.addEventListener('change', resetImportAttempt);
+    playlistName.addEventListener('input', resetImportAttempt);
     $('#cancelBtn').addEventListener('click', () => window.close());
     confirmBtn.addEventListener('click', async () => {
         const source = selectedSource();
         const chart = selectedChart();
-        if (!source || !chart) return;
+        if (busy || !source || !chart) return;
         errorEl.textContent = '';
         statusEl.textContent = '正在读取并创建播放列表';
         setBusy(true);
-        const result = await send('importChart', {
+        const options = {
             sourceId: source.id,
             chartId: chart.id,
             limit: Number(limitSelect.value) || 50,
             name: playlistName.value.trim()
-        });
+        };
+        const result = await send('importChart', Object.assign({ requestId: importRequestId(options) }, options));
         if (result && result.ok) {
             window.close();
             return;
         }
         errorEl.textContent = result && result.error ? result.error : '榜单导入失败，请重试';
         statusEl.textContent = '请选择要导入的榜单';
+        if (result && result.ok === false && !result.uncertain) resetImportAttempt();
         setBusy(false);
     });
 

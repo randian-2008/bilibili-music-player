@@ -41,7 +41,7 @@ rmdir /s /q "%TEMP_UPDATER%" >nul 2>&1
 
 if not "%UPDATE_EXIT%"=="0" (
     echo.
-    echo Update failed. The previous extension files should be unchanged.
+    echo Update failed. Check the error above for the installation and backup status.
 )
 pause
 exit /b %UPDATE_EXIT%

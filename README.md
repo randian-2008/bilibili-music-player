@@ -44,7 +44,7 @@ Offscreen Document：后台音频播放
 - `src/panel/sidepanel.*` 提供播放器、播放列表管理和导入导出界面，并通过 Content Script 与后台通信。
 - `src/background/background.js` 管理播放列表和持久化状态，读取第三方榜单，并调用 B站接口匹配视频和解析音频候选源。
 - `src/charts/` 提供 Apple Music、QQ 音乐、网易云音乐榜单适配器、B站候选评分和榜单选择窗口。
-- `src/player/offscreen.js` 持有唯一的 `<audio>` 实例，使播放不依赖当前标签页的生命周期。
+- `src/player/offscreen.js` 管理唯一的有声播放器，使播放不依赖当前标签页的生命周期；手动匹配使用独立的临时静音元素验证音源。
 - `chrome.storage.local` 保存用户数据；`declarativeNetRequest` 为必要的媒体请求设置来源请求头。
 
 播放命令优先通过长连接 Port 发送，并使用请求 ID 去重。网络请求、媒体加载和播放过程均设置了超时与有限重试；快速切歌时，旧的异步结果会被取消，避免过期音源覆盖当前歌曲。更完整的设计说明见 [docs/architecture.md](docs/architecture.md)。
@@ -60,10 +60,13 @@ Offscreen Document：后台音频播放
 3. Chrome 打开 `chrome://extensions/`，Edge 打开 `edge://extensions/`。
 4. 开启“开发者模式”，点击“加载已解压的扩展程序”。
 5. 选择包含 `manifest.json` 的解压目录。
+6. 在扩展详情中将站点访问权限设为“在所有网站上”，确保浮层和必要的跨站请求可用。
 
 浏览器不能直接安装 ZIP。安装后请勿随意移动或删除解压目录。使用同一扩展目录更新时，原有播放列表和设置会保留，用户修改过的 `src/rename/rules.json` 也会保留。
 
 > 升级提示：将 `update.bat` 放在扩展目录根部，双击即可检查并安装最新版；完成后请重启浏览器或重新加载扩展。
+
+通过 Git 克隆的源码目录请使用 Git 更新；发布包更新器不会替换源码检出目录。
 
 安装完成后，打开任意普通网页，点击右下角的音符按钮即可展开播放器。在 B站视频页面展开面板后，可以使用顶部的“＋加入”保存当前视频；检测到合集或多 P 时，还可以使用“全部加入”批量导入。完整操作说明见 [docs/user-guide.md](docs/user-guide.md)。
 
@@ -72,7 +75,7 @@ Offscreen Document：后台音频播放
 ## 已知限制
 
 - 完全关闭浏览器后，后台音频也会停止。
-- 部分高音质、大会员或地区受限内容取决于当前 B站账号权限。
+- 仅尝试匿名可访问的 B站音频，不读取登录 Cookie；会员、付费或地区受限内容可能无法播放，网页登录不会为扩展请求附加账号权限。
 - Chromium 可能回收长时间暂停的后台音频文档，再次播放时需要短暂重建并恢复进度。
 - 当前通过开发者模式加载，尚未发布到 Chrome Web Store 或 Edge 加载项商店。
 - Apple Music、QQ 音乐和网易云音乐榜单接口可能由平台调整；接口失效时需要更新对应适配器。
@@ -87,7 +90,7 @@ Offscreen Document：后台音频播放
 
 ## 项目信息
 
-- 当前版本：**v2.8.5**
+- 当前版本：**v2.8.6**
 - 开源许可：[GNU GPL v3.0 或更高版本](LICENSE)
 - 参与贡献：[CONTRIBUTING.md](CONTRIBUTING.md)
 - 安全问题：[SECURITY.md](SECURITY.md)

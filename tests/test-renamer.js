@@ -137,6 +137,86 @@ const renamer = context.BPLRenamer;
     result = await renamer.renameItems([{ title: '周杰伦 - Song' }], { rules: {}, prefix: '周杰伦' });
     ok(result[0].title === '周杰伦 - Song', '已有相同前缀时不会重复添加');
 
+    console.log('\n[renamer 受限正则与工作量边界]');
+    const examples = JSON.parse(fs.readFileSync(path.join(__dirname, '../src/rename/rules.json'), 'utf8'));
+    const enabled = examples.filters.map(rule => ({ ...rule, enabled: true }));
+    const normalized = renamer.normalizeRules({ filters: enabled });
+    ok(normalized.filters.length === enabled.length, 'rules.json 中每个示例启用后均能编译');
+    const exampleInputs = ['[Tag] Song', 'Song，这是一段足够长的说明文案', 'Artist FT. Singer'];
+    const exampleExpected = ['Song', 'Song', 'Artist feat Singer'];
+    ok(normalized.filters.every((rule, index) =>
+        rule.matcher.replace(exampleInputs[index], rule.replacement, { remaining: 25000 }) === exampleExpected[index]),
+        '三个现有示例实际执行结果正确');
+
+    const unsupported = [
+        '^(a|aa)+$', '^(?:a|aa)+$', '(?:a+)+$', '(?:a{1,8}){1,8}', '(a)',
+        '(?=a)a', '(?!b)a', '(?<=a)b', '\\1', '\\k<name>', '\\bword\\b',
+        'a+?', 'a**', 'a{241}', 'a{999999999999}', 'a{3,2}', '[a-z', '\\u{61}', '\\cA'
+    ];
+    ok(unsupported.every(pattern => !renamer.normalizeRules({ filters: [{ pattern }] }).filters.length),
+        '分组量词、捕获与回溯引用、断言及不支持语法均在执行前拒绝');
+    ok(!renamer.normalizeRules({ filters: [{ pattern: 'a', flags: 'gg' }] }).filters.length,
+        '重复 flags 被拒绝');
+    ok(!renamer.normalizeRules({ filters: [{ pattern: 'a{240}b{240}c{240}' }] }).filters.length,
+        '量词展开超过状态上限的规则被拒绝');
+
+    const equivalentCases = [
+        ['a*a*ab', '', 'aaaab', 'X'], ['a*a*a*b$', '', 'aaaa!', 'X'],
+        ['a?aa?', 'g', 'aaaaa', '<$&>'], ['(?:ab|a)b?', 'g', 'a abb ab', '[$&]'],
+        ['(?:a|ab)b?', '', 'abb', 'X'], ['a{0,3}a{1,2}b', '', 'aaaaab', 'X'],
+        ['(?:|a)', 'g', 'aba', '_'], ['[a-z]+', 'gi', 'AZ 中文 abc', '$$:$&'],
+        ['^a+$', 'gm', 'aa\nb\raa\u2028a', 'X'], ['\\u4e2d[文语]+', '', '中文文', 'X'],
+        ['\\x61\\d{1,3}', 'g', 'a12 a2345', 'N'], ['\\w+\\s+\\W', 'g', 'abc !', 'X'],
+        ['a$', '', 'a\n', 'X'], ['^', 'gm', 'ab\ncd', '>'], ['$', 'gm', 'ab\ncd', '<'],
+        ['.', 'g', '😀中', '$&'], ['a', '', 'bac', "$`/$&/$'/$$/$1"]
+    ];
+    ok(equivalentCases.every(([pattern, flags, input, replacement]) => {
+        const rule = renamer.normalizeRules({ filters: [{ pattern, flags, replace: replacement }] }).filters[0];
+        return rule && rule.matcher.replace(input, replacement, { remaining: 25000 }) === input.replace(new RegExp(pattern, flags), replacement);
+    }), '支持语法的贪婪、分支优先、空匹配、多行、字符集及替换标记与 JavaScript 行为一致');
+
+    // Fixed deterministic combinations exercise overlapping quantifiers without trusting wall-clock benchmarks.
+    const atoms = ['a*', 'a?', '[ab]+', 'b{0,3}', '(?:ab|a)', '\\s*'];
+    const inputs = ['', 'a', 'aaaaab', 'ababab!', 'aa bb', 'bbaa'];
+    let equivalent = true;
+    for (const first of atoms) for (const second of atoms) {
+        const pattern = first + second + 'b?';
+        const rule = renamer.normalizeRules({ filters: [{ pattern, flags: 'g' }] }).filters[0];
+        for (const input of inputs) {
+            if (rule.matcher.replace(input, '<$&>', { remaining: 25000 }) !== input.replace(new RegExp(pattern, 'g'), '<$&>')) equivalent = false;
+        }
+    }
+    ok(equivalent, '216 组短字符串交叉验证覆盖重叠量词与分支组合');
+
+    context.adversarialRules = { filters: [
+        { scope: 'title', pattern: '^(a|aa)+$', replace: '' },
+        { scope: 'title', pattern: '^a*a*a*a*a*a*a*a*a*a*b$', replace: '' },
+        { scope: 'title', pattern: '^' + 'a?'.repeat(100) + 'b$', replace: '' }
+    ] };
+    context.adversarialTitle = 'a'.repeat(239) + '!';
+    // VM timeout ensures a future accidental native-regex regression fails this test instead of hanging the suite.
+    vm.runInContext('globalThis.adversarialResult = BPLRenamer.renameItems([{ title: adversarialTitle }], { rules: adversarialRules });', context, { timeout: 1000 });
+    result = await context.adversarialResult;
+    ok(result[0].title === context.adversarialTitle, '指数/多项式回溯形状不会阻塞，无法匹配时保留默认结果');
+
+    const expensive = renamer.normalizeRules({ filters: [{ pattern: '^a{0,120}a{0,120}b$' }] }).filters[0];
+    const tinyBudget = { remaining: 20 };
+    let exhausted = false;
+    try { expensive.matcher.replace('a'.repeat(200) + '!', '', tinyBudget); }
+    catch (error) { exhausted = /work limit/.test(error.message); }
+    ok(exhausted && tinyBudget.remaining < 0, '匹配器执行步数达到预算会立即中止');
+
+    const growthRules = { filters: Array.from({ length: 32 }, () => ({
+        scope: 'title', pattern: '.', flags: 'g', replace: 'Z'.repeat(200)
+    })) };
+    context.growthRules = growthRules;
+    vm.runInContext('globalThis.growthResult = BPLRenamer.renameItems([{ title: "Song" }], { rules: growthRules });', context, { timeout: 1000 });
+    result = await context.growthResult;
+    ok(result[0].title.length === 240, '连续替换不能使中间标题指数膨胀，输出限制为 240 个字符');
+    const growth = renamer.normalizeRules({ filters: [{ pattern: '(?:)', flags: 'g', replace: "$`$&$'" }] }).filters[0];
+    ok(growth.matcher.replace('x'.repeat(240), growth.replacement, { remaining: 25000 }).length === 240,
+        '零宽全局匹配与上下文替换标记同样受到长度限制');
+
     console.log('\n=================');
     console.log('通过: ' + pass + '  失败: ' + fail);
     process.exit(fail > 0 ? 1 : 0);

@@ -25,3 +25,17 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: Run syntax checks and tests
         run: npm test
+
+  windows-update:
+    name: Windows package and updater
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Test package and update transactions
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/test-update.ps1

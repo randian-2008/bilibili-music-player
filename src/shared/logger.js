@@ -16,7 +16,7 @@
     var FLUSH_MS = 1000;    // 批量落盘间隔
 
     var hasChrome = (typeof chrome !== 'undefined') && chrome && chrome.storage && chrome.storage.local;
-    // 无 chrome.storage 但有 runtime 的上下文（现场实锤：此 Edge 的 offscreen）改经 background 代理落盘：
+    // offscreen 只开放 runtime 扩展 API，日志经 background 代理落盘。
     // 把整批条目发给 bg 的 logMerge 并入 bpl_log。否则该上下文的日志会因写存储失败而整片静默。
     var hasRelay = !hasChrome && (typeof chrome !== 'undefined') && chrome && chrome.runtime && chrome.runtime.sendMessage;
     var pending = [];       // 尚未落盘的条目

@@ -1,9 +1,14 @@
 param(
     [Parameter(Mandatory = $true)]
-    [string]$InstallRoot
+    [string]$InstallRoot,
+    [switch]$ValidateOnly
 )
 
 $ErrorActionPreference = 'Stop'
+# Resolve built-in modules against the executing PowerShell, not an inherited
+# PowerShell 7 module path (for example when launched via npm).
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Utility/Microsoft.PowerShell.Utility.psd1') -Force
+Import-Module (Join-Path $PSHOME 'Modules/Microsoft.PowerShell.Archive/Microsoft.PowerShell.Archive.psd1') -Force
 
 $Repository = 'randian-2008/bilibili-music-player'
 $ProjectName = 'bilibili-music-player'
@@ -14,8 +19,13 @@ $PreserveRelativePaths = @(
 
 function Get-NormalizedPath([string]$Path) {
     # cmd.exe can leave a trailing quote when a quoted Windows path ends in a backslash.
-    $cleanPath = ([string]$Path).Trim().Trim('"').TrimEnd('\', '/')
-    return [IO.Path]::GetFullPath($cleanPath)
+    $cleanPath = ([string]$Path).Trim().Trim('"')
+    if ([string]::IsNullOrWhiteSpace($cleanPath)) { throw 'The installation path is empty.' }
+    $fullPath = [IO.Path]::GetFullPath($cleanPath)
+    if ($fullPath.TrimEnd('\', '/') -eq [IO.Path]::GetPathRoot($fullPath).TrimEnd('\', '/')) {
+        throw 'A drive root cannot be used as an extension installation directory.'
+    }
+    return $fullPath.TrimEnd('\', '/')
 }
 
 function Read-Manifest([string]$Path) {
@@ -38,6 +48,9 @@ function Get-ReleaseAsset($Release, [string]$Pattern) {
 }
 
 function Assert-ProjectRoot([string]$Root) {
+    if (Test-Path -LiteralPath (Join-Path $Root '.git')) {
+        throw 'This is a Git source checkout. Update it with Git; the release updater will not replace source files.'
+    }
     $manifest = Read-Manifest (Join-Path $Root 'manifest.json')
     if ($manifest.manifest_version -ne 3 -or
         -not $manifest.background -or
@@ -50,6 +63,65 @@ function Assert-ProjectRoot([string]$Root) {
     return $manifest
 }
 
+function Assert-PackageFiles([string]$Root, $Manifest) {
+    # Keep this validator in the standalone updater: update.bat copies only this script.
+    $queue = [Collections.Generic.Queue[string]]::new()
+    foreach ($path in @('update.bat', 'scripts/update.ps1', 'src/player/offscreen.html',
+        'src/panel/sidepanel.html', 'src/charts/chart-picker.html', 'src/rename/rules.json',
+        $Manifest.background.service_worker, $Manifest.action.default_popup, $Manifest.options_page,
+        $Manifest.options_ui.page)) {
+        if ($path) { $queue.Enqueue($path) }
+    }
+    foreach ($script in $Manifest.content_scripts) {
+        foreach ($path in @($script.js) + @($script.css)) { if ($path) { $queue.Enqueue($path) } }
+    }
+    foreach ($icon in $Manifest.icons.PSObject.Properties) { $queue.Enqueue($icon.Value) }
+    foreach ($rule in $Manifest.declarative_net_request.rule_resources) { $queue.Enqueue($rule.path) }
+    foreach ($resources in $Manifest.web_accessible_resources) {
+        foreach ($path in $resources.resources) {
+            if ($path -notmatch '[*?]') { $queue.Enqueue($path) }
+        }
+    }
+    $seen = @{}
+    $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    while ($queue.Count -gt 0) {
+        $relative = $queue.Dequeue()
+        $file = if ([IO.Path]::IsPathRooted($relative)) { [IO.Path]::GetFullPath($relative) }
+            else { [IO.Path]::GetFullPath((Join-Path $Root $relative)) }
+        if (-not $file.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Package resource escapes its directory: $relative"
+        }
+        if ($seen.ContainsKey($file)) { continue }
+        $seen[$file] = $true
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "The package is incomplete: $relative" }
+        $extension = [IO.Path]::GetExtension($file)
+        if ($extension -notin @('.html', '.js', '.css')) { continue }
+        $text = Get-Content -LiteralPath $file -Raw -Encoding UTF8
+        $references = @()
+        if ($extension -eq '.html') {
+            $references += [regex]::Matches($text, '(?i)\b(?:src|href)\s*=\s*["'']([^"'']+)["'']') |
+                ForEach-Object { $_.Groups[1].Value }
+        } elseif ($extension -eq '.js') {
+            foreach ($call in [regex]::Matches($text, '\bimportScripts\s*\(([^)]*)\)')) {
+                $references += [regex]::Matches($call.Groups[1].Value, '["'']([^"'']+)["'']') |
+                    ForEach-Object { $_.Groups[1].Value }
+            }
+            foreach ($call in [regex]::Matches($text, '\bgetURL\s*\(\s*["'']([^"'']+)["'']\s*\)')) {
+                $queue.Enqueue($call.Groups[1].Value)
+            }
+        } elseif ($extension -eq '.css') {
+            $references += [regex]::Matches($text, '(?i)url\(\s*["'']?([^\s)"'']+)["'']?\s*\)') |
+                ForEach-Object { $_.Groups[1].Value }
+        }
+        foreach ($reference in $references) {
+            if ($reference -match '^(?:[a-z][a-z0-9+.-]*:|//|#)' -or $reference -match '[<>]') { continue }
+            $local = ($reference -split '[?#]', 2)[0]
+            if ($local.StartsWith('/')) { $queue.Enqueue($local.TrimStart('/')) }
+            else { $queue.Enqueue((Join-Path (Split-Path -Parent $file) $local)) }
+        }
+    }
+}
+
 function Get-Checksum([string]$ChecksumText) {
     $match = [regex]::Match($ChecksumText, '(?im)\b([0-9a-f]{64})\b')
     if (-not $match.Success) { throw 'The SHA-256 file does not contain a valid checksum.' }
@@ -57,13 +129,27 @@ function Get-Checksum([string]$ChecksumText) {
 }
 
 $root = Get-NormalizedPath $InstallRoot
+$pathToCheck = $root
+while ($pathToCheck) {
+    if ((Test-Path -LiteralPath $pathToCheck) -and
+        ((Get-Item -LiteralPath $pathToCheck -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "The installation path must not pass through a junction or symbolic link: $pathToCheck"
+    }
+    $pathToCheck = Split-Path -Parent $pathToCheck
+}
 $currentManifest = Assert-ProjectRoot $root
+if ($ValidateOnly) {
+    Assert-PackageFiles $root $currentManifest
+    return
+}
 $currentVersion = Get-Version $currentManifest.version
 $parent = Split-Path -Parent $root
 $workRoot = Join-Path $env:TEMP ("bpl-update-" + [guid]::NewGuid().ToString('N'))
 $stagingRoot = Join-Path $parent ('.bpl-staging-' + [guid]::NewGuid().ToString('N'))
 $backupRoot = Join-Path $parent ('.bpl-backup-' + [guid]::NewGuid().ToString('N'))
-$swapped = $false
+$oldMoved = $false
+$committed = $false
+$rollbackFailed = $false
 $operation = 'starting update'
 
 try {
@@ -128,11 +214,9 @@ try {
         Write-Host ("The downloaded package is already installed: v{0}" -f $currentManifest.version)
         exit 0
     }
-    foreach ($required in @('update.bat', 'scripts\update.ps1', 'src\rename\renamer.js')) {
-        if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $required) -PathType Leaf)) {
-            throw "The package is incomplete: $required"
-        }
-    }
+    if ($newVersion -ne $releaseVersion) { throw 'The package version does not match its release filename.' }
+    $operation = 'validating the package files'
+    Assert-PackageFiles $packageRoot $newManifest
 
     $operation = 'preserving user rules'
     $preservedRoot = Join-Path $workRoot 'preserved'
@@ -160,29 +244,38 @@ try {
     $operation = 'installing the new files'
     Write-Host ("Installing v{0}..." -f $newManifest.version)
     Move-Item -LiteralPath $root -Destination $backupRoot
+    $oldMoved = $true
     Move-Item -LiteralPath $stagingRoot -Destination $root
-    $swapped = $true
 
     $operation = 'validating the installed files'
     $installedManifest = Assert-ProjectRoot $root
     if ((Get-Version $installedManifest.version) -ne $newVersion) {
         throw 'The installed package version did not pass validation.'
     }
+    Assert-PackageFiles $root $installedManifest
+    $committed = $true
 
     $operation = 'cleaning the temporary backup'
-    Remove-Item -LiteralPath $backupRoot -Recurse -Force
+    try { Remove-Item -LiteralPath $backupRoot -Recurse -Force }
+    catch { Write-Warning "The update is installed, but its old backup could not be fully removed: $backupRoot. $($_.Exception.Message)" }
     Write-Host ''
     Write-Host ("Update complete: v{0} -> v{1}" -f $currentManifest.version, $installedManifest.version)
     Write-Host 'Please restart the browser or reload the extension from the extensions page.'
 } catch {
-    if ($swapped -and (Test-Path -LiteralPath $root)) {
-        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    if (Test-Path -LiteralPath $backupRoot) {
-        Move-Item -LiteralPath $backupRoot -Destination $root -Force -ErrorAction SilentlyContinue
-    }
+    $failure = $_
     $message = [string]$_.Exception.Message
-    $isPermissionError = $_.Exception -is [UnauthorizedAccessException] -or
+    if ($oldMoved -and -not $committed) {
+        try {
+            if (-not (Test-Path -LiteralPath $backupRoot -PathType Container)) { throw 'The original backup is missing.' }
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
+            Move-Item -LiteralPath $backupRoot -Destination $root
+            Write-Host 'The original installation was restored.'
+        } catch {
+            $rollbackFailed = $true
+            $message += " Rollback failed: $($_.Exception.Message). Do not reload the extension until the backup at $backupRoot has been restored to $root."
+        }
+    }
+    $isPermissionError = $failure.Exception -is [UnauthorizedAccessException] -or
         $message -match '(?i)access is denied|unauthorized|拒绝访问'
     $isNetworkOperation = $operation -match '(?i)GitHub|downloading|checksum'
     if ($isPermissionError) {
@@ -194,7 +287,7 @@ try {
     }
     exit 1
 } finally {
-    if (Test-Path -LiteralPath $stagingRoot) {
+    if (-not $rollbackFailed -and (Test-Path -LiteralPath $stagingRoot)) {
         Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     if (Test-Path -LiteralPath $workRoot) {

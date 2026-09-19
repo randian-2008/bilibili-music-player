@@ -1,6 +1,6 @@
 {
   "name": "bilibili-music-player",
-  "version": "2.8.6",
+  "version": "2.8.7",
   "private": true,
   "license": "GPL-3.0-or-later",
   "description": "Manifest V3 Bilibili background audio player with playlists.",
@@ -12,12 +12,13 @@
     "test:offscreen": "node tests/test-offscreen.js && node tests/test-playback-boundaries.js",
     "test:background": "node tests/test-background.js && node tests/test-data-boundaries.js",
     "test:content": "node tests/test-content.js && node tests/test-panel-boundaries.js",
+    "test:panel": "node tests/test-panel-dialogs.js",
     "test:update": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/test-update.ps1",
     "test:renamer": "node tests/test-renamer.js",
     "test:logger": "node tests/test-logger.js",
     "test:theme": "node tests/test-theme.js",
     "test:charts": "node tests/test-charts.js",
-    "test": "npm run check && npm run test:charts && npm run test:renamer && npm run test:offscreen && npm run test:background && npm run test:content && npm run test:logger && npm run test:theme",
+    "test": "npm run check && npm run test:charts && npm run test:renamer && npm run test:offscreen && npm run test:background && npm run test:content && npm run test:panel && npm run test:logger && npm run test:theme",
     "package:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package.ps1"
   }
 }

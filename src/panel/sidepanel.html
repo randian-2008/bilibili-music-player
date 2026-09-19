@@ -73,6 +73,25 @@
     </div>
     <div id="selMenu" class="sel-menu hidden"></div>
 
+    <dialog id="actionDialog" class="manual-dialog action-dialog" aria-labelledby="actionDialogTitle" aria-describedby="actionDialogMessage">
+        <form id="actionDialogForm" novalidate>
+            <h2 id="actionDialogTitle"></h2>
+            <div class="dialog-body">
+                <p id="actionDialogMessage"></p>
+                <ol id="actionDialogItems" hidden></ol>
+                <div id="actionDialogInputRow" hidden>
+                    <label for="actionDialogInput">播放列表名称</label>
+                    <input id="actionDialogInput" type="text" maxlength="100" autocomplete="off">
+                </div>
+            </div>
+            <p id="actionDialogError" role="alert" hidden></p>
+            <div class="manual-dialog-actions">
+                <button type="button" id="actionDialogCancel">取消</button>
+                <button type="submit" id="actionDialogConfirm">确认</button>
+            </div>
+        </form>
+    </dialog>
+
     <dialog id="manualItemDialog" class="manual-dialog">
         <form method="dialog" id="manualItemForm">
             <h2>添加条目</h2>

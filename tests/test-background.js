@@ -282,7 +282,8 @@ function makeCtx(opts) {
     }
     // 批量删除（删索引 1、3），当前播放索引 2 应左移 1 → 1
     ctx = seedBatch();
-    let r = await ctx.handleBg({ cmd: 'batchRemove', playlistId: 'plA', itemIds: ['item3', 'item1'] }, null);
+    let r = await ctx.handleBg({ cmd: 'batchRemove', playlistId: 'plA', itemIds: ['item3', 'item1'],
+        confirmation: { playlistId: 'plA', name: 'A', items: [{ id: 'item3', title: 't3' }, { id: 'item1', title: 't1' }] } }, null);
     let pl = ctx.__store.bpl_playlists[0];
     ok(r.ok && pl.items.length === 3, 'batchRemove 删除后剩 3 首');
     ok(pl.items.map(x => x.bvid).join(',') === 'BV0,BV2,BV4', '剩余顺序正确 (' + pl.items.map(x => x.bvid).join(',') + ')');
@@ -312,7 +313,8 @@ function makeCtx(opts) {
         '移走正在播放歌曲后停止并清除断点');
 
     ctx = seedBatch();
-    r = await ctx.handleBg({ cmd: 'batchRemove', playlistId: 'plA', itemIds: ['item2'] }, null);
+    r = await ctx.handleBg({ cmd: 'batchRemove', playlistId: 'plA', itemIds: ['item2'],
+        confirmation: { playlistId: 'plA', name: 'A', items: [{ id: 'item2', title: 't2' }] } }, null);
     ok(r.ok && ctx.__store.bpl_state.trackId === null && ctx.__store.bpl_state.playing === false,
         '删除正在播放歌曲后清除当前曲目身份');
 

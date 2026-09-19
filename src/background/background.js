@@ -107,6 +107,22 @@ function selectedItemIndices(playlist, itemIds) {
     const ids = new Set(itemIds.filter(id => typeof id === 'string'));
     return playlist.items.map((item, index) => ids.has(item.id) ? index : -1).filter(index => index >= 0);
 }
+function deletionConfirmationMatches(playlist, confirmation, itemIds) {
+    if (!playlist || !confirmation || confirmation.playlistId !== playlist.id ||
+        confirmation.name !== String(playlist.name || '') || !Array.isArray(confirmation.items)) return false;
+    const ids = itemIds == null ? playlist.items.map(item => item.id) : itemIds;
+    if (!Array.isArray(ids) || new Set(ids).size !== ids.length || confirmation.items.length !== ids.length) return false;
+    const expected = new Map();
+    for (const item of confirmation.items) {
+        if (!item || typeof item.id !== 'string' || typeof item.title !== 'string' || expected.has(item.id)) return false;
+        expected.set(item.id, item.title);
+    }
+    const current = new Map(playlist.items.map(item => [item.id, item]));
+    return ids.every(id => current.has(id) && expected.has(id) && expected.get(id) === String(current.get(id).title || ''));
+}
+function deletionChanged() {
+    return { ok: false, staleConfirmation: true, error: '播放列表或待删除条目已变化，请取消后重新确认' };
+}
 function resetMatchingState(item) {
     if (item.matchState !== 'matching') return false;
     item.matchState = item.bvid ? 'matched' : 'pending';
@@ -1894,7 +1910,7 @@ async function handleBg(msg, sender, mutationLocked) {
         case 'remove': {
             const lists = await getPlaylists();
             const pl = findPl(lists, msg.playlistId);
-            if (!pl) return { ok: false };
+            if (!deletionConfirmationMatches(pl, msg.confirmation, [msg.itemId])) return deletionChanged();
             const i = pl.items.findIndex(item => item.id === msg.itemId);
             if (i >= 0 && i < pl.items.length) pl.items.splice(i, 1);
             await savePlaylists(lists);
@@ -1929,7 +1945,7 @@ async function handleBg(msg, sender, mutationLocked) {
         case 'batchRemove': {
             const lists = await getPlaylists();
             const pl = findPl(lists, msg.playlistId);
-            if (!pl) return { ok: false };
+            if (!Array.isArray(msg.itemIds) || !deletionConfirmationMatches(pl, msg.confirmation, msg.itemIds)) return deletionChanged();
             const asc = selectedItemIndices(pl, msg.itemIds);
             if (!asc.length) return { ok: true };
             for (let k = asc.length - 1; k >= 0; k--) pl.items.splice(asc[k], 1);
@@ -1986,7 +2002,7 @@ async function handleBg(msg, sender, mutationLocked) {
         case 'clear': {
             const lists = await getPlaylists();
             const pl = findPl(lists, msg.playlistId);
-            if (!pl) return { ok: false };
+            if (!deletionConfirmationMatches(pl, msg.confirmation)) return deletionChanged();
             pl.items = [];
             await savePlaylists(lists);
             await reconcileStoredState(lists);
@@ -2006,6 +2022,7 @@ async function handleBg(msg, sender, mutationLocked) {
         case 'renamePlaylist': {
             const lists = await getPlaylists();
             const pl = findPl(lists, msg.id);
+            if (!pl) return { ok: false, error: '该播放列表已不存在，请取消后重新选择' };
             if (pl && msg.name && String(msg.name).trim()) {
                 pl.name = String(msg.name).trim().slice(0, 100);
                 await savePlaylists(lists);
@@ -2016,7 +2033,7 @@ async function handleBg(msg, sender, mutationLocked) {
         case 'deletePlaylist': {
             const lists = await getPlaylists();
             const idx = lists.findIndex(p => p.id === msg.id);
-            if (idx < 0) return { ok: false };
+            if (!deletionConfirmationMatches(lists[idx], msg.confirmation)) return deletionChanged();
             lists.splice(idx, 1);
             await savePlaylists(lists);
             let activeId = await getActiveId();

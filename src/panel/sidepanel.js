@@ -507,7 +507,7 @@ function buildJson(pl) {
 }
 function exportAs(format) {
     const pl = activePlaylist();
-    if (!pl || !pl.items.length) { alert('当前播放列表是空的'); return; }
+    if (!pl || !pl.items.length) { showPanelNotice('无法导出', '当前播放列表是空的'); return; }
     const base = pl.name || '播放列表';
     if (format === 'txt') downloadText(base + '.txt', buildTxt(pl), 'text/plain;charset=utf-8');
     else if (format === 'md') downloadText(base + '.md', buildMd(pl), 'text/markdown;charset=utf-8');
@@ -527,17 +527,140 @@ function handleImportFile(f) {
                 name = data.name || playlist.name || '';
                 items = data.items;
             }
-            else { alert('不是有效的播放列表 JSON'); return; }
+            else { showPanelNotice('导入失败', '不是有效的播放列表 JSON'); return; }
             items = items.filter(x => x && typeof x === 'object' &&
                 (x.bvid || (x.chartSource && x.sourceTitle) ||
                     (x.matchOrigin === 'manual' && x.matchTargetTitle)));
-            if (!items.length) { alert('JSON 里没有有效条目'); return; }
-            send('importPlaylist', { name: name || f.name.replace(/\.json$/i, ''), playlist, items });
+            if (!items.length) { showPanelNotice('导入失败', 'JSON 里没有有效条目'); return; }
+            send('importPlaylist', { name: name || f.name.replace(/\.json$/i, ''), playlist, items }).then(result => {
+                if (!result || !result.ok) showPanelNotice('导入失败', result && result.error || '未收到导入结果，请检查播放列表后再试');
+            });
         } catch (err) {
-            alert('JSON 解析失败：' + err.message);
+            showPanelNotice('导入失败', 'JSON 解析失败：' + err.message);
         }
     };
+    reader.onerror = () => showPanelNotice('导入失败', '无法读取文件，请重新选择');
     reader.readAsText(f);
+}
+
+// HTML dialog stays inside this iframe and does not block the host webpage.
+const actionDialog = $('#actionDialog');
+const actionDialogForm = $('#actionDialogForm');
+const actionDialogInput = $('#actionDialogInput');
+const actionDialogCancel = $('#actionDialogCancel');
+const actionDialogConfirm = $('#actionDialogConfirm');
+let panelAction = null;
+function closePanelDialog() {
+    if (panelAction && !panelAction.busy) actionDialog.close();
+}
+function showPanelDialog(options) {
+    if (panelAction) return false;
+    panelAction = Object.assign({ busy: false, blocked: false, focus: document.activeElement }, options);
+    $('#actionDialogTitle').textContent = options.title;
+    $('#actionDialogMessage').textContent = options.message || '';
+    const items = $('#actionDialogItems');
+    items.replaceChildren();
+    for (const title of options.items || []) {
+        const li = document.createElement('li');
+        li.textContent = title || '未命名条目';
+        items.appendChild(li);
+    }
+    items.hidden = !items.childElementCount;
+    $('#actionDialogInputRow').hidden = !options.input;
+    actionDialogInput.disabled = !options.input;
+    actionDialogInput.value = options.value || '';
+    actionDialogInput.required = !!options.input;
+    $('#actionDialogError').hidden = true;
+    $('#actionDialogError').textContent = '';
+    actionDialogCancel.hidden = !!options.notice;
+    actionDialogCancel.disabled = false;
+    actionDialogConfirm.disabled = false;
+    actionDialogConfirm.textContent = options.confirmLabel || '确认';
+    actionDialogConfirm.classList.toggle('danger', !!options.danger);
+    actionDialog.showModal();
+    const focus = options.input ? actionDialogInput : options.notice ? actionDialogConfirm : actionDialogCancel;
+    focus.focus();
+    if (options.input) actionDialogInput.select();
+    return true;
+}
+function showPanelNotice(title, message) {
+    // A late file-read error must not replace an existing deletion confirmation.
+    if (!showPanelDialog({ title, message, notice: true })) toast(message);
+}
+actionDialogCancel.addEventListener('click', closePanelDialog);
+actionDialog.addEventListener('cancel', e => { e.preventDefault(); closePanelDialog(); });
+let actionBackdropDown = false;
+function outsideActionDialog(e) {
+    const rect = actionDialog.getBoundingClientRect();
+    return e.target === actionDialog && (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom);
+}
+actionDialog.addEventListener('pointerdown', e => { actionBackdropDown = outsideActionDialog(e); });
+actionDialog.addEventListener('click', e => {
+    if (actionBackdropDown && outsideActionDialog(e)) closePanelDialog();
+    actionBackdropDown = false;
+});
+actionDialog.addEventListener('close', () => {
+    const focus = panelAction && panelAction.focus;
+    panelAction = null;
+    actionBackdropDown = false;
+    if (focus && focus.isConnected) focus.focus();
+    else $('#plMenuBtn').focus();
+});
+actionDialogForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    const action = panelAction;
+    if (!action || action.busy || action.blocked) return;
+    const value = actionDialogInput.value.trim();
+    if (action.input && !value) {
+        $('#actionDialogError').textContent = '请输入播放列表名称';
+        $('#actionDialogError').hidden = false;
+        actionDialogInput.focus();
+        return;
+    }
+    if (!action.onConfirm) { closePanelDialog(); return; }
+    action.busy = true;
+    actionDialogConfirm.disabled = actionDialogCancel.disabled = true;
+    actionDialogInput.disabled = true;
+    let result;
+    try { result = await action.onConfirm(value); }
+    catch (error) { result = { ok: false, error: String(error.message || error) }; }
+    if (panelAction !== action) return;
+    action.busy = false;
+    if (result && result.ok) {
+        closePanelDialog();
+        if (action.onSuccess) action.onSuccess();
+        return;
+    }
+    // A timeout is not proof that deletion failed. Do not resubmit blindly.
+    action.blocked = !result || !!result.staleConfirmation;
+    actionDialogConfirm.disabled = action.blocked;
+    actionDialogCancel.disabled = false;
+    actionDialogInput.disabled = !action.input;
+    $('#actionDialogError').textContent = result && result.error || '未收到操作结果，请关闭后检查播放列表';
+    $('#actionDialogError').hidden = false;
+    if (action.blocked) actionDialogCancel.focus();
+});
+function confirmPlaylistDeletion(cmd, playlist, itemIds) {
+    if (!playlist) return;
+    const selectedIds = itemIds && new Set(itemIds);
+    const items = playlist.items.filter(item => !selectedIds || selectedIds.has(item.id))
+        .map(item => ({ id: item.id, title: String(item.title || '') }));
+    if (cmd !== 'deletePlaylist' && !items.length) return;
+    // Copy the exact names/IDs shown in the dialog. Background validates this
+    // snapshot under its mutation lock, including all items for clear/delete.
+    const confirmation = { playlistId: playlist.id, name: String(playlist.name || ''), items };
+    const name = confirmation.name || '未命名列表';
+    const message = cmd === 'batchRemove' ? '从「' + name + '」删除以下 ' + items.length + ' 个条目？'
+        : cmd === 'clear' ? '清空「' + name + '」中的全部 ' + items.length + ' 个条目？列表将保留。'
+        : '删除播放列表「' + name + '」及其中的 ' + items.length + ' 个条目？';
+    showPanelDialog({
+        title: cmd === 'batchRemove' ? '删除条目' : cmd === 'clear' ? '清空播放列表' : '删除播放列表',
+        message, items: items.map(item => item.title), danger: true,
+        confirmLabel: cmd === 'clear' ? '清空' : '删除',
+        onConfirm: () => send(cmd, { playlistId: confirmation.playlistId, id: confirmation.playlistId,
+            itemIds: items.map(item => item.id), confirmation }),
+        onSuccess: () => { if (selectionPlaylistId === confirmation.playlistId) exitSelMode(); refresh(); }
+    });
 }
 
 $('#plSelect').addEventListener('change', e => send('setActive', { id: e.target.value }));
@@ -620,8 +743,8 @@ menu.addEventListener('click', e => {
     const pl = activePlaylist();
     if (act === 'import') { fileInput.click(); return; }
     if (act === 'create') {
-        const name = prompt('新建播放列表，名称：', '新播放列表');
-        if (name != null && name.trim()) send('createPlaylist', { name: name.trim() });
+        showPanelDialog({ title: '新建播放列表', input: true, value: '新播放列表',
+            onConfirm: name => send('createPlaylist', { name }) });
         return;
     }
     if (act === 'log') { openLog(true); return; }
@@ -629,8 +752,9 @@ menu.addEventListener('click', e => {
     if (act === 'log-clear') { chrome.storage.local.set({ bpl_log: [] }); logCache = []; renderLog(); return; }
     if (!pl) return;
     if (act === 'rename') {
-        const name = prompt('重命名播放列表：', pl.name);
-        if (name && name.trim()) send('renamePlaylist', { id: pl.id, name: name.trim() });
+        const playlistId = pl.id;
+        showPanelDialog({ title: '重命名播放列表', input: true, value: pl.name,
+            onConfirm: name => send('renamePlaylist', { id: playlistId, name }) });
     } else if (act === 'export-txt') {
         exportAs('txt');
     } else if (act === 'export-md') {
@@ -638,9 +762,9 @@ menu.addEventListener('click', e => {
     } else if (act === 'export-json') {
         exportAs('json');
     } else if (act === 'clear') {
-        if (pl.items.length && confirm('清空播放列表「' + pl.name + '」？')) send('clear', { playlistId: pl.id });
+        confirmPlaylistDeletion('clear', pl);
     } else if (act === 'delete') {
-        if (confirm('删除播放列表「' + pl.name + '」及其所有条目？')) send('deletePlaylist', { id: pl.id });
+        confirmPlaylistDeletion('deletePlaylist', pl);
     }
 });
 fileInput.addEventListener('change', () => {
@@ -1006,9 +1130,7 @@ $('#selCopyBtn').addEventListener('click', () => openSelMenu('copy'));
 $('#selDelBtn').addEventListener('click', () => {
     const itemIds = selItemIds(), playlistId = selectionPlaylistId;
     if (!itemIds.length) return;
-    if (confirm('删除选中的 ' + itemIds.length + ' 个条目？')) {
-        send('batchRemove', { playlistId, itemIds }).then(() => { exitSelMode(); refresh(); });
-    }
+    confirmPlaylistDeletion('batchRemove', playlists.find(playlist => playlist.id === playlistId), itemIds);
 });
 $('#selCancelBtn').addEventListener('click', exitSelMode);
 $('#selMenu').addEventListener('click', e => {

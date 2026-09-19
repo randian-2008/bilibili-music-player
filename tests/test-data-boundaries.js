@@ -82,9 +82,11 @@ async function manualRenameRace(oldFails) {
     result = await ctx.handleBg({ cmd: 'moveItem', playlistId: 'A', itemId: 'a1', beforeItemId: 'deleted' });
     check(!result.ok && ctx.__store.bpl_playlists[0].items.map(item => item.id).join() === 'a2,a1', '拖拽目标已删除时不改变顺序');
     ctx.__store.bpl_playlists[0].items.reverse();
-    await ctx.handleBg({ cmd: 'remove', playlistId: 'A', itemId: 'a1' });
+    await ctx.handleBg({ cmd: 'remove', playlistId: 'A', itemId: 'a1',
+        confirmation: { playlistId: 'A', name: 'A', items: [{ id: 'a1', title: 'Renamed' }] } });
     check(ctx.__store.bpl_playlists[0].items.map(item => item.id).join() === 'a2', '异步重排后仍删除指定 ID');
-    await ctx.handleBg({ cmd: 'clear', playlistId: 'A' });
+    await ctx.handleBg({ cmd: 'clear', playlistId: 'A',
+        confirmation: { playlistId: 'A', name: 'A', items: [{ id: 'a2', title: 'Beta' }] } });
     check(ctx.__store.bpl_playlists[0].items.length === 0 && ctx.__store.bpl_playlists[1].items.length === 1, '清空指定列表不受全局活动列表影响');
 
     result = await ctx.handleBg({ cmd: 'addManualItem', playlistId: 'A', title: 'old query' });

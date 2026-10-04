@@ -10,7 +10,7 @@ if (typeof BPLLog === 'undefined') {
 }
 
 const DEF_STATE = { playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' };
-const STORAGE_SCHEMA_VERSION = 1;
+const STORAGE_SCHEMA_VERSION = 2;
 
 const MODES = ['order', 'shuffle', 'one', 'loop', 'shuffleLoop'];
 const CHART_MATCH_STATES = ['pending', 'matching', 'matched', 'failed'];
@@ -63,14 +63,22 @@ function withPlaylistMutation(fn) {
 async function getPlaylists() {
     return (await chrome.storage.local.get('bpl_playlists')).bpl_playlists || [];
 }
-async function savePlaylists(p) { await chrome.storage.local.set({ bpl_playlists: p }); }
+async function savePlaylists(p) {
+    for (const playlist of p) {
+        if (!MODES.includes(playlist.mode)) playlist.mode = DEF_STATE.mode;
+    }
+    await chrome.storage.local.set({ bpl_playlists: p });
+}
 async function getActiveId() {
     return (await chrome.storage.local.get('bpl_active')).bpl_active || null;
 }
 async function setActiveId(id) { await chrome.storage.local.set({ bpl_active: id }); }
 async function getState() {
-    const st = Object.assign({}, DEF_STATE, (await chrome.storage.local.get('bpl_state')).bpl_state || {});
+    const stored = await chrome.storage.local.get(['bpl_state', 'bpl_playlists']);
+    const st = Object.assign({}, DEF_STATE, stored.bpl_state || {});
     st.mode = normalizeMode(st);
+    const playlist = findPl(stored.bpl_playlists || [], st.playlistId);
+    if (playlist && MODES.includes(playlist.mode)) st.mode = playlist.mode;
     return st;
 }
 // All read/modify/write operations on player state share this queue. Offscreen
@@ -97,6 +105,8 @@ function patchPlayerState(patch, context) {
             next.index = index;
         }
         next.mode = normalizeMode(next);
+        const modePlaylist = findPl(await getPlaylists(), next.playlistId);
+        if (modePlaylist && MODES.includes(modePlaylist.mode)) next.mode = modePlaylist.mode;
         await chrome.storage.local.set({ bpl_state: next });
         return { ok: true, state: next };
     });
@@ -245,6 +255,11 @@ const BILI_SEARCH_412_RETRY_DELAYS_MS = [1500, 3000, 6000];
 const COLLECTION_CACHE_TTL_MS = 5 * 60 * 1000;
 const COLLECTION_CACHE_MAX = 20;
 const collectionCache = new Map();
+const BGM_TAG_TIMEOUT_MS = 2000;
+const BGM_BATCH_TIMEOUT_MS = 8000;
+const BGM_TAG_CONCURRENCY = 3;
+const BGM_TAG_CACHE_MAX = 500;
+const bgmTagCache = new Map();
 const collectionInflight = new Map();
 function waitMs(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function isRetryableNetworkError(error) {
@@ -856,6 +871,8 @@ function addCollectionItem(items, seen, item) {
         cid: cid,
         title: String(item.title || bvid),
         renameTitle: String(item.renameTitle || item.title || bvid),
+        renamePreferredTitle: String(item.renamePreferredTitle || ''),
+        renameSources: (item.renameSources || [item.title]).filter(value => typeof value === 'string' && value.trim()).slice(0, 2),
         pic: normUrl(item.pic),
         owner: String(item.owner || ''),
         duration: Number(item.duration) || 0,
@@ -895,6 +912,8 @@ function mapCollection(data, bvid) {
                         cid: page.cid || episode.cid,
                         title: collectionItemTitle(episode.title, page.part, pages.length > 1, episode.bvid || bvid),
                         renameTitle: collectionRenameTitle(episode.title, page.part, pages.length > 1, episode.bvid || bvid),
+                        renamePreferredTitle: pages.length === 1 && episode.title !== page.part ? page.part : '',
+                        renameSources: [episode.title, page.part],
                         pic: arc.pic || episode.pic || season.cover,
                         owner: owner || '',
                         duration: page.duration || arc.duration || episode.duration,
@@ -913,6 +932,7 @@ function mapCollection(data, bvid) {
                 bvid: data.bvid || bvid,
                 cid: page.cid,
                 title: part || String(data.title || bvid),
+                renameSources: [String(data.title || ''), part],
                 pic: data.pic,
                 owner: data.owner && data.owner.name,
                 duration: page.duration || data.duration,
@@ -963,6 +983,57 @@ async function collectionSummary(bvid) {
         activePlaylistName: active ? active.name : ''
     };
 }
+
+async function loadCollectionBgmTags(items) {
+    const result = items.map(() => []);
+    const jobs = new Map();
+    for (let index = 0; index < items.length; index++) {
+        const item = items[index];
+        if (!isValidBvid(item.bvid) || !Number.isSafeInteger(item.cid) || item.cid <= 0) continue;
+        const key = collectionItemKey(item);
+        const cached = bgmTagCache.get(key);
+        if (cached && cached.expiresAt > Date.now()) { result[index] = cached.tags; continue; }
+        if (!jobs.has(key)) jobs.set(key, { key, item, indices: [] });
+        jobs.get(key).indices.push(index);
+    }
+    const queue = [...jobs.values()];
+    const deadline = Date.now() + BGM_BATCH_TIMEOUT_MS;
+    let cursor = 0, stopped = false, failure = '';
+    async function worker() {
+        while (!stopped && cursor < queue.length) {
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) break;
+            const job = queue[cursor++];
+            try {
+                // Optional metadata: no retries or playback dependencies. Each
+                // request ends within the remaining total import budget.
+                const response = await biliFetchOnce('https://api.bilibili.com/x/web-interface/view/detail/tag?bvid=' +
+                    encodeURIComponent(job.item.bvid) + '&cid=' + encodeURIComponent(job.item.cid),
+                    Math.min(BGM_TAG_TIMEOUT_MS, remaining));
+                if (!response || response.code !== 0 || !Array.isArray(response.data)) {
+                    throw new Error(response && response.message || '标签响应无效');
+                }
+                const tags = response.data.filter(tag => tag && tag.tag_type === 'bgm').slice(0, 20)
+                    .map(tag => ({ tag_type: 'bgm', tag_name: String(tag.tag_name || '').slice(0, 244), music_id: String(tag.music_id || '') }));
+                bgmTagCache.delete(job.key);
+                bgmTagCache.set(job.key, { tags, expiresAt: Date.now() + COLLECTION_CACHE_TTL_MS });
+                while (bgmTagCache.size > BGM_TAG_CACHE_MAX) bgmTagCache.delete(bgmTagCache.keys().next().value);
+                for (const index of job.indices) result[index] = tags;
+            } catch (error) {
+                // On network failure/412, stop scheduling the rest of the batch.
+                // Already successful lookups remain usable; nothing writes titles later.
+                stopped = true;
+                failure = String(error && error.message || error);
+            }
+        }
+    }
+    await Promise.all(Array.from({ length: Math.min(BGM_TAG_CONCURRENCY, queue.length) }, () => worker()));
+    if (failure || cursor < queue.length) {
+        BPLLog.warn('rename', 'BGM 标签查询未完成，未确认条目使用本地规则：' + (failure || '达到等待上限'));
+    }
+    return result;
+}
+
 function normalizeImportedItems(raw) {
     const seen = new Set(), items = [];
     for (const item of (Array.isArray(raw) ? raw : [])) {
@@ -1182,6 +1253,12 @@ async function migrate() {
         const rawState = r.bpl_state || {};
         const st = Object.assign({}, DEF_STATE, rawState);
         st.mode = normalizeMode(st);
+        // Preserve the former global setting once, then each list owns its mode.
+        for (const playlist of lists) {
+            if (!MODES.includes(playlist.mode)) playlist.mode = (r.bpl_schema_version || 0) < 2 ? st.mode : DEF_STATE.mode;
+        }
+        const modePlaylist = findPl(lists, st.playlistId);
+        if (modePlaylist) st.mode = modePlaylist.mode;
         if (legacyList) st.playlistId = activeId;
         if (!Object.prototype.hasOwnProperty.call(rawState, 'trackId')) {
             const pl = findPl(lists, st.playlistId);
@@ -1621,7 +1698,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 const PLAYLIST_MUTATION_CMDS = new Set([
     'addManualItem', 'remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'moveItem', 'clear',
-    'createPlaylist', 'renamePlaylist', 'deletePlaylist', 'importPlaylist', 'setActive'
+    'createPlaylist', 'renamePlaylist', 'deletePlaylist', 'importPlaylist', 'setActive', 'setMode'
 ]);
 
 async function importChartPlaylist(msg, importedId) {
@@ -1662,6 +1739,19 @@ async function handleBg(msg, sender, mutationLocked) {
         return await withPlaylistMutation(() => handleBg(msg, sender, true));
     }
     switch (msg.cmd) {
+        case 'setMode': {
+            if (!msg.playlistId || !MODES.includes(msg.mode)) return { ok: false, error: '播放列表或播放模式无效' };
+            const lists = await getPlaylists();
+            const playlist = findPl(lists, msg.playlistId);
+            if (!playlist) return { ok: false, error: '该播放列表已不存在' };
+            playlist.mode = msg.mode;
+            await savePlaylists(lists);
+            // State.mode remains a compatibility mirror of the playing list.
+            // Keep the same playlist -> state lock order used by other edits.
+            await patchPlayerState({});
+            await broadcastData();
+            return { ok: true };
+        }
         case 'getChartCatalog': {
             const sources = chartCatalog();
             return sources.length ? { ok: true, sources: sources } : { ok: false, error: '没有可用的榜单来源' };
@@ -1739,7 +1829,13 @@ async function handleBg(msg, sender, mutationLocked) {
                     const renameSource = value.items.map(item => Object.assign({}, item, {
                         title: String(item.renameTitle || item.title || item.bvid)
                     }));
-                    importItems = await globalThis.BPLRenamer.renameItems(renameSource, { prefix: String(msg.renamePrefix || '') });
+                    const bgmTags = await loadCollectionBgmTags(value.items);
+                    importItems = await globalThis.BPLRenamer.renameItems(renameSource, {
+                        prefix: String(msg.renamePrefix || ''),
+                        preferredTitles: value.items.map(item => item.renamePreferredTitle),
+                        titleSources: value.items.map(item => item.renameSources),
+                        bgmTags
+                    });
                 } catch (error) {
                     BPLLog.warn('bg', 'smart rename failed; using source titles: ' + String(error && error.message || error));
                 }
@@ -1884,6 +1980,9 @@ async function handleBg(msg, sender, mutationLocked) {
         }
         case 'player': {
             const payload = Object.assign({}, msg.payload || {});
+            if (payload.cmd === 'setMode') {
+                return await handleBg({ cmd: 'setMode', playlistId: payload.playlistId, mode: payload.mode }, sender);
+            }
             if (LONG_PLAYER_CMDS.has(payload.cmd) || payload.cmd === 'stop') {
                 payload._intentId = beginBackgroundPlayIntent();
             }

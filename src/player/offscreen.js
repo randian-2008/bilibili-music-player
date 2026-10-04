@@ -83,6 +83,11 @@ let curIndex = -1;
 let curTrack = null;   // 当前曲身份 {bvid, cid}：断点落盘以此为键，stop/清空时置 null
 let shuffleOrder = [];
 let shufflePos = -1;
+let shuffleContext = '';
+function syncShuffleContext(playlistId, mode, items) {
+    const key = JSON.stringify([playlistId, mode, items.map(item => item.id || [item.bvid, item.cid])]);
+    if (key !== shuffleContext) { shuffleOrder = []; shufflePos = -1; shuffleContext = key; }
+}
 let curBlobUrl = null;
 let recoveryTimer = null;
 let recoveryAttempts = 0;
@@ -105,9 +110,11 @@ function normMode(st) {
     return st.loop ? 'loop' : 'order';
 }
 function pGetState() {
-    return store.get('bpl_state').then(r => {
+    return store.get(['bpl_state', 'bpl_playlists']).then(r => {
         const st = Object.assign({}, DEF_STATE, r.bpl_state || {});
         st.mode = normMode(st);
+        const playlist = (r.bpl_playlists || []).find(p => p.id === st.playlistId);
+        if (playlist && P_MODES.includes(playlist.mode)) st.mode = playlist.mode;
         return st;
     });
 }
@@ -557,11 +564,14 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
     const st = await pGetState();
     if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
     const targetPlaylistId = playlistId || st.playlistId;
-    const items = await pGetItems(targetPlaylistId);
+    const targetPlaylist = (await pGetPlaylists()).find(p => p.id === targetPlaylistId);
+    if (targetPlaylist && P_MODES.includes(targetPlaylist.mode)) st.mode = targetPlaylist.mode;
+    const items = targetPlaylist ? targetPlaylist.items : [];
     if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
     if (options && options.itemId) i = items.findIndex(item => item.id === options.itemId);
     if (!items.length) return { ok: false, error: '当前播放列表为空' };
     if (i < 0 || i >= items.length) return { ok: false, error: '播放索引越界 (' + i + '/' + items.length + ')' };
+    syncShuffleContext(targetPlaylistId, st.mode, items);
     if (pIsShuffle(st.mode) && !keepOrder) pBuildFrom(items.length, i);
     let it = items[i];
     const itemId = it && it.id;
@@ -678,6 +688,7 @@ async function pAdvance() {
     if (!isCurrentPlay(token)) return { ok: true, cancelled: true };
     if (!items.length) return { ok: false, error: '当前播放列表为空' };
     const mode = st.mode;
+    syncShuffleContext(st.playlistId, mode, items);
     if (pIsShuffle(mode)) {
         const orderWasEmpty = shuffleOrder.length !== items.length;
         if (orderWasEmpty) pBuildAfter(items.length, st.index);
@@ -739,6 +750,7 @@ async function pPrev() {
     if (!isCurrentPlay(token)) return { ok: true, cancelled: true };
     if (!items.length) return { ok: false, error: '当前播放列表为空' };
     if (audio.currentTime > 3) { audio.currentTime = 0; return { ok: true }; }
+    syncShuffleContext(st.playlistId, st.mode, items);
     if (pIsShuffle(st.mode) && shuffleOrder.length === items.length && shufflePos > 0) {
         shufflePos--;
         return await pPlayIndex(shuffleOrder[shufflePos], true);
@@ -953,7 +965,8 @@ setInterval(() => {
 }, 1000);
 
 function onPlaylistsChanged() {
-    shuffleOrder = []; shufflePos = -1;
+    // Validate the shuffle context when navigating. Editing another list or
+    // updating a cover must not restart the current random round.
     pGetItems().then(items => {
         const currentExists = !curTrack || items.some(it =>
             (curTrack.id && it.id) ? curTrack.id === it.id
@@ -985,11 +998,9 @@ async function handleCmd(msg) {
         case 'getStatus': return { ok: true, position: audio.currentTime || 0, duration: audio.duration || 0, playing: !audio.paused, index: curIndex, hasTrack: !!audio.src };
         case 'stop': return await pStopPlayback();
         case 'setMode': {
-            const st = await pGetState();
-            const mode = P_MODES.indexOf(msg.mode) >= 0 ? msg.mode : st.mode;
-            shuffleOrder = []; shufflePos = -1;
-            await pSetState({ mode: mode });
-            return { ok: true };
+            // Mode belongs to a playlist and must be saved under the background
+            // playlist lock. Normal UI requests are handled before reaching here.
+            return { ok: false, error: '请刷新页面后设置播放列表模式' };
         }
         case 'setVolume': {
             const v = Math.max(0, Math.min(1, Number(msg.value)));

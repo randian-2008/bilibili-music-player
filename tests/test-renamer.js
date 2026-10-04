@@ -43,15 +43,17 @@ const renamer = context.BPLRenamer;
 
     result = await renamer.renameItems([
         { title: '歌曲甲你还记得' },
-        { title: '歌曲乙你还记得' }
+        { title: '歌曲乙你还记得' },
+        { title: '歌曲丙你还记得' }
     ], { rules: {} });
-    ok(result.map(item => item.title).join('|') === '歌曲甲|歌曲乙', '默认逻辑检测并删除公共后缀');
+    ok(result.map(item => item.title).join('|') === '歌曲甲|歌曲乙|歌曲丙', '至少三个不同标题支持时才删除无分隔符公共后缀');
 
     result = await renamer.renameItems([
         { title: '合集前缀-相思-这是一段很长的页面说明文案' },
         { title: '合集前缀-晴天-这是另一段很长的页面说明文案' }
     ], { rules: {} });
-    ok(result.map(item => item.title).join('|') === '相思|晴天', '分段后删除超过十个字符的可疑片段');
+    ok(result.map(item => item.title).join('|') === '相思 - 这是一段很长的页面说明文案|晴天 - 这是另一段很长的页面说明文案',
+        '删除有批量依据的公共前缀，但不只凭长度丢弃含义不明的剩余片段');
 
     result = await renamer.renameItems([{ title: '这是一个超过十个字符的完整歌曲名称' }], { rules: {} });
     ok(result[0].title === '这是一个超过十个字符的完整歌曲名称', '唯一剩余的长片段会被保留');
@@ -109,8 +111,8 @@ const renamer = context.BPLRenamer;
         { title: '《任意系列》「角色甲」《百万级录音棚试听》' },
         { title: '《任意系列》「角色乙」《豪装录音棚大声听》' }
     ], { rules: {} });
-    ok(result.map(item => item.title).join('|') === '百万级录音棚试听|豪装录音棚大声听',
-        '核心候选选择不根据特定营销文案内容进行硬编码排除');
+    ok(result.map(item => item.title).join('|') === '「角色甲」《百万级录音棚试听》|「角色乙」《豪装录音棚大声听》',
+        '移除已确认的系列标签后保留多个不确定名称，不按位置或宣传文案词表猜测');
 
     result = await renamer.renameItems([
         { title: '歌曲甲zz' },
@@ -119,6 +121,141 @@ const renamer = context.BPLRenamer;
     ], { rules: {} });
     ok(result.map(item => item.title).join('|') === '歌曲甲|歌曲乙|歌曲丙',
         '任意重复短后缀均使用同一统计规则处理，不依赖后缀的具体文本');
+
+    console.log('\n[renamer 真实合集与结构回归]');
+    const collection = require('./fixtures/collection-titles.json');
+    result = await renamer.renameItems(collection.titles.map(title => ({ title })), { rules: {} });
+    ok(result.slice(0, 22).every((item, index) => item.title.startsWith(collection.titles[index].split(' -')[0])),
+        '真实混合合集的前 22 条保留歌曲主体，不再全部变成 Hi');
+    ok(result.every(item => !/Hi|Res|无损音质|𝐇𝐢|𝐑𝐞𝐬/.test(item.title)), '完整重复音质块按统计去除，支持字体变体');
+    ok(result[25].title === '画离弦' && result[24].title.startsWith('江湖如梦'), '引号内歌名正确提取，歧义歌词不覆盖左侧歌名');
+    for (const label of ['Studio-Edition附加说明', '另一种任意标签']) {
+        const renamed = await renamer.renameItems(['春风', '夏夜', '秋雨'].map(title => ({ title: title + ' | ' + label })), { rules: {} });
+        ok(renamed.map(item => item.title).join('|') === '春风|夏夜|秋雨', '统计规则不依赖具体音质标签：' + label);
+    }
+    result = await renamer.renameItems([{ title: '春风 | 副标题' }], { rules: {} });
+    ok(result[0].title === '春风 - 副标题', '只有分隔符时保留两侧不确定内容，不擅自舍弃左侧');
+    result = await renamer.renameItems(['春风', '夏夜', '秋雨'].map(title => ({ title: '共同说明 | ' + title })), { rules: {} });
+    ok(result.map(item => item.title).join('|') === '春风|夏夜|秋雨', '重复完整前置说明与后置说明采用一致规则');
+
+    console.log('\n[renamer 保守过滤边界]');
+    const preservedBatches = [
+        ['不能说的秘密', '不能说的再见'],
+        ['不能说的秘密', '不能说的秘密', '不能说的再见'],
+        ['歌曲甲你还记得', '歌曲乙你还记得'],
+        ['我爱你', '谁爱你', '偏爱你'],
+        ['Running', 'Runner', 'Runway'],
+        ['Shopping', 'Shipping', 'Hopping'],
+        ['[真实歌名] 作者'],
+        ['(Stay) Artist'],
+        ['（真实歌名） 作者'],
+        ['〔只有歌名〕'],
+        ['[未知标签] 晴天', '[未知标签] 晴天', '[未知标签] 夜曲'],
+        ['青春！未完'],
+        ['非常长的完整名称（另一个版本） - 短片段'],
+        ['这是一个很长但是完整的歌曲名字 - 作者'],
+        ['这是一个很长但是完整的歌曲名字 - 这是另外一个长标题名称'],
+        ['春日笔记 | 这是很长但是有实际意义的副标题'],
+        ['《晴天》与《夜曲》串烧'],
+        ['《长标题中的上半部分》 / 《另一个很长的下半部分》'],
+        ['《第一首》《第二首》'],
+        ['我喜欢的歌曲 | 片段一']
+    ];
+    for (const titles of preservedBatches) {
+        const renamed = await renamer.renameItems(titles.map(title => ({ title })), { rules: {} });
+        // Separators may be normalized; the title content must not be dropped.
+        const normalized = titles.map(title => title.replace(/\s*\|\s*/g, ' - '));
+        ok(renamed.map(item => item.title).join('|') === normalized.join('|'), '不足以删除时保留：' + titles.join(' / '));
+    }
+    result = await renamer.renameItems(['SongOP | 备注', 'Hope | 文案', 'Mixed | 提示'].map(title => ({ title })), { rules: {} });
+    ok(result.map(item => item.title).join('|') === 'SongOP - 备注|Hope - 文案|Mixed - 提示', '英文缩写不匹配单词内部，也不据此丢弃左侧');
+    result = await renamer.renameItems(['晴天', '夜曲', '稻香'].map(title => ({ title: '[共同频道] ' + title })), { rules: {} });
+    ok(result.map(item => item.title).join('|') === '晴天|夜曲|稻香', '三个不同标题支持时移除共同括号标签');
+    for (const separator of [' | ', ' - ']) {
+        result = await renamer.renameItems(['短标题', '短标题', '另一首'].map(title => ({ title: title + separator + '任意说明' })), { rules: {} });
+        const unique = await renamer.renameItems(['短标题', '另一首'].map(title => ({ title: title + separator + '任意说明' })), { rules: {} });
+        ok(result.map(item => item.title).join('|') === '短标题|短标题|另一首' && unique.map(item => item.title).join('|') === '短标题|另一首',
+            '完整分段采用一致的两条不同标题证据，重复项不改变结论：' + separator.trim());
+    }
+    result = await renamer.renameItems(['不能说的秘密', '不能说的再见', '不能说的爱你'].map(title => ({ title: '《' + title + '》作者' })), { rules: {} });
+    ok(result.map(item => item.title).join('|') === '不能说的秘密|不能说的再见|不能说的爱你', '明确引号内的歌曲名称不会再按公共前缀截短');
+    result = await renamer.renameItems(['《晴天》甲作者', '《晴天》乙作者', '《晴天》丙作者'].map(title => ({ title })), { rules: {} });
+    ok(result.every(item => item.title === '晴天'), '同一歌曲的不同版本不因重复引号被当成系列标签');
+    result = await renamer.renameItems(['《晴天》 | 甲作者', '《晴天》 | 乙作者', '《晴天》 | 丙作者'].map(title => ({ title })), { rules: {} });
+    ok(result.every(item => item.title === '晴天'), '完整重复块过滤同样保护引号内的真实标题');
+    result = await renamer.renameItems(['《STOP》', '《Hope》', '《Mixed》', '「梦-序章」', '『夜，回声』', '《夜に駆ける》'].map(title => ({ title })), { rules: {} });
+    ok(result.map(item => item.title).join('|') === 'STOP|Hope|Mixed|梦-序章|夜，回声|夜に駆ける', '明确标题中的缩写、分隔符和非汉字文字完整保留');
+    result = await renamer.renameItems([{ title: 'Song BGM' }, { title: '抽卡出金BGM' }], { rules: {} });
+    ok(result.map(item => item.title).join('|') === 'Song|抽卡出金', '独立英文描述词和汉字旁的标记仍可正常清理');
+    result = await renamer.renameItems([{ title: '𝄞𝄞𝄞𝄞𝄞𝄞 - 短名' }], { rules: {} });
+    ok(result[0].title === '𝄞𝄞𝄞𝄞𝄞𝄞 - 短名', '包含代理对字符的片段同样完整保留');
+    for (const separator of [' | ', ' - ']) {
+        const titles = ['作者甲', '作者乙'].flatMap(author => ['曲目甲', '曲目乙'].map(title => author + separator + title));
+        result = await renamer.renameItems(titles.map(title => ({ title })), { rules: {} });
+        ok(result.every((item, index) => item.title === titles[index]), '两侧都重复时不猜测哪侧应删除：' + separator.trim());
+    }
+    result = await renamer.renameItems([{ title: 'OP | 歌曲正文 | 不确定的附加信息' }], { rules: {} });
+    ok(result[0].title === '歌曲正文 - 不确定的附加信息', '明确上下文后仍保留多个不确定片段，不盲取最后一段');
+    result = await renamer.renameItems([{ title: '01. 这是一个很长但是完整的歌曲名字 - 作者' }], { rules: {} });
+    ok(result[0].title === '这是一个很长但是完整的歌曲名字 - 作者', '清理明确序号不引发后续长度误删');
+    const uncertain = ['[共同频道] 不能说的秘密', '[共同频道] 不能说的再见'];
+    const lessEvidence = await renamer.renameItems(uncertain.map(title => ({ title })), { rules: {} });
+    ok(lessEvidence.every((item, index) => item.title === uncertain[index]), '样本不足时同时保留未知标签和相似歌名，不连锁缩短');
+    const batch = collection.titles.concat(preservedBatches.flat()).map((title, id) => ({ id, title }));
+    const inputSnapshot = JSON.stringify(batch);
+    const baseline = await renamer.renameItems(batch, { rules: {} });
+    const reversed = await renamer.renameItems(batch.slice().reverse(), { rules: {} });
+    const duplicated = await renamer.renameItems(batch.concat(batch.slice(0, 7)), { rules: {} });
+    const namesById = new Map(baseline.map(item => [item.id, item.title]));
+    ok(reversed.concat(duplicated).every(item => item.title === namesById.get(item.id)), '改变导入顺序或增加重复副本不会改变统计结果');
+    ok(JSON.stringify(batch) === inputSnapshot && baseline.every((item, index) => item !== batch[index] && item.id === batch[index].id && item.title),
+        '批处理保持输入对象与条目身份不变，始终返回非空的新对象');
+
+    console.log('\n[renamer BGM 标签与原标题核对]');
+    const musicTag = name => ({ tag_type: 'bgm', tag_name: '发现《' + name + '》', music_id: 'MA-test' });
+    for (const [name, title, expected] of [
+        ['画离弦', '《画离弦》等什么君 | 怎将情话递心间', '画离弦'],
+        ['游山恋', '游山恋 - 崔天琪&韩晴 | 无损音质', '游山恋'],
+        ['Ｈｅｌｌｏ World', 'Artist - hello   world - Version', 'Ｈｅｌｌｏ World'],
+        ['晴天', '周杰伦 - 晴 天', '晴天'],
+        ['晴天', '总有一个晴天来临', ''],
+        ['爱', '爱情转移', ''],
+        ['爱', '作者《爱》', '爱'],
+        ['Love', 'Glove', ''],
+        ['Love', 'Love Story', 'Love'],
+        ['A+B (Live)', 'Artist - A+B (Live)', 'A+B (Live)'],
+        ['相思', '想思', ''],
+        ['甲曲', '《乙曲》', '']
+    ]) {
+        ok(renamer.selectBgmTitle([musicTag(name)], [title]) === expected, '音乐标签交叉验证：' + name + ' / ' + title);
+    }
+    ok(renamer.selectBgmTitle([{ ...musicTag('晴天'), tag_type: 'old_channel' }], ['晴天']) === '', '普通标签即使与标题一致也不作为已确认曲名');
+    ok(renamer.selectBgmTitle([musicTag('晴天'), musicTag('夜曲')], ['《晴天》与《夜曲》串烧']) === '', '多个不同曲名均命中时回退，不按接口顺序选取');
+    ok(renamer.selectBgmTitle([musicTag('晴天'), musicTag('晴天')], ['《晴天》']) === '晴天', '相同音乐标签重复出现不构成歧义');
+    ok(renamer.selectBgmTitle([musicTag('画离弦')], ['画离', '弦']) === '', '不同来源字段不能拼成标签曲名');
+    ok(renamer.selectBgmTitle([null, { tag_type: 'bgm' }, { ...musicTag('晴天'), tag_name: '发现《晴天' }], ['晴天']) === '',
+        '不完整标签或损坏的包装文本不作为确认结果');
+    const names = ['不能说的秘密', '不能说的再见', '不能说的爱你'];
+    result = await renamer.renameItems(names.map(title => ({ title: title + ' - 作者' })), {
+        rules: {}, bgmTags: names.map(title => [musicTag(title)]), prefix: '自定义'
+    });
+    ok(result.every((item, index) => item.title === '自定义 - ' + names[index]), '标签确认的曲名不再被公共前后缀截短，统一前缀仍会添加');
+    result = await renamer.renameItems([{ title: '视频标题 | 画离弦 - 作者' }], {
+        rules: {}, bgmTags: [[musicTag('画离弦')]], titleSources: [['视频标题', '画离弦 - 作者']]
+    });
+    ok(result[0].title === '画离弦', '独立的原视频标题与对应分P标题均可提供真实匹配证据');
+    const fallbackInput = [{ title: '较长但不能随意删除的标题 - 短片段' }];
+    const withoutTags = await renamer.renameItems(fallbackInput, { rules: {} });
+    const unmatchedTags = await renamer.renameItems(fallbackInput, { rules: {}, bgmTags: [[musicTag('不存在的歌')]] });
+    ok(unmatchedTags[0].title === withoutTags[0].title, '标签不匹配时完整沿用保守的本地规则');
+    result = await renamer.renameItems([{ title: '画离弦 - 作者' }], {
+        rules: { filters: [{ scope: 'title', pattern: '^画离弦$', replace: '用户指定名' }] }, bgmTags: [[musicTag('画离弦')]]
+    });
+    ok(result[0].title === '用户指定名', '主动启用的自定义规则仍能调整标签确认后的名称');
+    result = await renamer.renameItems([{ title: '原始文本' }], {
+        rules: { filters: [{ scope: 'title', pattern: '^原始文本$', replace: '画离弦 - 附加信息' }] }, bgmTags: [[musicTag('画离弦')]]
+    });
+    ok(result[0].title === '画离弦 - 附加信息', '自定义规则新生成的文字不能伪造原始标题与标签一致的证据');
 
     console.log('\n[renamer 静态正则规则]');
     result = await renamer.renameItems([
@@ -130,7 +267,11 @@ const renamer = context.BPLRenamer;
     result = await renamer.renameItems([{ title: '[Tag] Song' }], {
         rules: { filters: [{ enabled: true, scope: 'title', pattern: '(', flags: '', replace: '' }] }
     });
-    ok(result[0].title === 'Song', '非法正则规则被忽略且默认过滤仍可用');
+    ok(result[0].title === '[Tag] Song', '非法正则规则被忽略，未知括号内容不会被默认规则盲删');
+    result = await renamer.renameItems([{ title: '[Tag] Song' }], {
+        rules: { filters: [{ enabled: true, scope: 'segment', pattern: '^\\[[^\\]]+\\]\\s*', replace: '' }] }
+    });
+    ok(result[0].title === 'Song', '用户明确启用的括号删除规则仍可覆盖保守默认行为');
 
     result = await renamer.renameItems([{ title: 'Song' }], { rules: {}, prefix: '周杰伦 - ' });
     ok(result[0].title === '周杰伦 - Song', '自定义前缀会规范化并添加分隔符');

@@ -191,6 +191,10 @@ function act(cmd, extra) {
 }
 
 function activePlaylist() { return playlists.find(p => p.id === activeId) || null; }
+function activePlaylistMode() {
+    const playlist = activePlaylist();
+    return playlist && MODES.some(mode => mode.id === playlist.mode) ? playlist.mode : 'loop';
+}
 function playingPlaylist() { return playlists.find(p => p.id === state.playlistId) || null; }
 function playingItem() {
     const pl = playingPlaylist();
@@ -224,11 +228,12 @@ function render() {
             esc(p.name) + ' (' + p.items.length + ')</option>').join('')
         : '<option>（无播放列表）</option>';
 
-    const mode = MODES[modeIndex(state.mode)];
+    const mode = MODES[modeIndex(activePlaylistMode())];
     const mb = $('#modeBtn');
     mb.innerHTML = mode.icon + '<span>' + mode.label + '</span>';
-    mb.title = '播放模式：' + mode.label + '（点击切换）';
-    mb.classList.toggle('active', state.mode !== 'order');
+    mb.title = '当前列表播放模式：' + mode.label + '（点击切换）';
+    mb.disabled = !activePlaylist();
+    mb.classList.toggle('active', mode.id !== 'order');
     document.body.classList.toggle('playing', !!state.playing);
 
     const it = playingItem();
@@ -778,8 +783,12 @@ $('#nextBtn').addEventListener('click', () => act('next'));
 $('#prevBtn').addEventListener('click', () => act('prev'));
 $('#stopBtn').addEventListener('click', () => act('stop').then(refresh));
 $('#modeBtn').addEventListener('click', () => {
-    const next = MODES[(modeIndex(state.mode) + 1) % MODES.length];
-    send('setMode', { mode: next.id });
+    if (!activePlaylist()) return;
+    const next = MODES[(modeIndex(activePlaylistMode()) + 1) % MODES.length];
+    send('setMode', { playlistId: activeId, mode: next.id }).then(result => {
+        if (result && result.ok) refresh();
+        else toast(result && result.error || '保存播放模式失败，请重试');
+    });
 });
 $('#seek').addEventListener('input', e => send('seek', { value: +e.target.value }));
 

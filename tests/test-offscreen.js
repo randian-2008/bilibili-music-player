@@ -364,7 +364,7 @@ async function testHandleCmd() {
     console.log('\n[offscreen handleCmd]');
     const ctx = makeCtx({ store: setupPlaylist(3) });
     let r = await ctx.handleCmd({ cmd: 'setMode', mode: 'shuffle' });
-    ok(r.ok === true && (await getState(ctx)).mode === 'shuffle', 'setMode 生效');
+    ok(r.ok === false && (await getState(ctx)).mode === 'order', '拒绝直接覆盖全局模式，列表模式交给后台保存');
     r = await ctx.handleCmd({ cmd: 'getStatus' });
     ok(r.ok === true && typeof r.position === 'number' && r.hasTrack === false, 'getStatus 返回状态');
     r = await ctx.handleCmd({ cmd: 'playIndex', index: 1 });
@@ -394,15 +394,15 @@ async function testPort() {
     console.log('\n[offscreen Port 命令闭环]');
     const ctx = makeCtx({ store: setupPlaylist(3) });
     const before = ctx.__portSent.length;
-    ctx.__drive({ _id: 42, cmd: 'setMode', mode: 'shuffle' });
+    ctx.__drive({ _id: 42, cmd: 'setVolume', value: 0.4 });
     let resp = null;
     for (let i = 0; i < 20; i++) {
         resp = ctx.__portSent.slice(before).find(m => m._id === 42 && Object.prototype.hasOwnProperty.call(m, 'result'));
         if (resp) break;
         await new Promise(r => setTimeout(r, 5));
     }
-    ok(resp && resp.result && resp.result.ok === true && (await ctx.pGetState()).mode === 'shuffle',
-        'Port 命令→响应闭环（setMode）');
+    ok(resp && resp.result && resp.result.ok === true && ctx.__audio.volume === 0.4,
+        'Port 命令→响应闭环（setVolume）');
     ok(ctx.__portSent.slice(before).some(m => m._id === 42 && m.ack === true), 'Port 收到命令后立即 ACK');
 
     ctx.__drive({ _id: 43, cmd: 'getStatus' });

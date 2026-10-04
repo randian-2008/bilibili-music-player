@@ -257,7 +257,7 @@ function makeCtx(opts) {
     ok(migrated.every(x => !!x.id) && migrated[0].id !== migrated[1].id, '旧歌曲补齐唯一 ID');
     ok(ctx.__store.bpl_state.trackId === migrated[1].id && ctx.__store.bpl_state.index === 1,
         '旧播放索引迁移为 trackId');
-    ok(ctx.__store.bpl_schema_version === 1, '写入存储 schema 版本');
+    ok(ctx.__store.bpl_schema_version === 2, '写入存储 schema 版本');
 
     ctx = makeCtx();
     ctx.__store.bpl_playlists = [{ id: 'stopped', name: '已停止', items: [{ bvid: 'BV0', cid: 100, title: 'a' }] }];

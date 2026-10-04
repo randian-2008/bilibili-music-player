@@ -3,7 +3,6 @@
 
     // Keep the default policy in code so an empty or unavailable rules file is valid.
     const MAX_TITLE_LENGTH = 240;
-    const MAX_SEGMENT_LENGTH = 10;
     const MIN_COMMON_AFFIX_LENGTH = 3;
     const MIN_COMMON_TAIL_LENGTH = 2;
     const MIN_COMMON_TAIL_SUPPORT = 3;
@@ -20,8 +19,9 @@
         ['\u300E', '\u300F'],
         ['\u3008', '\u3009']
     ];
-    const TITLE_DESCRIPTOR_RE = /(?:BGM|OST|EP|PV|OP|ED|\u89d2\u8272\u5c55\u793a|\u89d2\u8272\u66f2|\u4e3b\u9898\u66f2|\u63d2\u66f2|\u914d\u4e50|\u65b0\u6b4c|\u6b4c\u66f2)/i;
-    const TRAILING_TITLE_METADATA_RE = /(?:\s*(?:BGM|OST)|(?:^|\s)(?:EP|PV|OP|ED)|\s*(?:\u5b8c\u6574\u7248|\u7eaf\u4eab\u7248|\u8bd5\u542c\u7248))\s*$/i;
+    const TITLE_DESCRIPTOR_RE = /(?:(?<![A-Za-z0-9])(?:BGM|OST|EP|PV|OP|ED)|\u89d2\u8272\u5c55\u793a|\u89d2\u8272\u66f2|\u4e3b\u9898\u66f2|\u63d2\u66f2|\u914d\u4e50|\u65b0\u6b4c|\u6b4c\u66f2)\s*$/i;
+    const TRAILING_TITLE_METADATA_RE = /(?:(?<![A-Za-z0-9])(?:BGM|OST|EP|PV|OP|ED)|\u5b8c\u6574\u7248|\u7eaf\u4eab\u7248|\u8bd5\u542c\u7248)\s*$/i;
+    const BRACKET_BLOCK_RE = /\[[^\]]{1,80}\]|【[^】]{1,80}】|\([^)]{1,80}\)|（[^）]{1,80}）|〔[^〕]{1,80}〕/g;
 
     let rulesCache = null;
     let rulesPromise = null;
@@ -38,33 +38,45 @@
             .replace(/[\s\-\u2013\u2014|\uFF5C\u4E28\uFF0F\/\u00B7\u2022]+$/, '')
             .trim();
         for (const pair of TITLE_QUOTE_PAIRS) {
-            if (result.startsWith(pair[0]) && result.endsWith(pair[1])) {
+            if (result.startsWith(pair[0]) && result.endsWith(pair[1]) &&
+                result.indexOf(pair[1], pair[0].length) === result.length - pair[1].length) {
                 return text(result.slice(pair[0].length, -pair[1].length));
             }
         }
         return result;
     }
 
-    function stripLeadingMetadata(value) {
+    function stripLeadingMetadata(value, context) {
         let result = cleanSegment(value);
         let previous;
         do {
             previous = result;
-            result = result
-                .replace(/^(?:\[[^\]]{1,80}\]|\u3010[^\u3011]{1,80}\u3011|\([^)]{1,80}\)|\u3014[^\u3015]{1,80}\u3015)\s*/, '')
-                .replace(/\s*(?:\[[^\]]{1,80}\]|\u3010[^\u3011]{1,80}\u3011|\([^)]{1,80}\)|\u3014[^\u3015]{1,80}\u3015)\s*$/, '')
-                .replace(/^\d{1,3}\s*[-.\u3001:：]\s*/, '')
-                .trim();
+            // Brackets are structure, not proof of metadata. Remove a block only
+            // when different titles in this batch support the same edge label.
+            if (context) {
+                for (const block of bracketEdges(result)) {
+                    if (!context.commonBrackets.has(blockKey(block.value))) continue;
+                    const remaining = cleanSegment(result.slice(0, block.start) + result.slice(block.end));
+                    if (remaining) { result = remaining; break; }
+                }
+            }
+            result = result.replace(/^\d{1,3}\s*[-.\u3001:：]\s*/, '').trim();
         } while (result && result !== previous);
         return cleanSegment(result.replace(TRAILING_TITLE_METADATA_RE, ''));
+    }
+
+    function bracketEdges(value) {
+        return [...value.matchAll(BRACKET_BLOCK_RE)].filter(match =>
+            !value.slice(0, match.index).trim() || !value.slice(match.index + match[0].length).trim())
+            .map(match => ({ start: match.index, end: match.index + match[0].length, value: match[0].slice(1, -1) }));
     }
 
     function splitTitle(value) {
         const source = text(value);
         if (!source) return [];
         // Split only outside paired brackets so metadata such as [Hi-res] stays intact.
-        const opening = new Set(['[', '\u3010', '(', '\uFF08', '\u3014', '\u300A', '\u3008']);
-        const closing = new Set([']', '\u3011', ')', '\uFF09', '\u3015', '\u300B', '\u3009']);
+        const opening = new Set(['[', '\u3010', '(', '\uFF08', '\u3014', '\u300A', '\u3008', '「', '『']);
+        const closing = new Set([']', '\u3011', ')', '\uFF09', '\u3015', '\u300B', '\u3009', '」', '』']);
         const separators = new Set(['-', '\u2013', '\u2014', '|', '\uFF5C', '\u4E28', '/', '\uFF0F', ',', '\uFF0C', ';', '\uFF1B', '\u00B7', '\u2022']);
         const parts = [];
         let start = 0;
@@ -113,7 +125,20 @@
         return candidates.sort((a, b) => a.start - b.start || a.end - b.end);
     }
 
-    function findCommonTails(values) {
+    function canRemoveRange(value, start, end, context) {
+        // Later character-level passes must respect the structural decisions:
+        // never cut through a bracket/quote or erase an unconfirmed bracket label.
+        const spans = [...value.matchAll(BRACKET_BLOCK_RE)].map(match => ({
+            start: match.index, end: match.index + match[0].length,
+            removable: context.commonBrackets.has(blockKey(match[0].slice(1, -1)))
+        })).concat(extractQuotedCandidates(value).map(quote => ({
+            ...quote, removable: context.commonQuoted.has(quote.key)
+        })));
+        return spans.every(span => end <= span.start || start >= span.end ||
+            (span.removable && start <= span.start && end >= span.end));
+    }
+
+    function findCommonTails(values, context, total) {
         const clusters = new Map();
         for (const raw of values) {
             const value = text(raw);
@@ -128,6 +153,12 @@
             const suffix = trimAffix(commonSuffix(cluster.map(value => value.toLowerCase())));
             if (suffix.length < MIN_COMMON_TAIL_LENGTH) continue;
             if (!cluster.every(value => value.length > suffix.length)) continue;
+            if (!cluster.every(value => canRemoveRange(value, value.length - suffix.length, value.length, context))) continue;
+            const remaining = cluster.map(value => value.slice(0, -suffix.length));
+            if (remaining.some(value => /[A-Za-z0-9]/.test(value.slice(-1)) && /[A-Za-z0-9]/.test(suffix[0]))) continue;
+            const bounded = cluster.every((value, index) => affixBoundary(remaining[index].slice(-1), suffix[0]));
+            if (!supportsAffix(remaining, bounded, total)) continue;
+            if (suffix.length < MIN_COMMON_AFFIX_LENGTH && !bounded) continue;
             tails.add(suffix);
         }
         return Array.from(tails).sort((a, b) => b.length - a.length);
@@ -135,27 +166,101 @@
 
     function removeCommonTails(value, context) {
         const source = text(value);
+        if (context.ambiguousTitles.has(blockKey(source))) return source;
         const lower = source.toLowerCase();
         for (const suffix of context.commonTails) {
             if (!lower.endsWith(suffix) || source.length <= suffix.length) continue;
+            if (!canRemoveRange(source, source.length - suffix.length, source.length, context)) continue;
             return cleanSegment(source.slice(0, -suffix.length));
         }
         return source;
     }
 
     function buildTitleContext(values) {
-        const titles = values.filter(Boolean);
+        // Repeated copies do not increase the confidence of batch statistics.
+        const titles = [...new Map(values.filter(Boolean).map(value => [blockKey(value), value])).values()];
         const counts = new Map();
+        const bracketRemainders = new Map();
         for (const title of titles) {
             const seen = new Set(extractQuotedCandidates(title).map(candidate => candidate.key));
             for (const key of seen) counts.set(key, (counts.get(key) || 0) + 1);
+            for (const block of bracketEdges(title)) {
+                const key = blockKey(block.value);
+                const rest = cleanSegment(title.slice(0, block.start) + title.slice(block.end));
+                if (!rest) continue;
+                if (!bracketRemainders.has(key)) bracketRemainders.set(key, new Set());
+                bracketRemainders.get(key).add(blockKey(rest));
+            }
         }
         const commonQuoted = new Set();
         const threshold = Math.max(2, Math.ceil(titles.length * 0.5));
         for (const [key, count] of counts) {
-            if (count >= threshold) commonQuoted.add(key);
+            if (count < threshold) continue;
+            // Repeated versions of one song are not a shared series label. A
+            // common quote must leave another distinct quoted/described title.
+            const alternatives = new Set(titles.flatMap(title => {
+                const quotes = extractQuotedCandidates(title);
+                const label = quotes.find(candidate => candidate.key === key);
+                if (!label) return [];
+                const others = quotes.filter(candidate => candidate.key !== key).map(candidate => candidate.key);
+                if (others.length) return others;
+                const remainder = title.slice(label.end);
+                const delimiter = findStrongDelimiters(remainder).find(index => TITLE_DESCRIPTOR_RE.test(remainder.slice(0, index)));
+                return delimiter == null ? [] : [cleanTitleCandidate(remainder.slice(delimiter + 1))].filter(Boolean);
+            }));
+            if (count >= threshold && alternatives.size >= 2) commonQuoted.add(key);
         }
-        return { commonQuoted: commonQuoted, commonTails: findCommonTails(titles) };
+        // Count complete edge blocks before cutting character suffixes. Otherwise
+        // a repeated block such as Hi-Res can be reduced to a misleading fragment.
+        // A complete delimited block uses the same two-distinct-title evidence
+        // as a whole segment in applyCommonAffixes; hyphens inside it stay intact.
+        const commonBlocks = findRepeatedEdgeBlocks(titles.map(strongBlocks));
+        const commonBrackets = new Set([...bracketRemainders].filter(([, rest]) =>
+            rest.size >= Math.max(3, threshold)).map(([key]) => key));
+        const context = { commonQuoted, commonBlocks, commonBrackets, commonTails: [], ambiguousTitles: new Set() };
+        const blockFiltered = titles.map(title => removeCommonBlocks(title, context));
+        const segments = blockFiltered.map(splitTitle);
+        const repeatedSegments = findRepeatedEdgeBlocks(segments);
+        segments.forEach((group, index) => {
+            if (hasAmbiguousEdges(group, repeatedSegments)) context.ambiguousTitles.add(blockKey(blockFiltered[index]));
+        });
+        context.commonTails = findCommonTails(blockFiltered.filter(title => !context.ambiguousTitles.has(blockKey(title))), context, titles.length);
+        return context;
+    }
+
+    function blockKey(value) { return text(value).normalize('NFKC').toLowerCase(); }
+    function findRepeatedEdgeBlocks(groups) {
+        const edgeRemainders = new Map();
+        for (const blocks of groups) {
+            if (blocks.length < 2) continue;
+            for (const key of new Set([blockKey(blocks[0]), blockKey(blocks[blocks.length - 1])])) {
+                if (!edgeRemainders.has(key)) edgeRemainders.set(key, new Set());
+                const rest = blocks.filter(block => blockKey(block) !== key).map(blockKey).join(' | ');
+                if (rest) edgeRemainders.get(key).add(rest);
+            }
+        }
+        return new Set([...edgeRemainders].filter(([, remaining]) => remaining.size >= 2).map(([key]) => key));
+    }
+    function hasAmbiguousEdges(group, repeated) {
+        // If every part repeats, repetition cannot tell us which part is the title.
+        return group.length > 1 && group.every(value => repeated.has(blockKey(value)));
+    }
+    function strongBlocks(value) {
+        const positions = findStrongDelimiters(value);
+        const parts = [];
+        let start = 0;
+        for (const position of positions) { parts.push(text(value.slice(start, position))); start = position + 1; }
+        parts.push(text(value.slice(start)));
+        return parts.filter(Boolean);
+    }
+    function removeCommonBlocks(value, context) {
+        const blocks = strongBlocks(value);
+        let changed = false;
+        const removable = block => context.commonBlocks.has(blockKey(block)) && canRemoveRange(block, 0, block.length, context);
+        if (blocks.every(removable)) return value;
+        while (blocks.length > 1 && removable(blocks[0])) { blocks.shift(); changed = true; }
+        while (blocks.length > 1 && removable(blocks[blocks.length - 1])) { blocks.pop(); changed = true; }
+        return changed ? blocks.join(' | ') : value;
     }
 
     function removeCommonQuoted(value, context) {
@@ -174,8 +279,8 @@
         return text(result);
     }
 
-    function cleanTitleCandidate(value) {
-        let result = stripLeadingMetadata(value);
+    function cleanTitleCandidate(value, context) {
+        let result = stripLeadingMetadata(value, context);
         let previous;
         do {
             previous = result;
@@ -205,35 +310,65 @@
     function looksLikeTitleCandidate(value) {
         const candidate = text(value);
         if (!candidate || candidate.length > 80) return false;
-        if (!/[A-Za-z0-9\u3400-\u9fff]/.test(candidate)) return false;
+        if (!/[\p{L}\p{N}]/u.test(candidate)) return false;
         return !/^(?:BGM|OST|EP|PV|OP|ED)$/i.test(candidate);
     }
 
-    function selectTitleCandidate(value, context) {
+    function selectTitleCandidate(value, context, preferredTitle) {
         const source = text(value);
-        const quoted = extractQuotedCandidates(source)
+        const preserve = title => ({ title, protected: true });
+        if (context.ambiguousTitles.has(blockKey(source))) return preserve(source);
+        const quotedCandidates = extractQuotedCandidates(source)
             .filter(candidate => !context.commonQuoted.has(candidate.key))
             .filter(candidate => looksLikeTitleCandidate(candidate.value));
-        const quotedChoice = quoted.length ? quoted[quoted.length - 1] : null;
-
+        const quoted = quotedCandidates.filter((candidate, index) => {
+            const next = quotedCandidates[index + 1];
+            if (!next) return true;
+            const between = cleanSegment(source.slice(candidate.end, next.start));
+            const descriptor = between.match(TITLE_DESCRIPTOR_RE);
+            // A quoted subject followed directly by a descriptor and another
+            // quoted name supplies context; two bare names do not.
+            return !descriptor || descriptor.index !== 0;
+        });
+        if (new Set(quoted.map(candidate => candidate.key)).size > 1) {
+            // Several plausible names may describe a medley, versions or lessons.
+            // Their position alone is not evidence for discarding any of them.
+            return preserve(removeCommonQuoted(source, context));
+        }
+        const quotedChoice = quoted[0];
         const delimiters = findStrongDelimiters(source);
-        let delimiter = -1;
-        let delimitedChoice = '';
-        for (let i = delimiters.length - 1; i >= 0; i--) {
-            const position = delimiters[i];
-            const candidate = cleanTitleCandidate(removeCommonQuoted(source.slice(position + 1), context));
-            if (!looksLikeTitleCandidate(candidate)) continue;
-            delimiter = position;
-            delimitedChoice = candidate;
-            break;
+        if (quotedChoice) {
+            for (const delimiter of delimiters) {
+                const between = source.slice(quotedChoice.end, delimiter);
+                if (delimiter <= quotedChoice.end || !TITLE_DESCRIPTOR_RE.test(between)) continue;
+                const candidate = cleanTitleCandidate(removeCommonQuoted(source.slice(delimiter + 1), context), context);
+                if (looksLikeTitleCandidate(candidate)) return { title: candidate, protected: false };
+            }
+            return preserve(text(quotedChoice.value));
         }
-
-        if (delimitedChoice && quotedChoice) {
-            const between = source.slice(quotedChoice.end, delimiter);
-            if (delimiter > quotedChoice.end && TITLE_DESCRIPTOR_RE.test(between)) return delimitedChoice;
+        if (preferredTitle) {
+            const candidate = cleanTitleCandidate(removeCommonTails(removeCommonBlocks(preferredTitle, context), context), context);
+            // The importer knows the primary part name; its context separator
+            // is not evidence inferred from punctuation in a user's title.
+            if (looksLikeTitleCandidate(candidate) && !context.commonTails.includes(blockKey(candidate))) return { title: candidate, protected: false };
         }
-        if (quotedChoice) return cleanTitleCandidate(quotedChoice.value);
-        return delimitedChoice;
+        for (const delimiter of delimiters) {
+            const before = source.slice(0, delimiter);
+            const after = source.slice(delimiter + 1);
+            // A separator alone does not prove the song is on its right. Only
+            // discard the left side with explicit context. Keep the entire right
+            // side, rather than guessing its last segment is the best candidate.
+            const descriptor = text(before).match(TITLE_DESCRIPTOR_RE);
+            const explicitDescriptor = descriptor && (descriptor.index === 0 ||
+                /[^\p{L}\p{N}]/u.test(text(before)[descriptor.index - 1]));
+            const commonLabelOnly = !cleanSegment(removeCommonQuoted(before, context));
+            const startsWithCommonLabel = extractQuotedCandidates(after).some(candidate =>
+                context.commonQuoted.has(candidate.key) && !text(after.slice(0, candidate.start)));
+            if (!explicitDescriptor && !commonLabelOnly && !startsWithCommonLabel) continue;
+            const candidate = cleanTitleCandidate(removeCommonQuoted(after, context), context);
+            if (looksLikeTitleCandidate(candidate)) return { title: candidate, protected: false };
+        }
+        return { title: '', protected: false };
     }
 
     function commonPrefix(values) {
@@ -269,7 +404,7 @@
 
     function validAffix(affix, values, allowWholeValue) {
         const candidate = trimAffix(affix);
-        const markerOnly = /^[^A-Za-z0-9\u3400-\u9fff]+$/.test(candidate);
+        const markerOnly = /^[^\p{L}\p{N}]+$/u.test(candidate);
         if (candidate.length < MIN_COMMON_AFFIX_LENGTH && !(allowWholeValue && markerOnly)) return '';
         if (!values.every(value => value.length > candidate.length) && !allowWholeValue) return '';
         return candidate;
@@ -286,11 +421,29 @@
         return Array.from(clusters.values()).filter(cluster => cluster.length >= 2);
     }
 
-    function applyCommonAffixes(groups, includeSuffix) {
+    function affixBoundary(left, right) {
+        return /[\s\-–—|｜丨/／,，;；:：·•_&+]/.test(left + right) ||
+            (/[\u3400-\u9fff]/.test(left) && /[A-Za-z]/.test(right)) ||
+            (/[A-Za-z]/.test(left) && /[\u3400-\u9fff]/.test(right));
+    }
+
+    function supportsAffix(remaining, bounded, total) {
+        const distinct = new Set(remaining.map(value => blockKey(cleanSegment(value))).filter(value => /[\p{L}\p{N}]/u.test(value)));
+        // Duplicate uploads must not turn two observations into strong evidence.
+        return distinct.size >= (bounded ? 2 : Math.max(3, Math.ceil(total * 0.5)));
+    }
+
+    function applyCommonAffixes(groups, protectedGroups, context) {
         if (groups.length < 2) return;
+        const distinctTotal = new Set(groups.map(group => blockKey(group.join(' - ')))).size;
+        const repeated = findRepeatedEdgeBlocks(groups);
+        for (const group of groups) {
+            if (hasAmbiguousEdges(group, repeated)) protectedGroups.add(group);
+        }
+        const eligible = groups.filter(group => !protectedGroups || !protectedGroups.has(group));
         // Work within simple title-shape clusters. This supports mixed collections
         // where one group uses a leading description and another uses a trailing one.
-        const prefixClusters = groupClusters(groups, group => (group[0] || '').slice(0, 1));
+        const prefixClusters = groupClusters(eligible, group => (group[0] || '').slice(0, 1));
         for (const cluster of prefixClusters) {
             // Strip at most three layers. This also handles a user prefix followed by
             // a shared artist/series segment without hard-coding any artist names.
@@ -298,6 +451,10 @@
                 const firstValues = cluster.map(group => group[0] || '');
                 const prefix = validAffix(commonPrefix(firstValues), firstValues, cluster.every(group => group.length > 1));
                 if (!prefix) break;
+                if (!cluster.every(group => canRemoveRange(group[0], 0, prefix.length, context))) break;
+                const bounded = cluster.every(group => (group[0] === prefix && group.length > 1) ||
+                    affixBoundary(prefix.slice(-1), group[0][prefix.length] || ''));
+                if (cluster.some(group => /[A-Za-z0-9]/.test(prefix.slice(-1)) && /[A-Za-z0-9]/.test(group[0][prefix.length] || ''))) break;
                 const candidate = cluster.map(group => {
                     const next = group.slice();
                     next[0] = cleanSegment(next[0].slice(prefix.length));
@@ -307,12 +464,12 @@
                     return next.filter(Boolean);
                 });
                 if (!candidate.every(group => group.length && group.join(' - ').length)) break;
+                if (!supportsAffix(candidate.map(group => group.join(' - ')), bounded, distinctTotal)) break;
                 candidate.forEach((next, index) => cluster[index].splice(0, cluster[index].length, ...next));
             }
         }
 
-        if (includeSuffix === false) return;
-        const suffixClusters = groupClusters(groups, group => {
+        const suffixClusters = groupClusters(eligible, group => {
             const last = group[group.length - 1] || '';
             return last.slice(-1);
         });
@@ -320,6 +477,12 @@
             const lastValues = cluster.map(group => group[group.length - 1] || '');
             const suffix = validAffix(commonSuffix(lastValues), lastValues, cluster.every(group => group.length > 1));
             if (!suffix) continue;
+            if (!lastValues.every(value => canRemoveRange(value, value.length - suffix.length, value.length, context))) continue;
+            const bounded = cluster.every(group => {
+                const last = group[group.length - 1];
+                return (last === suffix && group.length > 1) || affixBoundary(last[last.length - suffix.length - 1] || '', suffix[0]);
+            });
+            if (lastValues.some(value => /[A-Za-z0-9]/.test(value[value.length - suffix.length - 1] || '') && /[A-Za-z0-9]/.test(suffix[0]))) continue;
             const candidate = cluster.map(group => {
                 const next = group.slice();
                 const last = next.length - 1;
@@ -327,17 +490,9 @@
                 return next.filter(Boolean);
             });
             if (!candidate.every(group => group.length && group.join(' - ').length)) continue;
+            if (!supportsAffix(candidate.map(group => group.join(' - ')), bounded, distinctTotal)) continue;
             candidate.forEach((next, index) => cluster[index].splice(0, cluster[index].length, ...next));
         }
-    }
-
-    function filterLongSegments(groups) {
-        return groups.map(group => {
-            const retained = group.filter(segment => segment.length <= MAX_SEGMENT_LENGTH);
-            if (retained.length) return retained;
-            // If every candidate is long, preserve the shortest one instead of producing an empty title.
-            return group.slice().sort((a, b) => a.length - b.length).slice(0, 1);
-        });
     }
 
     function compilePattern(pattern, flags) {
@@ -550,9 +705,9 @@
         return full;
     }
 
-    function applyRules(title, groups, rules, titleRulesApplied, budget) {
+    function applyRules(title, groups, rules, titleRulesApplied, budget, context, protectedTitle) {
         const full = titleRulesApplied ? title : applyTitleRules(title, rules, budget);
-        let next = splitTitle(full).map(stripLeadingMetadata).filter(Boolean);
+        let next = protectedTitle ? [full] : splitTitle(full).map(value => stripLeadingMetadata(value, context)).filter(Boolean);
         if (next.length > 1) {
             next = next.filter(segment => !/^#?\d{1,3}$/.test(segment));
         }
@@ -560,7 +715,7 @@
             if (rule.scope !== 'segment') continue;
             next = next.map(segment => cleanSegment(replaceWithRule(segment, rule, budget))).filter(Boolean);
         }
-        groups.push(next.length ? next : splitTitle(title).map(stripLeadingMetadata).filter(Boolean));
+        groups.push(next.length ? next : splitTitle(title).map(value => stripLeadingMetadata(value, context)).filter(Boolean));
     }
 
     function sanitizePrefix(value) {
@@ -576,38 +731,94 @@
         return p + ' - ' + n;
     }
 
+    function bgmTitleMatches(name, title) {
+        const candidate = text(name).normalize('NFKC').toLowerCase();
+        const source = text(title).normalize('NFKC').toLowerCase();
+        if (!source || source.length > 1000) return false;
+        const letters = Array.from(candidate).filter(ch => !/\s/.test(ch));
+        if (!letters.length) return false;
+        // Whitespace differences are formatting; punctuation and spelling stay
+        // significant. Keep source boundaries when checking short/Latin names.
+        const pattern = letters.map(ch => ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\s*');
+        const matches = source.matchAll(new RegExp(pattern, 'gu'));
+        for (const match of matches) {
+            const left = Array.from(source.slice(0, match.index)).pop() || '';
+            const right = Array.from(source.slice(match.index + match[0].length))[0] || '';
+            if (letters.length <= 2 && /[\p{L}\p{N}]/u.test(left + right)) continue;
+            if (/[a-z0-9]/.test(letters[0]) && /[a-z0-9]/.test(left)) continue;
+            if (/[a-z0-9]/.test(letters[letters.length - 1]) && /[a-z0-9]/.test(right)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    function selectBgmTitle(tags, titles) {
+        const names = new Map();
+        if (!Array.isArray(tags) || !Array.isArray(titles)) return '';
+        for (const tag of tags.slice(0, 20)) {
+            if (!tag || tag.tag_type !== 'bgm' || typeof tag.tag_name !== 'string' || !tag.music_id) continue;
+            const label = text(tag.tag_name);
+            if (label.length > MAX_TITLE_LENGTH + 4) continue;
+            const wrapped = /^发现\s*《(.+)》$/.exec(label);
+            const name = wrapped ? text(wrapped[1]) : label;
+            if (!name || name.length > MAX_TITLE_LENGTH || !/[\p{L}\p{N}]/u.test(name) ||
+                (!wrapped && /^发现\s*《/.test(label))) continue;
+            if (titles.some(title => typeof title === 'string' && bgmTitleMatches(name, title))) {
+                names.set(blockKey(name).replace(/\s/g, ''), name);
+            }
+        }
+        // Multiple matching names can describe a medley. Do not pick one by order.
+        return names.size === 1 ? names.values().next().value : '';
+    }
+
     async function renameItems(items, options) {
         options = options || {};
         const source = Array.isArray(items) ? items : [];
         const rules = options.rules == null ? await loadRules() : normalizeRules(options.rules);
         const groups = [];
+        const protectedGroups = new Set();
         const originals = [];
         const budgets = source.map(() => ({ remaining: MAX_RULE_STEPS }));
         for (const item of source) {
             const original = text(item && item.title);
             originals.push(original);
         }
+        // Verify against untouched source fields, not titles shortened by rules.
+        const bgmTitles = originals.map((original, index) => selectBgmTitle(
+            options.bgmTags && options.bgmTags[index],
+            options.titleSources && options.titleSources[index] || [original]));
         const preparedTitles = originals.map((original, index) =>
             applyTitleRules(original.slice(0, MAX_TITLE_LENGTH), rules, budgets[index]));
         const context = buildTitleContext(preparedTitles);
         for (let index = 0; index < originals.length; index++) {
+            if (bgmTitles[index]) {
+                const confirmed = applyTitleRules(bgmTitles[index], rules, budgets[index]) || bgmTitles[index];
+                const local = [];
+                applyRules(confirmed, local, rules, true, budgets[index], context, true);
+                const group = local[0] && local[0].length ? local[0] : [bgmTitles[index]];
+                groups.push(group);
+                protectedGroups.add(group);
+                continue;
+            }
             const original = originals[index];
             const ruleFiltered = preparedTitles[index];
-            const structural = removeCommonTails(ruleFiltered, context);
-            const candidate = selectTitleCandidate(structural, context);
-            const prepared = candidate || removeCommonQuoted(structural, context);
+            const structural = removeCommonTails(removeCommonBlocks(ruleFiltered, context), context);
+            const preferred = options.preferredTitles && options.preferredTitles[index];
+            const preferredTitle = preferred ? applyTitleRules(text(preferred).slice(0, MAX_TITLE_LENGTH), rules, budgets[index]) : '';
+            const candidate = selectTitleCandidate(structural, context, preferredTitle);
+            const prepared = candidate.title || removeCommonQuoted(structural, context);
             const local = [];
-            applyRules(prepared, local, rules, true, budgets[index]);
-            groups.push(local[0] && local[0].length ? local[0] : [stripLeadingMetadata(original) || original]);
+            applyRules(prepared, local, rules, true, budgets[index], context, candidate.protected);
+            const group = local[0] && local[0].length ? local[0] : [stripLeadingMetadata(original, context) || original];
+            groups.push(group);
+            if (candidate.protected) protectedGroups.add(group);
         }
-        // Detect common prefixes before dropping long candidates. This preserves a
-        // prefix shared by most items even when a few items include collaborators.
-        applyCommonAffixes(groups, false);
-        const filtered = filterLongSegments(groups);
-        applyCommonAffixes(filtered, true);
+        // Length alone is not evidence of metadata. Uncertain segments remain
+        // intact; only supported structural and batch rules may remove them.
+        applyCommonAffixes(groups, protectedGroups, context);
         return source.map((item, index) => {
             const fallback = stripLeadingMetadata(originals[index]) || originals[index] || String(item && item.bvid || '');
-            const name = (filtered[index] && filtered[index].join(' - ')) || fallback;
+            const name = (groups[index] && groups[index].join(' - ')) || fallback;
             const copy = Object.assign({}, item || {});
             copy.title = addPrefix(name, options.prefix);
             delete copy.originalTitle;
@@ -616,11 +827,11 @@
     }
 
     root.BPLRenamer = {
-        MAX_SEGMENT_LENGTH: MAX_SEGMENT_LENGTH,
         normalizeRules: normalizeRules,
         splitTitle: splitTitle,
         loadRules: loadRules,
         renameItems: renameItems,
+        selectBgmTitle: selectBgmTitle,
         sanitizePrefix: sanitizePrefix
     };
 })(typeof globalThis !== 'undefined' ? globalThis : this);

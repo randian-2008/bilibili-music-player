@@ -189,6 +189,7 @@ const NETWORK_RETRY_DELAY_MS = 250;
 // contexts in quick succession. Manual retry deliberately bypasses this gate.
 const CHART_MATCH_FAILURE_COOLDOWN_MS = 15000;
 const CHART_MANUAL_RETRY_LIMIT = 10;
+const MATCH_HISTORY_MAX = 20;
 const MATCH_OPERATION_TIMEOUT_MS = 105000;
 const MATCH_PLAY_OPERATION_TIMEOUT_MS = 140000;
 const MEDIA_PROBE_TIMEOUT_MS = 12000;
@@ -404,7 +405,7 @@ function normalizedMatchHistory(item) {
         const value = String(bvid || '');
         if (isValidBvid(value) && result.indexOf(value) < 0) result.push(value);
     }
-    return result;
+    return result.slice(-MATCH_HISTORY_MAX);
 }
 function extendedMatchHistory(item, ...bvids) {
     const result = normalizedMatchHistory(item);
@@ -415,23 +416,30 @@ function extendedMatchHistory(item, ...bvids) {
         if (previous >= 0) result.splice(previous, 1);
         result.push(value);
     }
-    return result;
+    return result.slice(-MATCH_HISTORY_MAX);
 }
 function matchOrigin(item) {
     if (item && (item.matchOrigin === 'chart' || item.matchOrigin === 'repair' || item.matchOrigin === 'manual')) return item.matchOrigin;
     return isChartItem(item) && item.bvid ? 'chart' : '';
 }
 function canRematchSource(item) {
-    return !!(item && item.bvid && (item.sourceUnavailable || matchOrigin(item)));
+    // Every item with a concrete source may be explicitly switched to another
+    // source. Pending manual/chart entries still use their initial search flow.
+    return !!(item && isValidBvid(item.bvid));
 }
-function sourceMatchTarget(item) {
+function sourceMatchTarget(item, options) {
     const chartTitle = String(item && item.sourceTitle || '').trim();
     const chartArtist = String(item && item.sourceArtist || '').trim();
+    const useCurrentTitle = !!(options && options.useCurrentTitle);
     return {
-        title: String(item && (item.matchTargetTitle || chartTitle || item.title) || '').trim(),
-        sourceArtist: String(item && (item.matchTargetArtist || chartArtist) || '').trim(),
-        duration: Number(item && (item.matchTargetDuration || item.duration)) || 0,
-        owner: String(item && (item.matchTargetOwner || (!matchOrigin(item) ? item.owner : '')) || '').trim()
+        // A user-initiated rematch follows the visible title at the moment of
+        // the click. Stored chart/manual targets remain available to the
+        // original matching and metadata-preservation paths.
+        title: String(item && (useCurrentTitle ? (item.title || chartTitle || item.matchTargetTitle) :
+            (item.matchTargetTitle || chartTitle || item.title)) || '').trim(),
+        sourceArtist: String(item && (useCurrentTitle ? '' : (item.matchTargetArtist || chartArtist)) || '').trim(),
+        duration: Number(item && (useCurrentTitle ? item.duration : (item.matchTargetDuration || item.duration))) || 0,
+        owner: String(item && (useCurrentTitle ? '' : (item.matchTargetOwner || (!matchOrigin(item) ? item.owner : ''))) || '').trim()
     };
 }
 function chartPlaceholder(source, song) {
@@ -715,10 +723,10 @@ async function checkBiliSource(bvid) {
     }
 }
 
-async function searchReplacementCandidates(item) {
+async function searchReplacementCandidates(item, options) {
     const matcher = globalThis.BPLChartMatcher;
     if (!matcher || typeof matcher.rankReplacementCandidates !== 'function') throw new Error('替代源匹配器不可用');
-    const target = sourceMatchTarget(item);
+    const target = sourceMatchTarget(item, options);
     const keyword = [target.title, target.sourceArtist].filter(Boolean).join(' ');
     if (!keyword) throw new Error('条目标题为空，无法搜索替代源');
     const url = 'https://api.bilibili.com/x/web-interface/search/type?search_type=video' +
@@ -747,9 +755,9 @@ function replacementResolvedPage(item, resolved) {
     return { cid: best.cid || resolved.cid, info: resolved.info, page: best };
 }
 
-async function performSourceRematch(playlistId, itemId) {
-    const playbackDeadline = Date.now() + MATCH_PLAY_OPERATION_TIMEOUT_MS;
-    const intent = beginBackgroundPlayIntent();
+async function performSourceRematch(playlistId, itemId, options) {
+    options = options || {};
+    const forceSearch = options.forceSearch !== false;
     const deadline = Date.now() + MATCH_OPERATION_TIMEOUT_MS;
     let lists = await getPlaylists();
     let playlist = findPl(lists, playlistId);
@@ -757,9 +765,17 @@ async function performSourceRematch(playlistId, itemId) {
     if (!item || !canRematchSource(item) || !isValidBvid(item.bvid)) {
         return { ok: false, error: '该条目不支持重新匹配音源' };
     }
+    const state = await getState();
+    const wasPlaying = !!(state.playing && state.playlistId === playlistId && state.trackId === itemId);
+    // Legacy repairSource keeps its recovery behavior. The user-facing
+    // rematchSource only resumes playback when the rematched item was already
+    // playing; rematching another row must never start it unexpectedly.
+    const resumePlayback = forceSearch ? wasPlaying : true;
+    const playbackDeadline = resumePlayback ? Date.now() + MATCH_PLAY_OPERATION_TIMEOUT_MS : 0;
+    const intent = resumePlayback ? beginBackgroundPlayIntent() : 0;
     const originalBvid = item.bvid;
     const originalTitle = item.title;
-    if (item.sourceUnavailable && !matchOrigin(item)) {
+    if (!forceSearch && item.sourceUnavailable && !matchOrigin(item)) {
         let recheck;
         try { recheck = await matchBeforeDeadline(deadline, () => checkBiliSource(originalBvid)); }
         catch (error) { return { ok: false, error: String(error.message || error) }; }
@@ -788,7 +804,7 @@ async function performSourceRematch(playlistId, itemId) {
         if (Date.now() >= deadline) { lastError = matchTimeoutError(); break; }
         let entry = null;
         try {
-            const ranked = await matchBeforeDeadline(deadline, () => searchReplacementCandidates(searchItem));
+            const ranked = await matchBeforeDeadline(deadline, () => searchReplacementCandidates(searchItem, { useCurrentTitle: true }));
             if (!ranked.length) break;
             entry = ranked[0];
             let resolved = await matchBeforeDeadline(deadline, () => resolveCid(entry.candidate.bvid, 1));
@@ -799,7 +815,9 @@ async function performSourceRematch(playlistId, itemId) {
             const replacement = resolvedItemFields(resolved, entry.candidate.bvid, resolved.page && resolved.page.page || 1, entry.candidate);
             const changed = await mutatePlaylistItem(playlistId, itemId, current => {
                 assertMatchDeadline(deadline);
-                if (current.bvid !== originalBvid || !canRematchSource(current)) return false;
+                // A title edit during the network operation invalidates the
+                // snapshot. Never commit a source found for an older title.
+                if (current.bvid !== originalBvid || current.title !== originalTitle || !canRematchSource(current)) return false;
                 const title = current.title || originalTitle;
                 const target = sourceMatchTarget(current);
                 const origin = matchOrigin(current) || 'repair';
@@ -822,6 +840,7 @@ async function performSourceRematch(playlistId, itemId) {
                 delete current.sourceUnavailableReason;
             });
             if (!changed) return { ok: false, error: '条目已发生变化' };
+            if (!resumePlayback) return { ok: true, replaced: true, bvid: replacement.bvid };
             lists = await getPlaylists();
             playlist = findPl(lists, playlistId);
             const index = playlist ? playlist.items.findIndex(current => current.id === itemId) : -1;
@@ -839,11 +858,11 @@ async function performSourceRematch(playlistId, itemId) {
     return { ok: false, error: '没有找到可播放的替代源' + (lastError ? '：' + String(lastError.message || lastError) : '') };
 }
 
-async function rematchSource(playlistId, itemId) {
+async function rematchSource(playlistId, itemId, options) {
     const key = chartItemKey(playlistId, itemId);
     const existing = sourceRematchInflight.get(key);
     if (existing) return await existing;
-    const task = performSourceRematch(playlistId, itemId)
+    const task = performSourceRematch(playlistId, itemId, options)
         .finally(() => sourceRematchInflight.delete(key));
     sourceRematchInflight.set(key, task);
     return await task;
@@ -1697,7 +1716,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 const PLAYLIST_MUTATION_CMDS = new Set([
-    'addManualItem', 'remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'moveItem', 'clear',
+    'addManualItem', 'remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove',
+    'batchCopyNew', 'batchMoveNew', 'moveItem', 'clear',
     'createPlaylist', 'renamePlaylist', 'deletePlaylist', 'importPlaylist', 'setActive', 'setMode'
 ]);
 
@@ -1733,7 +1753,7 @@ async function handleBg(msg, sender, mutationLocked) {
     if (msg.resolveAudio) return await handleResolveAudio(msg.resolveAudio);
     // Destructive edits from stale interfaces must never be interpreted against
     // whichever playlist happens to be active when the queued operation runs.
-    if (['remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'moveItem', 'clear'].includes(msg.cmd) &&
+    if (['remove', 'renameItem', 'batchRemove', 'batchCopy', 'batchMove', 'batchCopyNew', 'batchMoveNew', 'moveItem', 'clear'].includes(msg.cmd) &&
         !msg.playlistId) return { ok: false, error: '缺少播放列表标识，请刷新页面后重试' };
     if (!mutationLocked && PLAYLIST_MUTATION_CMDS.has(msg.cmd)) {
         return await withPlaylistMutation(() => handleBg(msg, sender, true));
@@ -1805,9 +1825,11 @@ async function handleBg(msg, sender, mutationLocked) {
         case 'playChartItem': {
             return await playChartItem(String(msg.playlistId || ''), String(msg.itemId || ''));
         }
-        case 'repairSource':
+        case 'repairSource': {
+            return await rematchSource(String(msg.playlistId || ''), String(msg.itemId || ''), { forceSearch: false });
+        }
         case 'rematchSource': {
-            return await rematchSource(String(msg.playlistId || ''), String(msg.itemId || ''));
+            return await rematchSource(String(msg.playlistId || ''), String(msg.itemId || ''), { forceSearch: true });
         }
         case 'getCollection': {
             try { return await collectionSummary(msg.bvid); }
@@ -2080,6 +2102,57 @@ async function handleBg(msg, sender, mutationLocked) {
             if (msg.cmd === 'batchMove') await reconcileStoredState(lists);
             await broadcastData();
             return { ok: true, count: asc.length, added: added };
+        }
+        case 'batchCopyNew':
+        case 'batchMoveNew': {
+            const lists = await getPlaylists();
+            const fromPl = findPl(lists, msg.playlistId);
+            if (!fromPl) return { ok: false, error: '源播放列表不存在，请刷新页面后重试' };
+            const asc = selectedItemIndices(fromPl, msg.itemIds);
+            if (!asc.length) return { ok: false, error: '选中的条目已不存在，请重新选择' };
+            const move = msg.cmd === 'batchMoveNew';
+            const selectedIds = new Set(asc.map(index => fromPl.items[index].id));
+            const id = genId();
+            const name = (msg.name && String(msg.name).trim()) || '新播放列表';
+            const items = asc.map(index => {
+                const source = fromPl.items[index];
+                const item = move ? source : Object.assign({}, source, { id: genId() });
+                // A pending matcher is keyed by the old playlist ID. Clear
+                // its transient state when the item changes lists so the new
+                // list can schedule a fresh attempt instead of leaving a
+                // permanently disabled "matching" row behind.
+                resetMatchingState(item);
+                return item;
+            });
+            lists.push({ id, name: name.slice(0, 100), items });
+            if (move) {
+                for (let k = asc.length - 1; k >= 0; k--) fromPl.items.splice(asc[k], 1);
+            }
+            await savePlaylists(lists);
+            await setActiveId(id);
+            if (move) {
+                // Read the state under its own mutation lock after the list
+                // write. If playback changed while the dialog was open, the
+                // track currently selected for moving is the one that should
+                // follow the item; otherwise reconcile its source-list index.
+                let stateMigrated = false;
+                await withPlayerStateMutation(async () => {
+                    const current = await getState();
+                    if (current.playlistId !== fromPl.id || !current.trackId || !selectedIds.has(current.trackId)) return;
+                    const index = items.findIndex(item => item.id === current.trackId);
+                    if (index < 0) return;
+                    current.playlistId = id;
+                    current.index = index;
+                    current.mode = normalizeMode(current);
+                    const destination = findPl(lists, id);
+                    if (destination && MODES.includes(destination.mode)) current.mode = destination.mode;
+                    await chrome.storage.local.set({ bpl_state: current });
+                    stateMigrated = true;
+                });
+                if (!stateMigrated) await reconcileStoredState(lists);
+            }
+            await broadcastData();
+            return { ok: true, playlistId: id, count: items.length, added: items.length, moved: move };
         }
         case 'moveItem': {
             const lists = await getPlaylists();

@@ -179,6 +179,12 @@ async function testMatchPlaybackBudget() {
             ctx.getAudioUrls = async () => ['https://cdn/valid'];
             const result = kind === 'chart' ? await ctx.playChartItem('p', 'a') : await ctx.rematchSource('p', 'a');
             const playCommand = messages.find(msg => msg.cmd === 'playIndex');
+            if (kind === 'replacement') {
+                assert.equal(playCommand, undefined, '重新匹配未播放条目不会自动开始播放');
+                assert.equal(result.ok, true, '未播放条目仍能完成来源替换');
+                assert.equal(player.__audio.playCalls, 0, '未播放条目不触发可听播放');
+                continue;
+            }
             assert(playCommand);
             assert.equal(playCommand.playbackDeadline, 141000, 'outer deadline starts before matching');
             assert.equal(playCommand.deadline, 136000, 'media finishes with five seconds left for transport/state');
@@ -277,6 +283,52 @@ async function run() {
     assert.equal(ctx.__store.bpl_playlists[0].items[0].bvid, 'BV1sM4y1x7Bx');
     assert(!ctx.__store.bpl_playlists[0].items[0].matchHistory.includes('BV1LTisBHESH'));
     console.log('PASS: failed media probe causes another search without committing bad source');
+
+    ctx = bg.makeCtx({ realTimers: true });
+    ctx.__store.bpl_playlists = [{ id: 'p', items: [{
+        id: 'a', title: '当前歌曲名', bvid: 'BV1ar421b77b', cid: 1, duration: 180,
+        matchTargetTitle: '旧的匹配标题', matchHistory: ['BV1ar421b77b']
+    }] }, { id: 'other', items: [{ id: 'other-item', title: '正在播放' }] }];
+    ctx.__store.bpl_state = { playlistId: 'other', trackId: 'other-item', index: 0, mode: 'loop', playing: true };
+    assert.equal(ctx.sourceMatchTarget(ctx.__store.bpl_playlists[0].items[0], { useCurrentTitle: true }).title, '当前歌曲名');
+    assert.equal(ctx.sourceMatchTarget(ctx.__store.bpl_playlists[0].items[0], { useCurrentTitle: true }).sourceArtist, '');
+    let rematchTitle = '';
+    ctx.searchReplacementCandidates = async (item, options) => {
+        rematchTitle = item.title;
+        assert(options && options.useCurrentTitle);
+        return [{ score: 99, candidate: { bvid: 'BV1sM4y1x7Bx', title: '替代源' } }];
+    };
+    ctx.resolveCid = async () => ({ cid: 2, info: { bvid: 'BV1sM4y1x7Bx', title: '替代视频' }, page: { page: 1, duration: 180 } });
+    ctx.getAudioUrls = async () => ['https://cdn/rematch-current-title'];
+    const probeCalls = [];
+    ctx.sendToOffscreen = async msg => { probeCalls.push(msg); return { ok: true }; };
+    const ordinaryRematch = await ctx.rematchSource('p', 'a');
+    assert(ordinaryRematch.ok && ordinaryRematch.replaced);
+    assert.equal(rematchTitle, '当前歌曲名');
+    assert.equal(ctx.__store.bpl_playlists[0].items[0].bvid, 'BV1sM4y1x7Bx');
+    assert.equal(probeCalls.length, 1);
+    assert.equal(probeCalls[0].cmd, 'probeAudio');
+    assert.equal(ctx.__store.bpl_state.trackId, 'other-item');
+    assert.equal(ctx.__store.bpl_state.playing, true);
+    console.log('PASS: ordinary sources rematch from the current title without interrupting other playback');
+
+    ctx = bg.makeCtx({ realTimers: true });
+    ctx.__store.bpl_playlists = [{ id: 'p', items: [{
+        id: 'a', title: '旧标题', bvid: 'BV1ar421b77b', cid: 1, duration: 180
+    }] }];
+    let finishLateSearch;
+    ctx.searchReplacementCandidates = async () => new Promise(resolve => { finishLateSearch = resolve; });
+    ctx.resolveCid = async () => ({ cid: 2, info: { bvid: 'BV1sM4y1x7Bx' }, page: { page: 1, duration: 180 } });
+    ctx.getAudioUrls = async () => ['https://cdn/late-title'];
+    const staleRematch = ctx.rematchSource('p', 'a');
+    for (let turn = 0; turn < 120 && !finishLateSearch; turn++) await Promise.resolve();
+    assert(finishLateSearch);
+    ctx.__store.bpl_playlists[0].items[0].title = '用户刚改的新标题';
+    finishLateSearch([{ score: 99, candidate: { bvid: 'BV1sM4y1x7Bx', title: '替代源' } }]);
+    const staleResult = await staleRematch;
+    assert.equal(staleResult.ok, false);
+    assert.equal(ctx.__store.bpl_playlists[0].items[0].bvid, 'BV1ar421b77b');
+    console.log('PASS: a late rematch result cannot overwrite a title edited during matching');
 
     ctx = bg.makeCtx({ offscreenResponder: () => ({ ok: false, transient: true, error: 'network timeout' }) });
     ctx.__store.bpl_playlists = [{ id: 'p', items: [{ id: 'a', title: 'Song', bvid: 'BV1ar421b77b', cid: 1, matchOrigin: 'repair' }] }];

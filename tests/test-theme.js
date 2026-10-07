@@ -78,8 +78,10 @@ ok(toolbarStart >= 0 && addButton > toolbarStart && chartButton > addButton &&
     '工具栏按“播放列表、添加、热榜、更多操作”布局，并接入手动条目入口');
 const selectionMenu = sidepanelHtml.indexOf('<div id="selMenu"');
 ok(selectionMenu > listwrapEnd && /\.sel-menu\s*\{[\s\S]*?position:\s*fixed;[\s\S]*?z-index:\s*70;/.test(sidepanelCss) &&
-    /function positionSelectionMenu\(\)/.test(sidepanelCode),
-    '批量移动和复制菜单是列表外的视口级浮层，可覆盖歌曲并按可用空间定位');
+    /function positionSelectionMenu\(\)/.test(sidepanelCode) && /data-new-playlist/.test(sidepanelCode) &&
+    /batchCopyNew|batchMoveNew/.test(sidepanelCode) && /\.sel-menu \.sel-sep/.test(sidepanelCss) &&
+    /\.sel-menu \.sel-new/.test(sidepanelCss),
+    '批量移动和复制菜单是列表外的视口级浮层，并提供分隔后的新播放列表入口');
 ok(contentCode.includes("THEME_PICKER_ORDER = ['paper', 'gold', 'jade', 'starry'") &&
     contentCode.includes('.theme-picker.open .theme-swatches{max-width:112px') &&
     contentCode.includes('.theme-swatch{appearance:none;flex:none;width:16px;height:16px') &&
@@ -110,7 +112,7 @@ ok(/data-rematch=/.test(sidepanelCode) && /title="重新匹配音源"/.test(side
     /\.source-slot\.unavailable \.source-rematch/.test(sidepanelCss) &&
     !/\.item:hover \.source-slot\.rematchable \.source-rematch/.test(sidepanelCss) &&
     /width: 42px; height: 22px/.test(sidepanelCss),
-    '自动匹配条目仅悬浮时长槽才显示按钮，失效条目则持续显示重新匹配按钮');
+    '所有已有音源条目仅在悬浮时长槽时显示重新匹配按钮，失效条目持续显示');
 ok((sidepanelHtml.match(/data-locate-playing/g) || []).length === 2 &&
     /async function locatePlayingItem\(\)/.test(sidepanelCode) &&
     /send\('setActive', \{ id: pl\.id \}\)/.test(sidepanelCode) &&

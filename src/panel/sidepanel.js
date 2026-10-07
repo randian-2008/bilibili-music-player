@@ -36,8 +36,7 @@ const rematchingSources = new Set();
 const manualMatchingItems = new Set();
 
 function canRematchItem(item) {
-    return !!(item && item.bvid && (item.sourceUnavailable || item.matchOrigin === 'chart' || item.matchOrigin === 'repair' ||
-        item.matchOrigin === 'manual' || (item.chartSource && item.matchState === 'matched')));
+    return !!(item && item.bvid && item.matchState !== 'matching');
 }
 function isManualPending(item) {
     return !!(item && item.matchOrigin === 'manual' && !item.bvid &&
@@ -1015,7 +1014,7 @@ box.addEventListener('click', e => {
         toast('正在重新匹配音源');
         send('rematchSource', { playlistId: activeId, itemId: item.id }).then(result => {
             rematchingSources.delete(item.id);
-            if (result && result.ok) toast(result.replaced ? '已切换到新的匹配源' : '原视频已恢复');
+            if (result && result.ok) toast(result.replaced ? '已切换到新的匹配源' : (result.recovered ? '原视频已恢复' : '音源已更新'));
             else toast((result && result.error) || '未找到新的可信来源');
             refresh();
         });
@@ -1126,9 +1125,12 @@ function openSelMenu(action) {
     selAction = action;
     const others = playlists.filter(p => p.id !== activeId);
     const selMenu = $('#selMenu');
-    selMenu.innerHTML = others.length
+    const targets = others.length
         ? others.map(p => '<div data-plid="' + esc(p.id) + '">' + esc(p.name) + '</div>').join('')
         : '<div class="sel-none">（无其他播放列表）</div>';
+    selMenu.innerHTML = targets +
+        '<div class="sel-sep" role="separator"></div>' +
+        '<div class="sel-new" data-new-playlist="true">新播放列表</div>';
     selMenu.classList.remove('hidden');
     selMenu.scrollTop = 0;
     positionSelectionMenu();
@@ -1145,10 +1147,24 @@ $('#selCancelBtn').addEventListener('click', exitSelMode);
 $('#selMenu').addEventListener('click', e => {
     e.stopPropagation();
     const d = e.target.closest('[data-plid]');
+    const createNew = e.target.closest('[data-new-playlist]');
     $('#selMenu').classList.add('hidden');
-    if (!d) return;
     const itemIds = selItemIds(), playlistId = selectionPlaylistId;
     if (!itemIds.length) return;
+    if (createNew) {
+        const cmd = selAction === 'move' ? 'batchMoveNew' : 'batchCopyNew';
+        const actionName = selAction === 'move' ? '移动' : '复制';
+        showPanelDialog({
+            title: actionName + '到新播放列表',
+            message: actionName + '已选的 ' + itemIds.length + ' 个条目到新播放列表',
+            input: true,
+            value: '新播放列表',
+            onConfirm: name => send(cmd, { playlistId, itemIds, name }),
+            onSuccess: () => { exitSelMode(); refresh(); }
+        });
+        return;
+    }
+    if (!d) return;
     const cmd = selAction === 'move' ? 'batchMove' : 'batchCopy';
     send(cmd, { playlistId, itemIds, toId: d.dataset.plid }).then(() => { exitSelMode(); refresh(); });
 });

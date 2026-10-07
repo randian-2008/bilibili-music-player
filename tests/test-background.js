@@ -312,6 +312,30 @@ function makeCtx(opts) {
     ok(ctx.__store.bpl_state.trackId === null && ctx.__store.bpl_state.playing === false && ctx.__store.bpl_position === null,
         '移走正在播放歌曲后停止并清除断点');
 
+    // 从批量菜单创建新播放列表：复制保留源列表和当前播放状态，条目获得新的稳定 ID。
+    ctx = seedBatch();
+    r = await ctx.handleBg({ cmd: 'batchCopyNew', playlistId: 'plA', itemIds: ['item0', 'item2'], name: '精选歌曲' }, null);
+    const copiedNew = ctx.__store.bpl_playlists.find(p => p.id === r.playlistId);
+    ok(r.ok && copiedNew && copiedNew.name === '精选歌曲' && copiedNew.items.length === 2 &&
+        ctx.__store.bpl_active === copiedNew.id && ctx.__store.bpl_playlists.find(p => p.id === 'plA').items.length === 5,
+        '批量复制到新播放列表创建列表并切换显示');
+    ok(copiedNew.items.every(item => !['item0', 'item2'].includes(item.id)) &&
+        copiedNew.items.map(item => item.bvid).join(',') === 'BV0,BV2' &&
+        ctx.__store.bpl_state.playlistId === 'plA' && ctx.__store.bpl_state.trackId === 'item2',
+        '复制到新列表保留顺序、内容和原播放状态');
+
+    // 移动正在播放的条目时，播放身份跟随原条目迁移到新列表，断点也继续有效。
+    ctx = seedBatch();
+    r = await ctx.handleBg({ cmd: 'batchMoveNew', playlistId: 'plA', itemIds: ['item1', 'item2'], name: '待听精选' }, null);
+    const movedNew = ctx.__store.bpl_playlists.find(p => p.id === r.playlistId);
+    ok(r.ok && movedNew && movedNew.name === '待听精选' && movedNew.items.map(item => item.bvid).join(',') === 'BV1,BV2' &&
+        ctx.__store.bpl_playlists.find(p => p.id === 'plA').items.map(item => item.bvid).join(',') === 'BV0,BV3,BV4',
+        '批量移动到新播放列表同时从源列表移除');
+    ok(ctx.__store.bpl_active === movedNew.id && ctx.__store.bpl_state.playlistId === movedNew.id &&
+        ctx.__store.bpl_state.trackId === 'item2' && ctx.__store.bpl_state.index === 1 &&
+        ctx.__store.bpl_state.playing === true && ctx.__store.bpl_position.position === 5,
+        '移动正在播放条目时播放状态和断点跟随新列表');
+
     ctx = seedBatch();
     r = await ctx.handleBg({ cmd: 'batchRemove', playlistId: 'plA', itemIds: ['item2'],
         confirmation: { playlistId: 'plA', name: 'A', items: [{ id: 'item2', title: 't2' }] } }, null);
@@ -685,10 +709,10 @@ function makeCtx(opts) {
         '播放残缺条目时补齐 cid、封面和标题');
 
     console.log('\n[background 失效来源识别与用户触发修复]');
-    ok(!ctx.canRematchSource({ bvid: 'BV1MANUAL001', title: '手动来源' }) &&
+    ok(ctx.canRematchSource({ bvid: 'BV1MANUAL001', title: '手动来源' }) &&
         ctx.canRematchSource({ bvid: 'BV1LEGACY001', chartSource: 'apple', sourceTitle: '旧热榜条目', matchState: 'matched' }) &&
         ctx.canRematchSource({ bvid: 'BV1BROKEN001', sourceUnavailable: true }),
-        '正常手动来源不可换源，旧版自动匹配条目和确认失效来源可以重新匹配');
+        '所有已有音源的条目都可以主动重新匹配');
     ctx = makeCtx({ fetchResponder: url => {
         if (url.includes('/x/web-interface/view')) return {
             code: 0, data: { bvid: 'BV1NETWORK001', title: '仍然存在', pages: [{ page: 1, cid: 33 }] }

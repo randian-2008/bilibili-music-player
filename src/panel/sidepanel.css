@@ -410,6 +410,9 @@ input[type=range]:hover::-webkit-slider-thumb { transform: scale(1.3); }
 .sel-menu div:hover { background: var(--bpl-hover); }
 .sel-menu .sel-none { color: var(--bpl-faint); cursor: default; }
 .sel-menu .sel-none:hover { background: none; }
+.sel-menu .sel-sep { height: 1px; margin: 4px 8px; padding: 0; background: var(--bpl-border); cursor: default; }
+.sel-menu .sel-sep:hover { background: var(--bpl-border); }
+.sel-menu .sel-new { color: var(--bpl-accent); font-weight: 600; }
 .sel-menu::-webkit-scrollbar { width: 7px; }
 .sel-menu::-webkit-scrollbar-thumb { background: var(--bpl-scroll); border-radius: 4px; }
 

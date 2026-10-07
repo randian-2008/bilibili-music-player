@@ -2,6 +2,18 @@
 
 本文件记录项目自首次公开发布以来的重要用户可见变化。公开前的内部迭代保留在 Git 提交历史中，不再作为正式版本逐项列出。
 
+## [2.9.1] - 2026-10-07
+
+### 新增
+
+- 已有音源可从条目当前显示标题发起重新匹配；新来源完成音频流和静音起播验证后才会替换原来源及原页面链接，失败时保留原条目。
+- 批量选择歌曲后可直接“移动到”或“复制到”新播放列表；复制保留原列表，移动保留条目身份，并在移动当前播放条目时同步迁移播放状态和断点。
+
+### 改进
+
+- 重新匹配会排除当前来源及最近使用过的来源，避免反复选中相同视频；未播放条目匹配成功后不会意外开始播放。
+- 新播放列表操作沿用稳定条目 ID 和后台串行事务，降低异步操作与列表切换造成状态错乱的风险。
+
 ## [2.9.0] - 2026-10-05
 
 ### 改进
@@ -239,6 +251,8 @@
 - 建立包含 146 项断言的自动化测试与 GitHub Actions CI。
 - 采用 GNU GPL v3.0 或更高版本开源。
 
+[2.9.1]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.9.1
+[2.9.0]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.9.0
 [2.8.6]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.6
 [2.8.5]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.5
 [2.8.4]: https://github.com/randian-2008/bilibili-music-player/releases/tag/v2.8.4

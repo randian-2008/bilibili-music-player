@@ -9,7 +9,7 @@
   },
   "scripts": {
     "check": "node --check src/rename/renamer.js && node --check src/charts/apple.js && node --check src/charts/qq.js && node --check src/charts/netease.js && node --check src/charts/matcher.js && node --check src/charts/chart-picker.js && node --check src/background/background.js && node --check src/content/content.js && node --check src/shared/logger.js && node --check src/player/offscreen-boot.js && node --check src/player/offscreen.js && node --check src/panel/sidepanel.js && node --check src/shared/theme.js",
-    "test:offscreen": "node tests/test-offscreen.js && node tests/test-playback-boundaries.js",
+    "test:offscreen": "node tests/test-offscreen.js && node tests/test-playback-boundaries.js && node tests/test-shuffle.js",
     "test:background": "node tests/test-background.js && node tests/test-data-boundaries.js",
     "test:content": "node tests/test-content.js && node tests/test-panel-boundaries.js",
     "test:panel": "node tests/test-panel-dialogs.js && node tests/test-playlist-modes.js",

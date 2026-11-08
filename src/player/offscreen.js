@@ -81,12 +81,76 @@ const P_MODES = ['order', 'shuffle', 'one', 'loop', 'shuffleLoop'];
 const audio = document.getElementById('player');
 let curIndex = -1;
 let curTrack = null;   // 当前曲身份 {bvid, cid}：断点落盘以此为键，stop/清空时置 null
-let shuffleOrder = [];
-let shufflePos = -1;
-let shuffleContext = '';
+// History records successful starts; only 30 seconds of actual listening
+// consumes an item from this round. Going back never resets either record.
+const SHUFFLE_LISTEN_THRESHOLD_MS = 30000;
+const shuffleRounds = new Map();
+let shuffleListening = null;
+function shuffleItemKey(item) {
+    return item.id ? 'id:' + item.id : JSON.stringify([item.bvid, item.cid || 0]);
+}
 function syncShuffleContext(playlistId, mode, items) {
-    const key = JSON.stringify([playlistId, mode, items.map(item => item.id || [item.bvid, item.cid])]);
-    if (key !== shuffleContext) { shuffleOrder = []; shufflePos = -1; shuffleContext = key; }
+    if (!pIsShuffle(mode)) { shuffleRounds.delete(playlistId); return null; }
+    let round = shuffleRounds.get(playlistId);
+    if (!round || round.mode !== mode) {
+        round = { mode, played: new Set(), listened: new Map(), skipped: new Set(), history: [] };
+        shuffleRounds.set(playlistId, round);
+    }
+    const keys = new Set(items.map(shuffleItemKey));
+    for (const key of round.played) if (!keys.has(key)) round.played.delete(key);
+    for (const key of round.listened.keys()) if (!keys.has(key)) round.listened.delete(key);
+    for (const key of round.skipped) if (!keys.has(key)) round.skipped.delete(key);
+    round.history = round.history.filter(key => keys.has(key));
+    return round;
+}
+function rememberShufflePlay(round, item, count, options) {
+    if (!round || !item) return;
+    const key = shuffleItemKey(item);
+    round.skipped.delete(key);
+    if (options && options.shuffleHistoryRound === round &&
+        round.history[options.shuffleHistoryPos] === key) {
+        round.history = round.history.slice(0, options.shuffleHistoryPos + 1);
+    } else if (round.history[round.history.length - 1] !== key) {
+        round.history.push(key);
+    }
+    // Bound history even after many loop rounds or repeated manual selections.
+    const excess = round.history.length - Math.max(1, count * 2);
+    if (excess > 0) round.history.splice(0, excess);
+}
+function shuffleCurrentIndex(st, items) {
+    return st.trackId ? items.findIndex(item => item.id === st.trackId) : (st.playing ? st.index : -1);
+}
+function resetShuffleListeningClock() {
+    if (!shuffleListening) return;
+    shuffleListening.at = performance.now();
+    shuffleListening.position = Number(audio.currentTime) || 0;
+    shuffleListening.rate = Number(audio.playbackRate) || 1;
+    shuffleListening.running = !audio.paused && !audio.ended && !audio.seeking && !audio.error && audio.readyState >= 3;
+}
+function sampleShuffleListening() {
+    const sample = shuffleListening;
+    if (!sample) return;
+    if (shuffleRounds.get(sample.playlistId) !== sample.round) { shuffleListening = null; return; }
+    const elapsed = Math.max(0, performance.now() - sample.at);
+    const progress = Math.max(0, ((Number(audio.currentTime) || 0) - sample.position) * 1000);
+    // Require media progress as well as elapsed time: pausing, buffering and
+    // playback speed must not turn non-listening time into a played item.
+    if (sample.running && !audio.seeking && sample.rate > 0 && elapsed > 0 && progress > 0) {
+        const listened = Math.min(SHUFFLE_LISTEN_THRESHOLD_MS,
+            (sample.round.listened.get(sample.key) || 0) + Math.min(elapsed, progress / sample.rate));
+        sample.round.listened.set(sample.key, listened);
+        if (listened >= SHUFFLE_LISTEN_THRESHOLD_MS) sample.round.played.add(sample.key);
+    }
+    resetShuffleListeningClock();
+}
+function beginShuffleListening(playlistId, round, item) {
+    shuffleListening = round ? { playlistId, round, key: shuffleItemKey(item) } : null;
+    resetShuffleListeningClock();
+}
+function seekPlayback(position) {
+    sampleShuffleListening();
+    audio.currentTime = position;
+    resetShuffleListeningClock();
 }
 let curBlobUrl = null;
 let recoveryTimer = null;
@@ -288,23 +352,6 @@ function bgMatchChartItem(it, playlistId, timeoutMs) {
         setTimeout(() => finish({ ok: false, error: '榜单音源匹配超时' }), Math.max(1, timeoutMs || 45000));
     });
 }
-function pShuffled(count) {
-    const arr = [];
-    for (let i = 0; i < count; i++) arr.push(i);
-    for (let i = arr.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
-    }
-    return arr;
-}
-function pBuildAfter(count, played) {
-    shuffleOrder = pShuffled(count).filter(i => i !== played).concat([played]);
-    shufflePos = 0;
-}
-function pBuildFrom(count, first) {
-    shuffleOrder = [first].concat(pShuffled(count).filter(i => i !== first));
-    shufflePos = 0;
-}
 function pIsShuffle(mode) { return mode === 'shuffle' || mode === 'shuffleLoop'; }
 
 // error 事件感知的播放判定：play() 可能先 resolve、随后才由 'error' 事件异步失败
@@ -492,6 +539,10 @@ async function tryPlayUrl(url, token, deadline) {
     if (!isCurrentPlay(token)) return { cancelled: true };
     const signal = playAbortController && playAbortController.signal;
     const host = hostOf(url);
+    // The old track can keep playing while the next source resolves. Flush
+    // it just before changing src, then ignore candidate/probe startup time.
+    sampleShuffleListening();
+    shuffleListening = null;
     audio.src = url;
     playbackAttemptActive++;
     const res = await playSettled(audio, Math.min(PLAY_TIMEOUT_MS, Math.max(1, deadline - Date.now())), signal);
@@ -549,7 +600,9 @@ async function tryPlayUrl(url, token, deadline) {
 
 // savedPos：可选断点 {bvid, cid, position}——仅 toggle 从空音频起播时传入（回收后续播），
 // 身份匹配才 seek 回去；显式点歌/切歌一律不传，从头播。
-async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
+// The second argument is retained for existing callers; selecting a track no
+// longer rebuilds a fixed shuffle order or clears this playlist's played set.
+async function pPlayIndex(i, _keepOrder, savedPos, playlistId, options) {
     const workflowDeadline = Math.min(options && options.deadline || Infinity, Date.now() + PLAY_WORKFLOW_TIMEOUT_MS);
     if (Date.now() >= workflowDeadline) return { ok: false, error: '播放准备超时，请稍后重试' };
     const isRecovery = !!(options && options.recovery);
@@ -572,7 +625,6 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
     if (!items.length) return { ok: false, error: '当前播放列表为空' };
     if (i < 0 || i >= items.length) return { ok: false, error: '播放索引越界 (' + i + '/' + items.length + ')' };
     syncShuffleContext(targetPlaylistId, st.mode, items);
-    if (pIsShuffle(st.mode) && !keepOrder) pBuildFrom(items.length, i);
     let it = items[i];
     const itemId = it && it.id;
     if (it && it.sourceUnavailable) {
@@ -643,6 +695,9 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
                 await pStopPlayback();
                 return { ok: false, cancelled: true, error: '播放条目已被删除' };
             }
+            const round = syncShuffleContext(targetPlaylistId, savedState.mode, currentItems);
+            rememberShufflePlay(round, currentItems[i], currentItems.length, options);
+            beginShuffleListening(targetPlaylistId, round, currentItems[i]);
             persistPosition(resumeAt);
             suppressRecoveryUntil = 0;
             return { ok: true };
@@ -663,6 +718,7 @@ async function pPlayIndex(i, keepOrder, savedPos, playlistId, options) {
     };
 }
 async function pStopPlayback() {
+    shuffleListening = null;
     recoveryPending = false;
     recoveryPosition = null;
     recoveryAttempts = 0;
@@ -674,8 +730,7 @@ async function pStopPlayback() {
     audio.load();
     if (curBlobUrl) { URL.revokeObjectURL(curBlobUrl); curBlobUrl = null; }
     curIndex = -1;
-    shuffleOrder = [];
-    shufflePos = -1;
+    shuffleRounds.clear();
     clearPosition();
     await pSetState({ trackId: null, playing: false }, playIntent);
     return { ok: true };
@@ -683,46 +738,55 @@ async function pStopPlayback() {
 async function pAdvance() {
     let token = playIntent;
     const deadline = Date.now() + PLAY_WORKFLOW_TIMEOUT_MS;
-    const items = await pGetItems();
     const st = await pGetState();
+    const items = await pGetItems(st.playlistId);
     if (!isCurrentPlay(token)) return { ok: true, cancelled: true };
     if (!items.length) return { ok: false, error: '当前播放列表为空' };
+    sampleShuffleListening();
     const mode = st.mode;
-    syncShuffleContext(st.playlistId, mode, items);
+    const round = syncShuffleContext(st.playlistId, mode, items);
     if (pIsShuffle(mode)) {
-        const orderWasEmpty = shuffleOrder.length !== items.length;
-        if (orderWasEmpty) pBuildAfter(items.length, st.index);
-        // A failed chart match is skipped within the current shuffle round. Keep
-        // the number of attempts bounded so a playlist containing only failures
-        // cannot recurse forever in shuffle-loop mode.
-        let attempts = 0;
-        while (attempts < items.length) {
+        const currentIndex = shuffleCurrentIndex(st, items);
+        const currentKey = currentIndex >= 0 ? shuffleItemKey(items[currentIndex]) : null;
+        if (round.history[round.history.length - 1] !== currentKey) {
+            rememberShufflePlay(round, items[currentIndex], items.length);
+        }
+        const attempted = new Set();
+        let renewed = false;
+        // Skip unavailable entries without adding them to playback history.
+        // Each command tries each item at most once, including at a loop boundary.
+        while (attempted.size < items.length) {
             if (Date.now() >= deadline) return { ok: false, error: '播放列表匹配超时，请稍后重试' };
-            if (!orderWasEmpty || attempts > 0) {
-                if (shufflePos >= shuffleOrder.length - 1) break;
-                shufflePos++;
+            let candidates = items.filter(item => {
+                const key = shuffleItemKey(item);
+                return !round.played.has(key) && !round.skipped.has(key) && !attempted.has(key);
+            });
+            if (!candidates.length) {
+                if (mode !== 'shuffleLoop' || renewed) break;
+                round.played.clear();
+                round.listened.clear();
+                round.skipped.clear();
+                // Old audio may still be audible during the next request; do
+                // not credit it to the new round before a new start succeeds.
+                shuffleListening = null;
+                renewed = true;
+                candidates = items.filter(item => !attempted.has(shuffleItemKey(item)));
             }
-            const task = pPlayIndex(shuffleOrder[shufflePos], true, null, null, { deadline });
+            // Avoid selecting the currently playing item when there are other
+            // choices. No extra exclusion for a recently departed track.
+            if (candidates.length > 1) {
+                candidates = candidates.filter(item => shuffleItemKey(item) !== currentKey);
+            }
+            if (!candidates.length) break;
+            const item = candidates[Math.floor(Math.random() * candidates.length)];
+            const key = shuffleItemKey(item);
+            attempted.add(key);
+            const task = pPlayIndex(items.indexOf(item), true, null, st.playlistId, { deadline, itemId: item.id });
             token = playIntent;
             const result = await task;
             if (!isCurrentPlay(token)) return { ok: true, cancelled: true };
-            attempts++;
             if (!result || (!result.chartMatchFailed && !result.sourceUnavailable && !result.manualMatchPending)) return result;
-        }
-        if (mode === 'shuffleLoop') {
-            pBuildAfter(items.length, st.index);
-            for (let roundAttempts = 0; roundAttempts < items.length; roundAttempts++) {
-                if (Date.now() >= deadline) return { ok: false, error: '播放列表匹配超时，请稍后重试' };
-                if (roundAttempts > 0) {
-                    if (shufflePos >= shuffleOrder.length - 1) break;
-                    shufflePos++;
-                }
-                const task = pPlayIndex(shuffleOrder[shufflePos], true, null, null, { deadline });
-                token = playIntent;
-                const result = await task;
-                if (!isCurrentPlay(token)) return { ok: true, cancelled: true };
-                if (!result || (!result.chartMatchFailed && !result.sourceUnavailable && !result.manualMatchPending)) return result;
-            }
+            round.skipped.add(key);
         }
         return await pStopPlayback();
     }
@@ -745,15 +809,24 @@ async function pAdvance() {
 async function pNext() { return await pAdvance(); }
 async function pPrev() {
     const token = playIntent;
-    const items = await pGetItems();
     const st = await pGetState();
+    const items = await pGetItems(st.playlistId);
     if (!isCurrentPlay(token)) return { ok: true, cancelled: true };
     if (!items.length) return { ok: false, error: '当前播放列表为空' };
-    if (audio.currentTime > 3) { audio.currentTime = 0; return { ok: true }; }
-    syncShuffleContext(st.playlistId, st.mode, items);
-    if (pIsShuffle(st.mode) && shuffleOrder.length === items.length && shufflePos > 0) {
-        shufflePos--;
-        return await pPlayIndex(shuffleOrder[shufflePos], true);
+    if (audio.currentTime > 3) { seekPlayback(0); return { ok: true }; }
+    const round = syncShuffleContext(st.playlistId, st.mode, items);
+    if (round) {
+        const currentIndex = shuffleCurrentIndex(st, items);
+        const currentKey = currentIndex >= 0 ? shuffleItemKey(items[currentIndex]) : null;
+        if (round.history[round.history.length - 1] !== currentKey) {
+            rememberShufflePlay(round, items[currentIndex], items.length);
+        }
+        const pos = Math.max(0, round.history.length - 2);
+        const index = items.findIndex(item => shuffleItemKey(item) === round.history[pos]);
+        if (index < 0) return { ok: true };
+        return await pPlayIndex(index, true, null, st.playlistId, {
+            itemId: items[index].id, shuffleHistoryRound: round, shuffleHistoryPos: pos
+        });
     }
     let n = st.index - 1;
     if (n < 0) n = (st.mode === 'loop' || st.mode === 'shuffleLoop') ? items.length - 1 : 0;
@@ -778,12 +851,15 @@ async function pToggle() {
         if (!isCurrentPlay(intent.id) || resumed.cancelled) return { ok: true, cancelled: true };
         if (!resumed.ok) return { ok: false, error: (resumed.playError && resumed.playError.name === 'NotAllowedError')
             ? '浏览器阻止了自动播放：请先点一下页面或浮动按钮再试' : '恢复播放超时，请稍后重试' };
+        resetShuffleListeningClock();
         await pSetState({ playing: true }, intent.id);
     } else {
         recoveryPending = false;
         if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
         cancelPlayIntent();
+        sampleShuffleListening();
         audio.pause();
+        resetShuffleListeningClock();
         await pSetState({ playing: false }, playIntent);
     }
     return { ok: true };
@@ -873,6 +949,7 @@ async function recoverPlayback(reason) {
 }
 
 audio.addEventListener('ended', () => {
+    sampleShuffleListening();
     runAsync('自动切歌失败', async () => {
         const st = await pGetState();
         if (st.mode === 'one') {
@@ -895,6 +972,7 @@ audio.addEventListener('play', () => {
     }
 });
 audio.addEventListener('playing', () => {
+    resetShuffleListeningClock();
     // 短暂 stalled 后若媒体自行恢复，不再让旧定时器重新解析并打断正常播放。
     if (recoveryPending && !recoveryRunning) {
         recoveryPending = false;
@@ -904,6 +982,7 @@ audio.addEventListener('playing', () => {
     }
 });
 audio.addEventListener('pause', () => {
+    sampleShuffleListening();
     if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
     // 任何暂停路径（面板按钮/MediaSession/系统键）都落断点——这正是文档被回收前的最后一笔。
     // stop 会先同步清掉 curTrack，故其后触发的本事件不会误写（断点清除优先）。
@@ -915,6 +994,7 @@ audio.addEventListener('pause', () => {
 // 关键诊断：play() 可能先 resolve、随后由 error 事件异步失败（如 CDN 403/解码错），
 // 此处把 MediaError code、src、网络/就绪状态全部记下，专治“无法播放音源”查无对证
 audio.addEventListener('error', () => {
+    sampleShuffleListening();
     const e = audio.error;
     const code = e && e.code;
     BPLLog.error('off', 'audio error 事件：code=' + code + '(' + (MEDIA_ERR_NAME[code] || '?') + ')' +
@@ -930,6 +1010,16 @@ audio.addEventListener('stalled', () => {
         ' networkState=' + (NET_STATE[audio.networkState] != null ? NET_STATE[audio.networkState] : audio.networkState));
     if (!playbackAttemptActive && Date.now() >= suppressRecoveryUntil) scheduleRecovery('audio stalled', 8000);
 });
+audio.addEventListener('timeupdate', sampleShuffleListening);
+audio.addEventListener('ratechange', sampleShuffleListening);
+audio.addEventListener('waiting', () => {
+    sampleShuffleListening();
+    if (shuffleListening) shuffleListening.running = false;
+});
+// Seeking is a discontinuity, not listening. Internal seek controls flush
+// before moving; native seek events also reset the baseline defensively.
+audio.addEventListener('seeking', resetShuffleListeningClock);
+audio.addEventListener('seeked', resetShuffleListeningClock);
 if (typeof window !== 'undefined' && window.addEventListener) {
     window.addEventListener('online', () => {
         if (recoveryPending) scheduleRecovery('network online', 0);
@@ -944,6 +1034,7 @@ store.get(['bpl_volume', 'bpl_mute']).then(r => {
 let progTick = 0;
 setInterval(() => {
     if (!audio.src) return;
+    sampleShuffleListening();
     relayBroadcast({
         type: 'progress',
         position: audio.currentTime || 0,
@@ -994,7 +1085,7 @@ async function handleCmd(msg) {
             if (!msg.playlistId) await pEnsurePlaylist();
             return await pPlayIndex(msg.index, false, null, msg.playlistId, { itemId: msg.itemId, deadline: msg.deadline });
         case 'probeAudio': return await probeAudioUrls(msg.urls, msg.timeoutMs);
-        case 'seek': audio.currentTime = msg.value || 0; return { ok: true };
+        case 'seek': seekPlayback(msg.value || 0); return { ok: true };
         case 'getStatus': return { ok: true, position: audio.currentTime || 0, duration: audio.duration || 0, playing: !audio.paused, index: curIndex, hasTrack: !!audio.src };
         case 'stop': return await pStopPlayback();
         case 'setMode': {

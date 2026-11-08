@@ -18,6 +18,7 @@ function makeCtx(opts) {
     const playNeverUrls = new Set(opts.playNeverUrls || []);
     const fetchFailUrls = new Set(opts.fetchFailUrls || []);
     const fetchOptions = [];
+    let listeningClock = 0;
     const asyncErrorUrls = new Set(opts.asyncErrorUrls || []);   // play() 成功后异步触发 error（模拟 CDN 403）
     const audio = {
         paused: true, currentTime: 0, duration: 0, playbackRate: 1, volume: 1, muted: false,
@@ -50,7 +51,7 @@ function makeCtx(opts) {
     // 换源即清空 error/就绪态，模拟真实 HTMLMediaElement（否则上一源的残留 error 会误杀下一源）
     Object.defineProperty(audio, 'src', {
         get() { return audio._src; },
-        set(v) { audio._src = v; audio.error = null; audio.readyState = v ? 4 : 0; }
+        set(v) { audio._src = v; audio.currentTime = 0; audio.error = null; audio.readyState = v ? 4 : 0; }
     });
     const handlers = [];
     const msgListeners = [];
@@ -137,6 +138,7 @@ function makeCtx(opts) {
     const windowHandlers = {};
     const sandbox = {
         console, Math, JSON, Promise, Date, URLSearchParams,
+        performance: { now: () => listeningClock },
         // setImmediate 驱动：offscreen 的 playSettled 宽限计时需真实触发（忽略延时、立即排队）
         setTimeout: fastSetTimeout, clearTimeout: fastClearTimeout, setInterval: () => 0,
         fetch: (url, options) => {
@@ -153,6 +155,18 @@ function makeCtx(opts) {
         document: { getElementById: () => audio },
         chrome: chromeObj,
         __audio: audio, __store: store, __fetchOptions: () => fetchOptions.slice(),
+        __elapse: milliseconds => { listeningClock += milliseconds; },
+        __listen: seconds => {
+            for (let left = seconds; left > 0;) {
+                const step = Math.min(1, left);
+                left -= step;
+                listeningClock += step * 1000;
+                if (!audio.paused && !audio.seeking && !audio.ended && !audio.error && audio.readyState >= 3) {
+                    audio.currentTime += step * audio.playbackRate;
+                }
+                (audio.ls.timeupdate || []).slice().forEach(listener => listener());
+            }
+        },
         __resolveAudioCalls: () => resolveAudioCalls,
         __port: port, __portSent: portSent, __sent: sent,
         __drive: (msg) => { handlers.forEach(fn => fn(msg)); },
@@ -292,13 +306,13 @@ async function testModes() {
     ctx = makeCtx({ store: setupPlaylist(4) });
     ctx.__store.bpl_state.mode = 'shuffle'; ctx.__store.bpl_state.index = 0; ctx.__store.bpl_state.trackId = 'item0';
     let stopped = false;
-    for (let i = 0; i < 10; i++) { await ctx.pNext(); if ((await getState(ctx)).playing === false) { stopped = true; break; } }
+    for (let i = 0; i < 10; i++) { ctx.__listen(30); await ctx.pNext(); if ((await getState(ctx)).playing === false) { stopped = true; break; } }
     ok(stopped, 'shuffle 播完停止');
 
     ctx = makeCtx({ store: setupPlaylist(4) });
     ctx.__store.bpl_state.mode = 'shuffleLoop'; ctx.__store.bpl_state.index = 0; ctx.__store.bpl_state.trackId = 'item0';
     let kept = true;
-    for (let i = 0; i < 12; i++) { await ctx.pNext(); if ((await getState(ctx)).playing === false) { kept = false; break; } }
+    for (let i = 0; i < 12; i++) { ctx.__listen(30); await ctx.pNext(); if ((await getState(ctx)).playing === false) { kept = false; break; } }
     ok(kept, 'shuffleLoop 不停');
 
     const mixedChartStore = setupPlaylist(4);

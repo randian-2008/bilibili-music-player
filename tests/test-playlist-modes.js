@@ -9,7 +9,7 @@ function fixture(file, marker, exports) {
 const bg = fixture('test-background.js', '\n(async () =>', '{ makeCtx }');
 const off = fixture('test-offscreen.js', '\nasync function testPlayIndex()', '{ makeCtx, setupPlaylist }');
 const panel = fixture('test-panel-dialogs.js', '\n(async () =>', '{ fixture }');
-const snapshot = player => vm.runInContext('JSON.stringify({order:shuffleOrder,pos:shufflePos})', player);
+const snapshot = player => vm.runInContext('JSON.stringify([...shuffleRounds].map(([id, r]) => ({id,mode:r.mode,played:[...r.played],skipped:[...r.skipped],history:r.history})))', player);
 
 (async () => {
     const ctx = bg.makeCtx();
@@ -34,7 +34,10 @@ const snapshot = player => vm.runInContext('JSON.stringify({order:shuffleOrder,p
         return send(message, callback);
     };
     assert.equal((await player.handleCmd({ cmd: 'playIndex', playlistId: 'pl1', index: 0 })).ok, true);
-    assert.equal(JSON.parse(snapshot(player)).order.length, 3, 'target list initializes its shuffle round');
+    assert.deepEqual(JSON.parse(snapshot(player))[0].history, ['id:item0'], 'successful start enters backward history');
+    assert.deepEqual(JSON.parse(snapshot(player))[0].played, [], 'successful start alone does not consume a shuffle candidate');
+    player.__listen(30);
+    assert.deepEqual(JSON.parse(snapshot(player))[0].played, ['id:item0'], 'thirty actual seconds qualify the item');
     const before = snapshot(player);
     await ctx.handleBg({ cmd: 'player', payload: { cmd: 'setMode', playlistId: 'pl2', mode: 'one' } });
     player.onPlaylistsChanged();

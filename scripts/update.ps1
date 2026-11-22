@@ -276,7 +276,7 @@ try {
         }
     }
     $isPermissionError = $failure.Exception -is [UnauthorizedAccessException] -or
-        $message -match '(?i)access is denied|unauthorized|拒绝访问'
+        $message -match '(?i)access is denied|unauthorized|\u62d2\u7edd\u8bbf\u95ee'
     $isNetworkOperation = $operation -match '(?i)GitHub|downloading|checksum'
     if ($isPermissionError) {
         Write-Error ("Update failed because permission was denied while {0}. Check the extension directory permissions or move it to a user-writable folder. Details: {1}" -f $operation, $message)

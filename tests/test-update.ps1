@@ -140,6 +140,18 @@ if ($Scenario) {
     exit 0
 }
 
+# Windows PowerShell 5.1 reads BOM-less scripts using the system ANSI encoding.
+# Parse the release scripts as Western Windows would, even on a UTF-8 machine.
+foreach ($relative in @('scripts/update.ps1', 'scripts/package.ps1')) {
+    $scriptBytes = [IO.File]::ReadAllBytes((Join-Path $projectRoot $relative))
+    $westernText = [Text.Encoding]::GetEncoding(1252).GetString($scriptBytes)
+    $parseTokens = $null
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($westernText, [ref]$parseTokens, [ref]$parseErrors)
+    Assert ($parseErrors.Count -eq 0) "Release script must parse on English Windows: $relative"
+}
+Write-Host 'PASS package: release scripts parse under Windows ANSI encoding'
+
 $FixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('bpl-update-tests-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $FixtureRoot | Out-Null
 try {

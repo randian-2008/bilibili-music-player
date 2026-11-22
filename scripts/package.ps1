@@ -57,6 +57,7 @@ $packageFiles = @(
     'src/player/offscreen-boot.js',
     'src/player/offscreen.html',
     'src/player/offscreen.js',
+    'src/player/source-selector.js',
     'src/network/rules.json',
     'src/rename/renamer.js',
     'src/rename/rules.json',

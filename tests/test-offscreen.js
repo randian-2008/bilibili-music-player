@@ -1,6 +1,7 @@
 const fs = require('fs');
 const vm = require('vm');
 const code = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'player', 'offscreen.js'), 'utf8');
+const selectorCode = fs.readFileSync(require('path').join(__dirname, '..', 'src', 'player', 'source-selector.js'), 'utf8');
 
 let pass = 0, fail = 0;
 function ok(cond, msg) { if (cond) { pass++; console.log('  PASS: ' + msg); } else { fail++; console.log('  FAIL: ' + msg); } }
@@ -20,15 +21,20 @@ function makeCtx(opts) {
     const fetchOptions = [];
     let listeningClock = 0;
     const asyncErrorUrls = new Set(opts.asyncErrorUrls || []);   // play() 成功后异步触发 error（模拟 CDN 403）
-    const audio = {
+    let audio, totalPlayCalls = 0;
+    const audios = [];
+    function makeAudio() {
+    const media = {
         paused: true, currentTime: 0, duration: 0, playbackRate: 1, volume: 1, muted: false,
-        error: null, networkState: 1, readyState: 0, playCalls: 0,
+        error: null, networkState: 1, readyState: 0,
+        get playCalls() { return totalPlayCalls; },
         ls: {},
         _src: '',
         addEventListener(t, f) { (this.ls[t] = this.ls[t] || []).push(f); },
         removeEventListener(t, f) { const l = this.ls[t]; if (l) { const i = l.indexOf(f); if (i >= 0) l.splice(i, 1); } },
         play() {
-            this.playCalls++;
+            totalPlayCalls++;
+            if (opts.playResponder) return opts.playResponder(this);
             if (playNeverUrls.has(this._src)) return new Promise(() => {});
             if (playFailUrls.has(this._src)) {
                 const e = new Error('The element has no supported sources.');
@@ -46,13 +52,18 @@ function makeCtx(opts) {
         },
         pause() { this.paused = true; },
         load() {},
+        replaceWith(next) { if (audio === this) audio = next; },
         removeAttribute(n) { if (n === 'src') this.src = ''; }
     };
     // 换源即清空 error/就绪态，模拟真实 HTMLMediaElement（否则上一源的残留 error 会误杀下一源）
-    Object.defineProperty(audio, 'src', {
-        get() { return audio._src; },
-        set(v) { audio._src = v; audio.currentTime = 0; audio.error = null; audio.readyState = v ? 4 : 0; }
+    Object.defineProperty(media, 'src', {
+        get() { return media._src; },
+        set(v) { media._src = v; media.currentTime = 0; media.error = null; media.readyState = v ? 4 : 0; }
     });
+    audios.push(media);
+    return media;
+    }
+    audio = makeAudio();
     const handlers = [];
     const msgListeners = [];
     const portSent = [];
@@ -137,24 +148,24 @@ function makeCtx(opts) {
     };
     const windowHandlers = {};
     const sandbox = {
-        console, Math, JSON, Promise, Date, URLSearchParams,
+        console, Math, JSON, Promise, Date, URLSearchParams, AbortController,
         performance: { now: () => listeningClock },
         // setImmediate 驱动：offscreen 的 playSettled 宽限计时需真实触发（忽略延时、立即排队）
-        setTimeout: fastSetTimeout, clearTimeout: fastClearTimeout, setInterval: () => 0,
+        setTimeout: opts.setTimeout || fastSetTimeout, clearTimeout: opts.clearTimeout || fastClearTimeout, setInterval: () => 0,
         fetch: (url, options) => {
             fetchOptions.push(options || {});
             if (fetchFailUrls.has(url)) return Promise.reject(new Error('fetch fail'));
             return Promise.resolve({ ok: true, blob: () => Promise.resolve({}) });
         },
-        URL: { createObjectURL: () => 'blob:mock', revokeObjectURL: () => {} },
+        URL: class extends URL { static createObjectURL() { return 'blob:mock'; } static revokeObjectURL() {} },
         window: {
             addEventListener(type, fn) { (windowHandlers[type] = windowHandlers[type] || []).push(fn); },
             dispatch(type) { (windowHandlers[type] || []).slice().forEach(fn => fn()); }
         },
         navigator: {},
-        document: { getElementById: () => audio },
+        document: { getElementById: () => audio, createElement: makeAudio },
         chrome: chromeObj,
-        __audio: audio, __store: store, __fetchOptions: () => fetchOptions.slice(),
+        get __audio() { return audio; }, __audios: audios, __store: store, __fetchOptions: () => fetchOptions.slice(),
         __elapse: milliseconds => { listeningClock += milliseconds; },
         __listen: seconds => {
             for (let left = seconds; left > 0;) {
@@ -173,6 +184,7 @@ function makeCtx(opts) {
         __driveMsg: (msg) => { msgListeners.forEach(fn => fn(msg)); }
     };
     vm.createContext(sandbox);
+    vm.runInContext(selectorCode, sandbox);
     vm.runInContext(code, sandbox);
     return sandbox;
 }

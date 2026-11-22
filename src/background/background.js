@@ -194,8 +194,41 @@ const MATCH_OPERATION_TIMEOUT_MS = 105000;
 const MATCH_PLAY_OPERATION_TIMEOUT_MS = 140000;
 const MEDIA_PROBE_TIMEOUT_MS = 12000;
 let backgroundPlayIntent = 0;
-function beginBackgroundPlayIntent() { return ++backgroundPlayIntent; }
+let pendingPlaybackIntent = null;
+let offscreenLoading = false;
+let publishedLoading = false;
+function playbackIsLoading() { return pendingPlaybackIntent != null || offscreenLoading; }
+function publishLoading() {
+    const loading = playbackIsLoading();
+    if (publishedLoading === loading) return;
+    publishedLoading = loading;
+    broadcast({ type: 'loading', loading });
+}
+function beginBackgroundPlayIntent() {
+    pendingPlaybackIntent = null;
+    return ++backgroundPlayIntent;
+}
 function currentBackgroundPlayIntent(intent) { return intent === backgroundPlayIntent; }
+async function withPlaybackLoading(intent, operation) {
+    if (!currentBackgroundPlayIntent(intent)) return { ok: true, cancelled: true };
+    if (pendingPlaybackIntent === intent) return await operation();
+    pendingPlaybackIntent = intent;
+    publishLoading();
+    try {
+        const result = await operation();
+        return currentBackgroundPlayIntent(intent) ? result : { ok: true, cancelled: true };
+    } catch (error) {
+        if (!currentBackgroundPlayIntent(intent)) return { ok: true, cancelled: true };
+        throw error;
+    }
+    finally {
+        if (pendingPlaybackIntent === intent) {
+            pendingPlaybackIntent = null;
+            offscreenLoading = false;
+            publishLoading();
+        }
+    }
+}
 function matchIdentity(item) {
     return [item.matchOrigin || '', item.chartSource || '', item.chartId || '',
         item.sourceRank || '', item.sourceTitle || '', item.sourceArtist || '',
@@ -667,22 +700,24 @@ async function matchNextChartItem(playlistId) {
 async function playChartItem(playlistId, itemId) {
     const playbackDeadline = Date.now() + MATCH_PLAY_OPERATION_TIMEOUT_MS;
     const intent = beginBackgroundPlayIntent();
-    let lists = await getPlaylists();
-    let playlist = findPl(lists, playlistId);
-    let index = playlist ? playlist.items.findIndex(item => item.id === itemId) : -1;
-    if (index < 0) return { ok: false, error: '榜单条目不存在' };
-    let item = playlist.items[index];
-    if (isChartItem(item) && (item.matchState !== 'matched' || !item.bvid)) {
-        const matched = await matchChartItem(playlistId, itemId, true, true);
-        if (!matched || !matched.ok) return matched || { ok: false, error: '匹配音源失败' };
-        lists = await getPlaylists();
-        playlist = findPl(lists, playlistId);
-        index = playlist ? playlist.items.findIndex(entry => entry.id === itemId) : -1;
-        item = index >= 0 ? playlist.items[index] : null;
-    }
-    if (!item || !item.bvid) return { ok: false, error: '匹配音源失败' };
-    if (!currentBackgroundPlayIntent(intent)) return { ok: true, cancelled: true };
-    return await sendToOffscreen({ cmd: 'playIndex', index: index, itemId: item.id, playlistId: playlistId, _intentId: intent, playbackDeadline });
+    return await withPlaybackLoading(intent, async () => {
+        let lists = await getPlaylists();
+        let playlist = findPl(lists, playlistId);
+        let index = playlist ? playlist.items.findIndex(item => item.id === itemId) : -1;
+        if (index < 0) return { ok: false, error: '榜单条目不存在' };
+        let item = playlist.items[index];
+        if (isChartItem(item) && (item.matchState !== 'matched' || !item.bvid)) {
+            const matched = await matchChartItem(playlistId, itemId, true, true);
+            if (!matched || !matched.ok) return matched || { ok: false, error: '匹配音源失败' };
+            lists = await getPlaylists();
+            playlist = findPl(lists, playlistId);
+            index = playlist ? playlist.items.findIndex(entry => entry.id === itemId) : -1;
+            item = index >= 0 ? playlist.items[index] : null;
+        }
+        if (!item || !item.bvid) return { ok: false, error: '匹配音源失败' };
+        if (!currentBackgroundPlayIntent(intent)) return { ok: true, cancelled: true };
+        return await sendToOffscreen({ cmd: 'playIndex', index: index, itemId: item.id, playlistId: playlistId, _intentId: intent, playbackDeadline });
+    });
 }
 
 async function setSourceUnavailable(playlistId, itemId, bvid, message) {
@@ -1158,13 +1193,17 @@ async function resolveCid(bvid, page) {
     if (!viewError) viewError = pageResult.error || apiResponseError(fallback, '无法解析视频 cid');
     throw viewError || new Error('无法解析视频 cid');
 }
-async function getAudioUrls(bvid, cid) {
+async function getAudioUrls(bvid, cid, withSources = false) {
     const base = 'https://api.bilibili.com/x/player/playurl?bvid=' + encodeURIComponent(bvid) + '&cid=' + encodeURIComponent(cid);
+    const sources = [];
+    let sourceGroup = 0;
     const pushStreams = (list, urls) => {
         for (const a of list) {
+            const group = sourceGroup++;
+            const add = url => { if (url) { urls.push(url); sources.push({ url, group }); } };
             const main = a.baseUrl || a.base_url || a.url;
-            if (main) urls.push(main);
-            for (const b of (a.backupUrl || a.backup_url || [])) if (b) urls.push(b);
+            add(main);
+            for (const b of (a.backupUrl || a.backup_url || [])) add(b);
         }
     };
     let dashError = null;
@@ -1206,7 +1245,7 @@ async function getAudioUrls(bvid, cid) {
         ? '(dash' + ((dash.flac && dash.flac.audio) ? '+flac' : '') + ((dash.dolby && dash.dolby.audio && dash.dolby.audio.length) ? '+dolby' : '') + ')'
         : '(durl)';
     BPLLog.info('bg', 'getAudioUrls[' + bvid + '/' + cid + '] 得 ' + uniq.length + ' 个候选' + tag);
-    return uniq;
+    return withSources ? { urls: uniq, sources: sources.filter((source, i) => sources.findIndex(s => s.url === source.url) === i) } : uniq;
 }
 function resolvedItemFields(r, bvid, page, fallback) {
     const d = r.info || {}, pg = r.page || {};
@@ -1442,8 +1481,8 @@ async function handleResolveAudio(p) {
             await repairResolvedItem(p, resolved);
         }
         if (!cid) return { ok: false, error: '无法解析视频 cid' };
-        const urls = await getAudioUrls(p.bvid, cid);
-        return { ok: true, urls: urls, cid: cid };
+        const resolved = await getAudioUrls(p.bvid, cid, true);
+        return { ok: true, ...resolved, cid: cid };
     } catch (e) {
         const message = String((e && e.message) || e);
         let unavailable = !!(e && e.sourceUnavailable);
@@ -1513,8 +1552,15 @@ function sendViaMessage(msg, timeout) {
 // 快速控制不再被慢速取源命令串行阻塞；播放竞态由 offscreen 的播放意图取消机制处理。
 let offscreenFailCount = 0;
 function sendToOffscreen(msg) {
+    if (LONG_PLAYER_CMDS.has(msg.cmd)) {
+        const request = { ...msg, _intentId: msg._intentId == null ? beginBackgroundPlayIntent() : msg._intentId };
+        return withPlaybackLoading(request._intentId, () => dispatchToOffscreen(request));
+    }
+    return dispatchToOffscreen(msg);
+}
+function dispatchToOffscreen(msg) {
     const request = Object.assign({}, msg);
-    if (LONG_PLAYER_CMDS.has(request.cmd) || request.cmd === 'stop') {
+    if (LONG_PLAYER_CMDS.has(request.cmd) || request.cmd === 'stop' || request.cmd === 'cancelPlayback') {
         if (request._intentId == null) request._intentId = beginBackgroundPlayIntent();
         if (!currentBackgroundPlayIntent(request._intentId)) return Promise.resolve({ ok: true, cancelled: true });
     }
@@ -1634,6 +1680,8 @@ chrome.runtime.onConnect.addListener(port => {
         if (wasActive) {
             offscreenPort = null;
             offscreenReady = false;
+            offscreenLoading = false;
+            publishLoading();
             Object.keys(portWaiters).forEach(id => {
                 try { portWaiters[id]({ disconnected: true }); } catch (_) {}
             });
@@ -1801,6 +1849,7 @@ async function handleBg(msg, sender, mutationLocked) {
                 return { ok: false, error: '来源不受信任' };
             }
             beginBackgroundPlayIntent();
+            publishLoading();
             return { ok: true };
         }
         case 'recoverMatchTasks': {
@@ -1953,8 +2002,13 @@ async function handleBg(msg, sender, mutationLocked) {
             // 广播中继：offscreen 的 state/progress 广播经此以 target:'all' 转发。
             // 必须由 bg 转发而非 offscreen 直发——现场实证 offscreen 直发的 runtime 广播
             // 到不了网页里的 content script（胶囊/面板进度条因此冻住）；bg→content 是实证通路。
-            if (msg.data && typeof msg.data === 'object') broadcast(msg.data);
             const data = msg.data || {};
+            if (data.type === 'loading') {
+                offscreenLoading = !!data.loading;
+                publishLoading();
+                return { ok: true };
+            }
+            if (msg.data && typeof msg.data === 'object') broadcast(msg.data);
             if (data.type === 'state' && data.state) {
                 const playing = !!data.state.playing;
                 const playlistId = data.state.playlistId || null;
@@ -2005,28 +2059,41 @@ async function handleBg(msg, sender, mutationLocked) {
             if (payload.cmd === 'setMode') {
                 return await handleBg({ cmd: 'setMode', playlistId: payload.playlistId, mode: payload.mode }, sender);
             }
-            if (LONG_PLAYER_CMDS.has(payload.cmd) || payload.cmd === 'stop') {
+            if (payload.cmd === 'toggle' && playbackIsLoading()) payload.cmd = 'cancelPlayback';
+            if (LONG_PLAYER_CMDS.has(payload.cmd) || payload.cmd === 'stop' || payload.cmd === 'cancelPlayback') {
                 payload._intentId = beginBackgroundPlayIntent();
             }
-            // 浏览中的播放列表(activeId)与正在播放的播放列表(state.playlistId)可以不同。
-            // 显式点播必须携带用户点击的播放列表，否则 offscreen 会继续按旧播放列表解释同一个索引。
-            if (payload.cmd === 'playIndex' && !payload.playlistId) payload.playlistId = await getActiveId();
-            if (payload.cmd !== 'getStatus' && payload.cmd !== 'ping') BPLLog.info('bg', '收到 player 命令：' + payload.cmd);
-            if (payload.cmd === 'getStatus' && !offscreenPort && !(await hasOffscreen())) {
-                // v2.2.9：offscreen 暂停 ~30s 即被浏览器当空闲文档回收（AUDIO_PLAYBACK 只在出声时保活），
-                // 此时“有一首暂停中的歌”仍是事实。从存储推导：新页面的胶囊/面板应显示暂停态与断点位置
-                // （而非无曲目的单音符 ♪），与旧页面保持一致；按下播放经 toggle 走断点续播。
-                const st = await getState();
-                const pls = await getPlaylists();
-                const pl = pls.find(p => p.id === st.playlistId);
-                const index = (pl && st.trackId) ? pl.items.findIndex(it => it.id === st.trackId) : -1;
-                const it = index >= 0 ? pl.items[index] : null;
-                if (!it) return { ok: true, position: 0, duration: 0, playing: false, index: -1, hasTrack: false };
-                const pos = (await chrome.storage.local.get('bpl_position')).bpl_position;
-                const at = positionMatchesItem(pos, it) ? (pos.position || 0) : 0;
-                return { ok: true, position: at, duration: it.duration || 0, playing: false, index, trackId: st.trackId, hasTrack: true, mode: st.mode };
+            if (payload.cmd === 'stop' || payload.cmd === 'cancelPlayback') {
+                offscreenLoading = false;
+                publishLoading();
+                if (payload.cmd === 'cancelPlayback' && !offscreenPort && !(await hasOffscreen())) return { ok: true, cancelled: true };
             }
-            return await sendToOffscreen(payload);
+            const execute = async () => {
+                // 浏览中的播放列表(activeId)与正在播放的播放列表(state.playlistId)可以不同。
+                // 显式点播必须携带用户点击的播放列表，否则 offscreen 会继续按旧播放列表解释同一个索引。
+                if (payload.cmd === 'playIndex' && !payload.playlistId) payload.playlistId = await getActiveId();
+                if (payload.cmd !== 'getStatus' && payload.cmd !== 'ping') BPLLog.info('bg', '收到 player 命令：' + payload.cmd);
+                if (payload.cmd === 'getStatus' && !offscreenPort && !(await hasOffscreen())) {
+                    // v2.2.9：offscreen 暂停 ~30s 即被浏览器当空闲文档回收（AUDIO_PLAYBACK 只在出声时保活），
+                    // 此时“有一首暂停中的歌”仍是事实。从存储推导：新页面的胶囊/面板应显示暂停态与断点位置
+                    // （而非无曲目的单音符 ♪），与旧页面保持一致；按下播放经 toggle 走断点续播。
+                    const st = await getState();
+                    const pls = await getPlaylists();
+                    const pl = pls.find(p => p.id === st.playlistId);
+                    const index = (pl && st.trackId) ? pl.items.findIndex(it => it.id === st.trackId) : -1;
+                    const it = index >= 0 ? pl.items[index] : null;
+                    if (!it) return { ok: true, position: 0, duration: 0, playing: false, index: -1, hasTrack: false, loading: playbackIsLoading() };
+                    const pos = (await chrome.storage.local.get('bpl_position')).bpl_position;
+                    const at = positionMatchesItem(pos, it) ? (pos.position || 0) : 0;
+                    return { ok: true, position: at, duration: it.duration || 0, playing: false, index, trackId: st.trackId, hasTrack: true, mode: st.mode, loading: playbackIsLoading() };
+                }
+                const result = await sendToOffscreen(payload);
+                if (payload.cmd === 'getStatus' && result && result.ok) {
+                    result.loading = !!result.loading || playbackIsLoading();
+                }
+                return result;
+            };
+            return LONG_PLAYER_CMDS.has(payload.cmd) ? await withPlaybackLoading(payload._intentId, execute) : await execute();
         }
         case 'remove': {
             const lists = await getPlaylists();

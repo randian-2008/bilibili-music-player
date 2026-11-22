@@ -141,6 +141,8 @@
     const PLAYER_CMDS = { toggle: 1, next: 1, prev: 1, playIndex: 1, seek: 1, getStatus: 1, stop: 1, setMode: 1, setVolume: 1, setMute: 1, getVolume: 1 };
     const LONG_PLAYER_CMDS = { toggle: 1, next: 1, prev: 1, playIndex: 1 };
     let playerState = { playing: false, hasTrack: false, index: 0, mode: 'loop' };
+    let playbackLoading = false;
+    let loadingRevision = 0;
     let loggedBridgeOrigin = false;
     let loggedBroadcast = false;
 
@@ -246,6 +248,12 @@
         '.m-btn.m-play{background:var(--bpl-accent);color:var(--bpl-on-accent);box-shadow:var(--bpl-control-shadow)}' +
         '.m-btn.m-play:hover{background:var(--bpl-accent-hover)}' +
         '.m-btn.m-play:active{box-shadow:var(--bpl-control-active-shadow)}' +
+        '.m-play.loading{position:relative}' +
+        '.m-play.loading svg{visibility:hidden}' +
+        '.m-play.loading::after{content:"";position:absolute;box-sizing:border-box;width:10px;height:10px;' +
+        'inset:0;margin:auto;border:1.5px solid currentColor;' +
+        'border-right-color:transparent;border-radius:50%;animation:bplConnectSpin .8s linear infinite}' +
+        '@keyframes bplConnectSpin{to{transform:rotate(360deg)}}' +
 
         '.panel{z-index:' + (Z + 1) + ';width:340px;height:540px;max-width:92vw;' +
         'max-height:calc(100vh - 160px);right:20px;bottom:146px;' +
@@ -433,10 +441,10 @@
             : '';
         shadow.innerHTML =
             '<style>' + CSS + '</style>' +
-            '<div class="mini" title="B站听歌列表">' +
+            '<div class="mini" aria-label="B站听歌列表">' +
             '<div class="m-controls">' +
             '<button class="m-btn m-prev" title="上一首"><svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M6 6h2v12H6zm3.5 6l8.5 6V6z"/></svg></button>' +
-            '<button class="m-btn m-play" title="播放/暂停"><svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="' + PLAY_D + '"/></svg></button>' +
+            '<button class="m-btn m-play" aria-label="播放"><svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="' + PLAY_D + '"/></svg></button>' +
             '<button class="m-btn m-next" title="下一首"><svg viewBox="0 0 24 24" width="12" height="12"><path fill="currentColor" d="M16 6h2v12h-2zM6 18l8.5-6L6 6z"/></svg></button>' +
             '</div>' +
             '<div class="m-core" title="展开播放列表">' +
@@ -599,8 +607,13 @@
 
     function updateMiniUI() {
         if (!mini) return;
-        mini.classList.toggle('loaded', !!playerState.hasTrack);
+        mini.classList.toggle('loaded', !!playerState.hasTrack || playbackLoading);
         mini.classList.toggle('playing', !!playerState.playing);
+        if (miniPlay) {
+            miniPlay.classList.toggle('loading', playbackLoading);
+            miniPlay.setAttribute('aria-busy', String(playbackLoading));
+            miniPlay.setAttribute('aria-label', playbackLoading ? '取消连接' : (playerState.playing ? '暂停' : '播放'));
+        }
         const p = miniPlay && miniPlay.querySelector('path');
         if (p) p.setAttribute('d', playerState.playing ? PAUSE_D : PLAY_D);
     }
@@ -1117,7 +1130,11 @@
             // 诊断留痕（每实例一次）：现场曾出现“广播投递失效、UI 冻住”，凭此条可确认
             // content script 是否真的收到了广播、首条是何类型（v2.2.7 起广播改为双路投递）。
             if (!loggedBroadcast) { loggedBroadcast = true; BPLLog.info('content', '收到首个广播 type=' + msg.type); }
-            if (msg.type === 'state' && msg.state) {
+            if (msg.type === 'loading') {
+                loadingRevision++;
+                playbackLoading = !!msg.loading;
+                updateMiniUI();
+            } else if (msg.type === 'state' && msg.state) {
                 playerState.playing = !!msg.state.playing;
                 playerState.hasTrack = !!msg.state.hasTrack;
                 playerState.index = msg.state.index || 0;
@@ -1200,10 +1217,12 @@
         setTimeout(() => clearInterval(t), 8000);
     }
     setInterval(() => { if (built) updateAddBtn(); }, 2000);
+    const initialLoadingRevision = loadingRevision;
     handlePlayerCmd({ cmd: 'getStatus' }).then(r => {
         if (r && r.ok) {
             playerState.playing = !!r.playing;
             playerState.hasTrack = !!r.hasTrack;
+            if (initialLoadingRevision === loadingRevision) playbackLoading = !!r.loading;
             updateMiniUI();
         }
     });

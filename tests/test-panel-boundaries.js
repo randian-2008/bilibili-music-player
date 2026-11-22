@@ -89,6 +89,8 @@ function makeTab(bus) {
     const shadow = root.querySelector('shadow');
     return {
         ctx, win, sent, timers, panel: shadow.querySelector('.panel'), frame: shadow.querySelector('.pframe'),
+        mini: shadow.querySelector('.mini'), miniPlay: shadow.querySelector('.m-play'),
+        broadcast: msg => runtimeListeners.forEach(fn => fn({ target: 'all', ...msg })),
         head: shadow.querySelector('.phead'), resize: shadow.querySelector('.resize-grip'),
         toggle: () => runtimeListeners.forEach(fn => fn({ target: 'content', cmd: 'togglePanel' }))
     };

@@ -99,6 +99,15 @@ body.has-track [data-locate-playing]:hover { filter: brightness(1.12); }
 .cbtn:active { transform: scale(.9); box-shadow: var(--bpl-control-active-shadow); }
 .cbtn.main { background: var(--bpl-accent); color: var(--bpl-on-accent); box-shadow: var(--bpl-control-shadow), 0 2px 10px var(--bpl-accent-shadow); }
 .cbtn.main:hover { background: var(--bpl-accent-hover); }
+.cbtn.main.loading { position: relative; }
+.cbtn.main.loading svg { visibility: hidden; }
+.cbtn.main.loading::after {
+    content: ''; position: absolute; box-sizing: border-box; width: 12px; height: 12px;
+    inset: 0; margin: auto;
+    border: 1.5px solid currentColor; border-right-color: transparent;
+    border-radius: 50%; animation: bplConnectSpin .8s linear infinite;
+}
+@keyframes bplConnectSpin { to { transform: rotate(360deg); } }
 .cbtn.stop { color: var(--bpl-accent); }
 .cbtn.stop:hover { background: var(--bpl-accent-soft); color: var(--bpl-accent-hover); }
 

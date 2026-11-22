@@ -78,7 +78,7 @@ connectAudioPort();
 
 const DEF_STATE = { playlistId: null, trackId: null, index: 0, playing: false, mode: 'loop' };
 const P_MODES = ['order', 'shuffle', 'one', 'loop', 'shuffleLoop'];
-const audio = document.getElementById('player');
+let audio = document.getElementById('player');
 let curIndex = -1;
 let curTrack = null;   // 当前曲身份 {bvid, cid}：断点落盘以此为键，stop/清空时置 null
 // History records successful starts; only 30 seconds of actual listening
@@ -366,6 +366,18 @@ const PLAY_WORKFLOW_TIMEOUT_MS = 105000;
 let playIntent = 0;
 let playAbortController = null;
 let playbackAttemptActive = 0;
+let playbackLoading = false;
+function setPlaybackLoading(value, token) {
+    if (token != null && !isCurrentPlay(token)) return;
+    if (playbackLoading === value) return;
+    playbackLoading = value;
+    relayBroadcast({ type: 'loading', loading: value });
+}
+let sourceHistory = BPLSources.createHistory();
+const sourceHistoryReady = store.get('bpl_source_history').then(r => {
+    sourceHistory = BPLSources.createHistory(r.bpl_source_history);
+}).catch(() => {});
+let sourceHistorySave = Promise.resolve();
 function newAbortController() { return (typeof AbortController !== 'undefined') ? new AbortController() : null; }
 function isCurrentPlay(token) { return token === playIntent; }
 function startPlayIntent() {
@@ -377,6 +389,7 @@ function cancelPlayIntent() {
     ++playIntent;
     if (playAbortController) { try { playAbortController.abort(); } catch (_) {} }
     playAbortController = null;
+    setPlaybackLoading(false);
 }
 function playSettled(a, timeout, signal) {
     return new Promise(resolve => {
@@ -535,67 +548,86 @@ function probeAudioUrls(urls, timeoutMs) {
     mediaProbeChain = task.then(() => {}, () => {});
     return task;
 }
-async function tryPlayUrl(url, token, deadline) {
-    if (!isCurrentPlay(token)) return { cancelled: true };
-    const signal = playAbortController && playAbortController.signal;
-    const host = hostOf(url);
-    // The old track can keep playing while the next source resolves. Flush
-    // it just before changing src, then ignore candidate/probe startup time.
+function releaseMedia(element) {
+    element.pause();
+    element.removeAttribute('src');
+    element.load();
+}
+async function prepareSource(source, timeout, signal, blobFallback = false) {
+    const element = document.createElement('audio');
+    element.preload = 'auto';
+    element.muted = true;
+    let blobUrl = null, keep = false;
+    const release = () => {
+        releaseMedia(element);
+        if (blobUrl) { URL.revokeObjectURL(blobUrl); blobUrl = null; }
+    };
+    signal.addEventListener('abort', release, { once: true });
+    try {
+        if (signal.aborted) return { cancelled: true };
+        if (blobFallback) {
+            const deadline = Date.now() + timeout;
+            const response = await fetchMedia(source.url, timeout, signal);
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            const blob = await readLimitedBlob(response, deadline, signal);
+            if (signal.aborted) return { cancelled: true };
+            blobUrl = URL.createObjectURL(blob);
+            element.src = blobUrl;
+            timeout = Math.max(1, deadline - Date.now());
+        } else element.src = source.url;
+        const result = await playSettled(element, timeout, signal);
+        if (signal.aborted || result.cancelled) return { cancelled: true };
+        if (result.ok) {
+            keep = true;
+            return { ok: true, element, blobUrl, release };
+        }
+        const blocked = result.playError && result.playError.name === 'NotAllowedError';
+        BPLLog.warn('off', '候选源未就绪：' + hostOf(source.url) + ' (' +
+            (result.mediaError ? MEDIA_ERR_NAME[result.mediaError] : result.playError && result.playError.name) + ')');
+        return { ...result, blocked: !!blocked };
+    } catch (error) {
+        return { ok: false, cancelled: signal.aborted, error };
+    } finally {
+        signal.removeEventListener('abort', release);
+        if (!keep) release();
+    }
+}
+async function selectAudioSource(resolved, signal, deadline) {
+    await sourceHistoryReady;
+    const groups = new Map((resolved.sources || []).map(s => [s.url, s.group]));
+    const sources = sourceHistory.rank([...new Set(resolved.urls)].map(url => ({ url, group: groups.get(url) || 0 })));
+    const direct = await BPLSources.race(sources, prepareSource, {
+        signal, deadline, timeout: url => sourceHistory.timeout(url),
+        onResult: (url, result, elapsed) => sourceHistory.record(url, result, elapsed)
+    });
+    sourceHistorySave = sourceHistorySave.then(() => store.set({ bpl_source_history: sourceHistory.snapshot() })).catch(() => {});
+    if (direct.ok || direct.cancelled || direct.blocked) return direct;
+    // Try all direct routes first. Downloading a whole blob on a timed-out host
+    // cannot repair connectivity, and must not delay healthy backup routes.
+    const fallback = direct.failures.filter(f => !f.result.cancelled && !f.result.blocked &&
+        !(f.result.playError && f.result.playError.name === 'TimeoutError')).map(f => f.source).slice(0, 2);
+    if (!fallback.length || Date.now() >= deadline) return direct;
+    const result = await BPLSources.race(fallback, (source, timeout, abort) => prepareSource(source, timeout, abort, true), {
+        signal, deadline, timeout: () => BLOB_TIMEOUT_MS
+    });
+    return { ...result, attempted: direct.attempted };
+}
+function adoptSource(selected, position) {
+    const old = audio;
     sampleShuffleListening();
     shuffleListening = null;
-    audio.src = url;
-    playbackAttemptActive++;
-    const res = await playSettled(audio, Math.min(PLAY_TIMEOUT_MS, Math.max(1, deadline - Date.now())), signal);
-    playbackAttemptActive--;
-    if (res.cancelled || !isCurrentPlay(token)) return { cancelled: true };
-    if (res.ok) {
-        BPLLog.info('off', '直接播放成功：' + host);
-        return { ok: true };
-    }
-    if (res.playError && res.playError.name === 'NotAllowedError') {
-        BPLLog.warn('off', '播放被浏览器阻止(NotAllowed)：' + host);
-        return { blocked: true };
-    }
-    const why = res.mediaError ? ('MediaError ' + (MEDIA_ERR_NAME[res.mediaError] || res.mediaError))
-        : ((res.playError && res.playError.name) || '未知');
-    BPLLog.warn('off', '直接播放失败(' + why + ')，转 fetch+blob：' + host);
-    try {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0 || !isCurrentPlay(token)) return { cancelled: true };
-        const blobDeadline = Math.min(deadline, Date.now() + BLOB_TIMEOUT_MS);
-        const resp = await fetchMedia(url, blobDeadline - Date.now(), signal);
-        if (!resp.ok) throw new Error('HTTP ' + resp.status);
-        const blob = await readLimitedBlob(resp, blobDeadline, signal);
-        if (!isCurrentPlay(token)) return { cancelled: true };
-        const nextBlobUrl = URL.createObjectURL(blob);
-        if (!isCurrentPlay(token)) { URL.revokeObjectURL(nextBlobUrl); return { cancelled: true }; }
-        if (curBlobUrl) URL.revokeObjectURL(curBlobUrl);
-        curBlobUrl = nextBlobUrl;
-        audio.src = curBlobUrl;
-        playbackAttemptActive++;
-        const res2 = await playSettled(audio, Math.min(PLAY_TIMEOUT_MS, Math.max(1, deadline - Date.now())), signal);
-        playbackAttemptActive--;
-        if (res2.cancelled || !isCurrentPlay(token)) return { cancelled: true };
-        if (res2.ok) {
-            BPLLog.info('off', 'fetch+blob 兜底播放成功：' + host);
-            return { ok: true };
-        }
-        if (res2.playError && res2.playError.name === 'NotAllowedError') {
-            BPLLog.warn('off', 'blob 播放被阻止(NotAllowed)：' + host);
-            return { blocked: true };
-        }
-        const why2 = res2.mediaError ? ('MediaError ' + (MEDIA_ERR_NAME[res2.mediaError] || res2.mediaError))
-            : ((res2.playError && res2.playError.name) || '未知');
-        BPLLog.error('off', '该音源彻底失败(' + why2 + ')：' + host);
-        return { ok: false };
-    } catch (e) {
-        if (e && e.name === 'NotAllowedError') {
-            BPLLog.warn('off', 'blob 播放被阻止(NotAllowed)：' + host);
-            return { blocked: true };
-        }
-        BPLLog.error('off', '该音源彻底失败(' + ((e && e.message) || e) + ')：' + host);
-        return { ok: false };
-    }
+    audio = selected.element;
+    audio.volume = old.volume;
+    audio.playbackRate = old.playbackRate;
+    audio.currentTime = position;
+    // Only the winner becomes audible. Retired elements cannot mutate state.
+    releaseMedia(old);
+    if (curBlobUrl) URL.revokeObjectURL(curBlobUrl);
+    curBlobUrl = selected.blobUrl;
+    audio.id = 'player';
+    if (old.replaceWith) old.replaceWith(audio);
+    bindAudioEvents(audio);
+    audio.muted = old.muted;
 }
 
 // savedPos：可选断点 {bvid, cid, position}——仅 toggle 从空音频起播时传入（回收后续播），
@@ -614,108 +646,122 @@ async function pPlayIndex(i, _keepOrder, savedPos, playlistId, options) {
     }
     suppressRecoveryUntil = Date.now() + 1200;
     const intent = startPlayIntent();
-    const st = await pGetState();
-    if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
-    const targetPlaylistId = playlistId || st.playlistId;
-    const targetPlaylist = (await pGetPlaylists()).find(p => p.id === targetPlaylistId);
-    if (targetPlaylist && P_MODES.includes(targetPlaylist.mode)) st.mode = targetPlaylist.mode;
-    const items = targetPlaylist ? targetPlaylist.items : [];
-    if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
-    if (options && options.itemId) i = items.findIndex(item => item.id === options.itemId);
-    if (!items.length) return { ok: false, error: '当前播放列表为空' };
-    if (i < 0 || i >= items.length) return { ok: false, error: '播放索引越界 (' + i + '/' + items.length + ')' };
-    syncShuffleContext(targetPlaylistId, st.mode, items);
-    let it = items[i];
-    const itemId = it && it.id;
-    if (it && it.sourceUnavailable) {
-        return { ok: false, sourceUnavailable: true, error: '原视频已失效，请将鼠标移到条目上重新匹配音源' };
-    }
-    if (it && it.matchOrigin === 'manual' && !it.bvid) {
-        return { ok: false, manualMatchPending: true, error: '请先点击搜索按钮匹配音源' };
-    }
-    if (it && it.chartSource && it.matchState === 'failed' && !it.bvid) {
-        return { ok: false, chartMatchFailed: true, error: it.matchError || '匹配榜单音源失败' };
-    }
-    if (it && it.chartSource && (it.matchState !== 'matched' || !it.bvid)) {
-        BPLLog.info('off', '随机/顺序播放优先匹配榜单条目[' + (it.sourceArtist || '') + ' - ' + (it.sourceTitle || it.title || '') + ']');
-        const match = await bgMatchChartItem(it, targetPlaylistId, Math.min(45000, workflowDeadline - Date.now()));
+    setPlaybackLoading(true, intent.id);
+    let selected = null;
+    let abandonSelected = null;
+    try {
+        const st = await pGetState();
         if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
-        if (!match || !match.ok) {
-            BPLLog.warn('off', '榜单条目匹配失败，跳过播放：' + ((match && match.error) || '未知错误'));
-            return { ok: false, chartMatchFailed: true, error: (match && match.error) || '匹配榜单音源失败' };
+        const targetPlaylistId = playlistId || st.playlistId;
+        const targetPlaylist = (await pGetPlaylists()).find(p => p.id === targetPlaylistId);
+        if (targetPlaylist && P_MODES.includes(targetPlaylist.mode)) st.mode = targetPlaylist.mode;
+        const items = targetPlaylist ? targetPlaylist.items : [];
+        if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
+        if (options && options.itemId) i = items.findIndex(item => item.id === options.itemId);
+        if (!items.length) return { ok: false, error: '当前播放列表为空' };
+        if (i < 0 || i >= items.length) return { ok: false, error: '播放索引越界 (' + i + '/' + items.length + ')' };
+        syncShuffleContext(targetPlaylistId, st.mode, items);
+        let it = items[i];
+        const itemId = it && it.id;
+        if (it && it.sourceUnavailable) {
+            return { ok: false, sourceUnavailable: true, error: '原视频已失效，请将鼠标移到条目上重新匹配音源' };
         }
-        const refreshedItems = await pGetItems(targetPlaylistId);
-        i = itemId ? refreshedItems.findIndex(item => item.id === itemId) : i;
-        it = refreshedItems[i];
-        if (!it || !it.bvid) return { ok: false, chartMatchFailed: true, error: '匹配后未得到B站视频' };
-    }
-    if (Date.now() >= workflowDeadline) return { ok: false, error: '播放准备超时，请稍后重试' };
-    const r = await bgResolveAudio(it, targetPlaylistId, Math.min(35000, workflowDeadline - Date.now()));
-    if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
-    if (!r || !r.ok || !r.urls || !r.urls.length) {
-        BPLLog.error('off', 'resolveAudio 失败[' + it.bvid + ']：' + ((r && r.error) || '无候选（取音源模块无有效应答）'));
+        if (it && it.matchOrigin === 'manual' && !it.bvid) {
+            return { ok: false, manualMatchPending: true, error: '请先点击搜索按钮匹配音源' };
+        }
+        if (it && it.chartSource && it.matchState === 'failed' && !it.bvid) {
+            return { ok: false, chartMatchFailed: true, error: it.matchError || '匹配榜单音源失败' };
+        }
+        if (it && it.chartSource && (it.matchState !== 'matched' || !it.bvid)) {
+            BPLLog.info('off', '随机/顺序播放优先匹配榜单条目[' + (it.sourceArtist || '') + ' - ' + (it.sourceTitle || it.title || '') + ']');
+            const match = await bgMatchChartItem(it, targetPlaylistId, Math.min(45000, workflowDeadline - Date.now()));
+            if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
+            if (!match || !match.ok) {
+                BPLLog.warn('off', '榜单条目匹配失败，跳过播放：' + ((match && match.error) || '未知错误'));
+                return { ok: false, chartMatchFailed: true, error: (match && match.error) || '匹配榜单音源失败' };
+            }
+            const refreshedItems = await pGetItems(targetPlaylistId);
+            i = itemId ? refreshedItems.findIndex(item => item.id === itemId) : i;
+            it = refreshedItems[i];
+            if (!it || !it.bvid) return { ok: false, chartMatchFailed: true, error: '匹配后未得到B站视频' };
+        }
+        if (Date.now() >= workflowDeadline) return { ok: false, error: '播放准备超时，请稍后重试' };
+        const r = await bgResolveAudio(it, targetPlaylistId, Math.min(35000, workflowDeadline - Date.now()));
+        if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
+        if (!r || !r.ok || !r.urls || !r.urls.length) {
+            BPLLog.error('off', 'resolveAudio 失败[' + it.bvid + ']：' + ((r && r.error) || '无候选（取音源模块无有效应答）'));
+            BPLLog.flush();
+            return {
+                ok: false,
+                sourceUnavailable: !!(r && r.sourceUnavailable),
+                error: (r && r.error) || '获取音频失败'
+            };
+        }
+        BPLLog.info('off', 'resolveAudio 返回 ' + r.urls.length + ' 个候选[' + it.bvid + '，' + (it.title || '') + ']');
+        // Media startup gets its own budget after matching and URL resolution.
+        const deadline = Math.min(workflowDeadline, Date.now() + PLAY_TOTAL_TIMEOUT_MS);
+        if (Date.now() >= deadline) return { ok: false, error: '播放准备超时，请稍后重试' };
+        playbackAttemptActive++;
+        try {
+            const res = selected = await selectAudioSource(r, intent.signal, deadline);
+            if (res.cancelled || !isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
+            if (res.ok) {
+                abandonSelected = () => res.release();
+                intent.signal.addEventListener('abort', abandonSelected, { once: true });
+                const currentItems = await pGetItems(targetPlaylistId);
+                if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
+                i = itemId ? currentItems.findIndex(item => item.id === itemId && item.bvid === it.bvid) : i;
+                if (i < 0 || !currentItems[i]) {
+                    await pStopPlayback();
+                    return { ok: false, cancelled: true, error: '播放条目已发生变化' };
+                }
+                BPLLog.info('off', '两路选源成功[' + it.bvid + ']：' + hostOf(res.source.url));
+                const resumeAt = (positionMatchesTrack(savedPos, it) && savedPos.position > 0) ? savedPos.position : 0;
+                if (res.element.error) return { ok: false, error: '音源在连接期间失效，请重试' };
+                adoptSource(res, resumeAt);
+                intent.signal.removeEventListener('abort', abandonSelected);
+                abandonSelected = null;
+                curIndex = i;
+                curTrack = { id: it.id || null, bvid: it.bvid, cid: r.cid || it.cid || 0 };
+                if (resumeAt > 0) {
+                    BPLLog.info('off', '从断点继续：' + Math.round(resumeAt) + 's[' + it.bvid + ']');
+                }
+                setupMediaSession(it);
+                const savedState = await pSetState({ playlistId: targetPlaylistId, trackId: it.id || null, index: i, playing: true }, intent.id);
+                if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
+                if (it.id && savedState.trackId !== it.id) {
+                    await pStopPlayback();
+                    return { ok: false, cancelled: true, error: '播放条目已被删除' };
+                }
+                const round = syncShuffleContext(targetPlaylistId, savedState.mode, currentItems);
+                rememberShufflePlay(round, currentItems[i], currentItems.length, options);
+                beginShuffleListening(targetPlaylistId, round, currentItems[i]);
+                persistPosition(resumeAt);
+                suppressRecoveryUntil = 0;
+                return { ok: true };
+            }
+        } finally { playbackAttemptActive--; }
+        const blocked = selected.blocked;
+        const attempted = selected.attempted;
+        if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
+        sampleShuffleListening();
+        shuffleListening = null;
+        releaseMedia(audio);
+        if (curBlobUrl) { URL.revokeObjectURL(curBlobUrl); curBlobUrl = null; }
+        await pSetState({ playing: false }, intent.id);
+        BPLLog.error('off', '所有音源失败[' + it.bvid + ']，共 ' + r.urls.length + ' 源' + (blocked ? '（自动播放被阻止）' : ''));
         BPLLog.flush();
         return {
             ok: false,
-            sourceUnavailable: !!(r && r.sourceUnavailable),
-            error: (r && r.error) || '获取音频失败'
+            error: blocked
+                ? '浏览器阻止了自动播放：请先点一下页面任意位置或浮动按钮，再点播放'
+                : '无法播放该音频（已尝试 ' + attempted + ' 个音源）'
         };
+    } finally {
+        if (abandonSelected) intent.signal.removeEventListener('abort', abandonSelected);
+        if (selected && selected.release && selected.element !== audio) selected.release();
+        setPlaybackLoading(false, intent.id);
     }
-    BPLLog.info('off', 'resolveAudio 返回 ' + r.urls.length + ' 个候选[' + it.bvid + '，' + (it.title || '') + ']');
-    // Media startup gets its own budget after matching and URL resolution.
-    const deadline = Math.min(workflowDeadline, Date.now() + PLAY_TOTAL_TIMEOUT_MS);
-    if (Date.now() >= deadline) return { ok: false, error: '播放准备超时，请稍后重试' };
-    let blocked = false;
-    let attempted = 0;
-    for (let si = 0; si < r.urls.length; si++) {
-        if (Date.now() >= deadline) break;
-        attempted++;
-        const res = await tryPlayUrl(r.urls[si], intent.id, deadline);
-        if (res.cancelled || !isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
-        if (res.ok) {
-            const currentItems = await pGetItems(targetPlaylistId);
-            if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
-            i = itemId ? currentItems.findIndex(item => item.id === itemId && item.bvid === it.bvid) : i;
-            if (i < 0 || !currentItems[i]) {
-                await pStopPlayback();
-                return { ok: false, cancelled: true, error: '播放条目已发生变化' };
-            }
-            BPLLog.info('off', '第 ' + (si + 1) + '/' + r.urls.length + ' 源播放成功[' + it.bvid + ']');
-            curIndex = i;
-            curTrack = { id: it.id || null, bvid: it.bvid, cid: r.cid || it.cid || 0 };
-            const resumeAt = (positionMatchesTrack(savedPos, it) && savedPos.position > 0) ? savedPos.position : 0;
-            if (resumeAt > 0) {
-                audio.currentTime = resumeAt;
-                BPLLog.info('off', '从断点继续：' + Math.round(resumeAt) + 's[' + it.bvid + ']');
-            }
-            setupMediaSession(it);
-            const savedState = await pSetState({ playlistId: targetPlaylistId, trackId: it.id || null, index: i, playing: true }, intent.id);
-            if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
-            if (it.id && savedState.trackId !== it.id) {
-                await pStopPlayback();
-                return { ok: false, cancelled: true, error: '播放条目已被删除' };
-            }
-            const round = syncShuffleContext(targetPlaylistId, savedState.mode, currentItems);
-            rememberShufflePlay(round, currentItems[i], currentItems.length, options);
-            beginShuffleListening(targetPlaylistId, round, currentItems[i]);
-            persistPosition(resumeAt);
-            suppressRecoveryUntil = 0;
-            return { ok: true };
-        }
-        if (res.blocked) { blocked = true; break; }
-    }
-    if (!isCurrentPlay(intent.id)) return { ok: true, cancelled: true };
-    audio.removeAttribute('src');
-    audio.load();
-    broadcastState(await pGetState());
-    BPLLog.error('off', '所有音源失败[' + it.bvid + ']，共 ' + r.urls.length + ' 源' + (blocked ? '（自动播放被阻止）' : ''));
-    BPLLog.flush();
-    return {
-        ok: false,
-        error: blocked
-            ? '浏览器阻止了自动播放：请先点一下页面任意位置或浮动按钮，再点播放'
-            : '无法播放该音频（已尝试 ' + attempted + ' 个音源）'
-    };
 }
 async function pStopPlayback() {
     shuffleListening = null;
@@ -833,6 +879,7 @@ async function pPrev() {
     return await pPlayIndex(n, true);
 }
 async function pToggle() {
+    if (playbackLoading) return await pCancelPlayback();
     if (audio.paused) {
         if (!audio.src) {
             const token = playIntent;
@@ -845,14 +892,20 @@ async function pToggle() {
             return await pPlayIndex(st.index, false, savedPos);
         }
         const intent = startPlayIntent();
-        playbackAttemptActive++;
-        const resumed = await playSettled(audio, PLAY_TIMEOUT_MS, playAbortController && playAbortController.signal);
-        playbackAttemptActive--;
-        if (!isCurrentPlay(intent.id) || resumed.cancelled) return { ok: true, cancelled: true };
-        if (!resumed.ok) return { ok: false, error: (resumed.playError && resumed.playError.name === 'NotAllowedError')
-            ? '浏览器阻止了自动播放：请先点一下页面或浮动按钮再试' : '恢复播放超时，请稍后重试' };
-        resetShuffleListeningClock();
-        await pSetState({ playing: true }, intent.id);
+        setPlaybackLoading(true, intent.id);
+        try {
+            playbackAttemptActive++;
+            const resumed = await playSettled(audio, PLAY_TIMEOUT_MS, playAbortController && playAbortController.signal);
+            playbackAttemptActive--;
+            if (!isCurrentPlay(intent.id) || resumed.cancelled) return { ok: true, cancelled: true };
+            if (!resumed.ok) {
+                audio.pause();
+                return { ok: false, error: (resumed.playError && resumed.playError.name === 'NotAllowedError')
+                    ? '浏览器阻止了自动播放：请先点一下页面或浮动按钮再试' : '恢复播放超时，请稍后重试' };
+            }
+            resetShuffleListeningClock();
+            await pSetState({ playing: true }, intent.id);
+        } finally { setPlaybackLoading(false, intent.id); }
     } else {
         recoveryPending = false;
         if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
@@ -864,10 +917,23 @@ async function pToggle() {
     }
     return { ok: true };
 }
+async function pCancelPlayback() {
+    recoveryPending = false;
+    if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
+    cancelPlayIntent();
+    sampleShuffleListening();
+    audio.pause();
+    resetShuffleListeningClock();
+    await pSetState({ playing: false }, playIntent);
+    return { ok: true, cancelled: true };
+}
 
 function setupMediaSession(it) {
     if (!('mediaSession' in navigator)) return;
     try {
+        // The winning element started while muted, before its main-player
+        // listeners were attached. Publish its playing state explicitly.
+        navigator.mediaSession.playbackState = 'playing';
         navigator.mediaSession.metadata = new MediaMetadata({
             title: it.title || '',
             artist: it.owner || 'Bilibili',
@@ -948,78 +1014,84 @@ async function recoverPlayback(reason) {
     broadcastPlayerError(message, reason);
 }
 
-audio.addEventListener('ended', () => {
-    sampleShuffleListening();
-    runAsync('自动切歌失败', async () => {
-        const st = await pGetState();
-        if (st.mode === 'one') {
-            audio.currentTime = 0;
-            const intent = startPlayIntent();
-            playbackAttemptActive++;
-            const result = await playSettled(audio, PLAY_TIMEOUT_MS, playAbortController && playAbortController.signal);
-            playbackAttemptActive--;
-            if (result.ok && isCurrentPlay(intent.id)) await pSetState({ playing: true }, intent.id);
-            else if (!result.cancelled) scheduleRecovery('repeat playback failed', 800);
-        } else {
-            await pAdvance();
+function bindAudioEvents(element) {
+    const on = (type, fn) => element.addEventListener(type, (...args) => {
+        if (audio === element) fn(...args);
+    });
+    on('ended', () => {
+        sampleShuffleListening();
+        runAsync('自动切歌失败', async () => {
+            const st = await pGetState();
+            if (st.mode === 'one') {
+                audio.currentTime = 0;
+                const intent = startPlayIntent();
+                playbackAttemptActive++;
+                const result = await playSettled(audio, PLAY_TIMEOUT_MS, playAbortController && playAbortController.signal);
+                playbackAttemptActive--;
+                if (result.ok && isCurrentPlay(intent.id)) await pSetState({ playing: true }, intent.id);
+                else if (!result.cancelled) scheduleRecovery('repeat playback failed', 800);
+            } else {
+                await pAdvance();
+            }
+        });
+    });
+    on('play', () => {
+        if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+        if (!playbackAttemptActive && curTrack && !audio.paused) {
+            runAsync('播放状态同步失败', () => pSetState({ playing: true }, playIntent, { trackId: curTrack.id || null }));
         }
     });
-});
-audio.addEventListener('play', () => {
-    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-    if (!playbackAttemptActive && curTrack && !audio.paused) {
-        runAsync('播放状态同步失败', () => pSetState({ playing: true }, playIntent, { trackId: curTrack.id || null }));
-    }
-});
-audio.addEventListener('playing', () => {
-    resetShuffleListeningClock();
-    // 短暂 stalled 后若媒体自行恢复，不再让旧定时器重新解析并打断正常播放。
-    if (recoveryPending && !recoveryRunning) {
-        recoveryPending = false;
-        recoveryAttempts = 0;
-        if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
-        BPLLog.info('off', '音频已自行恢复，取消排队中的自恢复任务');
-    }
-});
-audio.addEventListener('pause', () => {
-    sampleShuffleListening();
-    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-    // 任何暂停路径（面板按钮/MediaSession/系统键）都落断点——这正是文档被回收前的最后一笔。
-    // stop 会先同步清掉 curTrack，故其后触发的本事件不会误写（断点清除优先）。
-    persistPosition(audio.currentTime || 0);
-    if (!playbackAttemptActive && audio.paused) {
-        runAsync('暂停状态同步失败', () => pSetState({ playing: false }, playIntent, { trackId: curTrack && curTrack.id || null }));
-    }
-});
-// 关键诊断：play() 可能先 resolve、随后由 error 事件异步失败（如 CDN 403/解码错），
-// 此处把 MediaError code、src、网络/就绪状态全部记下，专治“无法播放音源”查无对证
-audio.addEventListener('error', () => {
-    sampleShuffleListening();
-    const e = audio.error;
-    const code = e && e.code;
-    BPLLog.error('off', 'audio error 事件：code=' + code + '(' + (MEDIA_ERR_NAME[code] || '?') + ')' +
-        ' msg=' + ((e && e.message) || '-') +
-        ' src=' + hostOf(audio.src) +
-        ' networkState=' + (NET_STATE[audio.networkState] != null ? NET_STATE[audio.networkState] : audio.networkState) +
-        ' readyState=' + (READY_STATE[audio.readyState] != null ? READY_STATE[audio.readyState] : audio.readyState));
-    BPLLog.flush();
-    if (!playbackAttemptActive && Date.now() >= suppressRecoveryUntil) scheduleRecovery('audio error', 800);
-});
-audio.addEventListener('stalled', () => {
-    BPLLog.warn('off', 'audio stalled（取流停滞）：src=' + hostOf(audio.src) +
-        ' networkState=' + (NET_STATE[audio.networkState] != null ? NET_STATE[audio.networkState] : audio.networkState));
-    if (!playbackAttemptActive && Date.now() >= suppressRecoveryUntil) scheduleRecovery('audio stalled', 8000);
-});
-audio.addEventListener('timeupdate', sampleShuffleListening);
-audio.addEventListener('ratechange', sampleShuffleListening);
-audio.addEventListener('waiting', () => {
-    sampleShuffleListening();
-    if (shuffleListening) shuffleListening.running = false;
-});
-// Seeking is a discontinuity, not listening. Internal seek controls flush
-// before moving; native seek events also reset the baseline defensively.
-audio.addEventListener('seeking', resetShuffleListeningClock);
-audio.addEventListener('seeked', resetShuffleListeningClock);
+    on('playing', () => {
+        resetShuffleListeningClock();
+        // 短暂 stalled 后若媒体自行恢复，不再让旧定时器重新解析并打断正常播放。
+        if (recoveryPending && !recoveryRunning) {
+            recoveryPending = false;
+            recoveryAttempts = 0;
+            if (recoveryTimer) { clearTimeout(recoveryTimer); recoveryTimer = null; }
+            BPLLog.info('off', '音频已自行恢复，取消排队中的自恢复任务');
+        }
+    });
+    on('pause', () => {
+        sampleShuffleListening();
+        if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+        // 任何暂停路径（面板按钮/MediaSession/系统键）都落断点——这正是文档被回收前的最后一笔。
+        // stop 会先同步清掉 curTrack，故其后触发的本事件不会误写（断点清除优先）。
+        persistPosition(audio.currentTime || 0);
+        if (!playbackAttemptActive && audio.paused) {
+            runAsync('暂停状态同步失败', () => pSetState({ playing: false }, playIntent, { trackId: curTrack && curTrack.id || null }));
+        }
+    });
+    // 关键诊断：play() 可能先 resolve、随后由 error 事件异步失败（如 CDN 403/解码错），
+    // 此处把 MediaError code、src、网络/就绪状态全部记下，专治“无法播放音源”查无对证
+    on('error', () => {
+        sampleShuffleListening();
+        const e = audio.error;
+        const code = e && e.code;
+        BPLLog.error('off', 'audio error 事件：code=' + code + '(' + (MEDIA_ERR_NAME[code] || '?') + ')' +
+            ' msg=' + ((e && e.message) || '-') +
+            ' src=' + hostOf(audio.src) +
+            ' networkState=' + (NET_STATE[audio.networkState] != null ? NET_STATE[audio.networkState] : audio.networkState) +
+            ' readyState=' + (READY_STATE[audio.readyState] != null ? READY_STATE[audio.readyState] : audio.readyState));
+        BPLLog.flush();
+        if (!playbackAttemptActive && Date.now() >= suppressRecoveryUntil) scheduleRecovery('audio error', 800);
+    });
+    on('stalled', () => {
+        BPLLog.warn('off', 'audio stalled（取流停滞）：src=' + hostOf(audio.src) +
+            ' networkState=' + (NET_STATE[audio.networkState] != null ? NET_STATE[audio.networkState] : audio.networkState));
+        if (!playbackAttemptActive && Date.now() >= suppressRecoveryUntil) scheduleRecovery('audio stalled', 8000);
+    });
+    on('timeupdate', sampleShuffleListening);
+    on('ratechange', sampleShuffleListening);
+    on('waiting', () => {
+        sampleShuffleListening();
+        if (shuffleListening) shuffleListening.running = false;
+    });
+    // Seeking is a discontinuity, not listening. Internal seek controls flush
+    // before moving; native seek events also reset the baseline defensively.
+    on('seeking', resetShuffleListeningClock);
+    on('seeked', resetShuffleListeningClock);
+}
+bindAudioEvents(audio);
 if (typeof window !== 'undefined' && window.addEventListener) {
     window.addEventListener('online', () => {
         if (recoveryPending) scheduleRecovery('network online', 0);
@@ -1077,8 +1149,12 @@ if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.onChanged)
 }
 
 async function handleCmd(msg) {
+    // Invalidate before reading storage: even a previous-track command that
+    // only seeks to zero must prevent an older pending selection from winning.
+    if (['playIndex', 'next', 'prev'].includes(msg.cmd)) cancelPlayIntent();
     switch (msg.cmd) {
         case 'toggle': return await pToggle();
+        case 'cancelPlayback': return await pCancelPlayback();
         case 'next': return await pNext();
         case 'prev': return await pPrev();
         case 'playIndex':
@@ -1086,7 +1162,7 @@ async function handleCmd(msg) {
             return await pPlayIndex(msg.index, false, null, msg.playlistId, { itemId: msg.itemId, deadline: msg.deadline });
         case 'probeAudio': return await probeAudioUrls(msg.urls, msg.timeoutMs);
         case 'seek': seekPlayback(msg.value || 0); return { ok: true };
-        case 'getStatus': return { ok: true, position: audio.currentTime || 0, duration: audio.duration || 0, playing: !audio.paused, index: curIndex, hasTrack: !!audio.src };
+        case 'getStatus': return { ok: true, position: audio.currentTime || 0, duration: audio.duration || 0, playing: !audio.paused, index: curIndex, hasTrack: !!audio.src, loading: playbackLoading };
         case 'stop': return await pStopPlayback();
         case 'setMode': {
             // Mode belongs to a playlist and must be saved under the background

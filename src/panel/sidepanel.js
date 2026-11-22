@@ -396,8 +396,14 @@ document.querySelectorAll('[data-locate-playing]').forEach(el => {
 
 const PLAY_D = 'M8 5v14l11-7z';
 const PAUSE_D = 'M6 5h4v14H6zm8 0h4v14h-4z';
+let playbackLoading = false;
+let loadingRevision = 0;
 function updateProgress() {
-    const pp = $('#playBtn').querySelector('path');
+    const button = $('#playBtn');
+    button.classList.toggle('loading', playbackLoading);
+    button.setAttribute('aria-busy', String(playbackLoading));
+    button.setAttribute('aria-label', playbackLoading ? '取消连接' : (state.playing ? '暂停' : '播放'));
+    const pp = button.querySelector('path');
     if (pp) pp.setAttribute('d', state.playing ? PAUSE_D : PLAY_D);
     document.body.classList.toggle('playing', !!state.playing);
     $('#time').textContent = fmt(position) + ' / ' + fmt(duration);
@@ -414,11 +420,13 @@ async function refresh() {
     state = Object.assign({}, DEF_STATE, r.bpl_state || {});
     state.mode = normMode(state);
     render();
+    const revision = loadingRevision;
     send('getStatus').then(res => {
         if (res && res.ok) {
             position = res.position || 0;
             duration = res.duration || 0;
             if (res.playing != null) state.playing = res.playing;
+            if (revision === loadingRevision) playbackLoading = !!res.loading;
             updateProgress();
         }
     });
@@ -1178,7 +1186,11 @@ window.addEventListener('resize', positionSelectionMenu);
 
 function handleBroadcast(msg) {
     if (!msg || msg.target !== 'all') return;
-    if (msg.type === 'data') {
+    if (msg.type === 'loading') {
+        loadingRevision++;
+        playbackLoading = !!msg.loading;
+        updateProgress();
+    } else if (msg.type === 'data') {
         playlists = msg.playlists || [];
         activeId = msg.activeId || (playlists[0] && playlists[0].id) || null;
         state = Object.assign({}, DEF_STATE, msg.state || {});
